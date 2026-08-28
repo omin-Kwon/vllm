@@ -129,6 +129,28 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
+    def gated_delta_net_cached_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType,
+        use_replayssm: bool,
+    ) -> tuple[torch.dtype, ...]:
+        """GDN state dtypes, extended for the ReplaySSM cached decode kernel.
+
+        Returns the baseline ``(conv, ssm)`` dtypes when ``use_replayssm`` is
+        ``False``; otherwise appends the ring cache dtypes
+        ``(d_cache, k_cache, g_cache)`` = ``(activation, activation, float32)``.
+        """
+        conv_dtype, ssm_dtype = cls._mamba_state_dtype(
+            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+        )
+        if not use_replayssm:
+            return conv_dtype, ssm_dtype
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return conv_dtype, ssm_dtype, activation_dtype, activation_dtype, torch.float32
+
+    @classmethod
     def kda_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -277,6 +299,52 @@ class MambaStateShapeCalculator:
             head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
+
+    @classmethod
+    def gated_delta_net_cached_state_shape(
+        cls,
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int,
+        use_replayssm: bool,
+        replayssm_buffer_len: int,
+        num_spec: int = 0,
+    ) -> tuple[tuple[int, ...], ...]:
+        """GDN state shapes, extended for the ReplaySSM cached decode kernel.
+
+        Returns the baseline ``(conv, ssm)`` shapes when ``use_replayssm`` is
+        ``False``; otherwise appends the ring-buffer shapes
+        ``d_cache``/``k_cache``/``g_cache``. Head counts use the
+        (un-extended) ``num_v_heads``/``num_k_heads`` divided by
+        ``tp_world_size``, matching ``gated_delta_net_state_shape``.
+        """
+        conv_state_shape, temporal_state_shape = cls.gated_delta_net_state_shape(
+            tp_world_size,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_size,
+            num_spec,
+        )
+        if not use_replayssm:
+            return conv_state_shape, temporal_state_shape
+
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        d_cache_shape = (local_v_heads, replayssm_buffer_len, head_v_dim)
+        k_cache_shape = (local_k_heads, replayssm_buffer_len, head_k_dim)
+        g_cache_shape = (local_v_heads, replayssm_buffer_len)
+        return (
+            conv_state_shape,
+            temporal_state_shape,
+            d_cache_shape,
+            k_cache_shape,
+            g_cache_shape,
+        )
 
     @classmethod
     def kda_state_shape(

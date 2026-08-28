@@ -56,6 +56,9 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.fused_recurrent_replayssm import (
+    fused_recurrent_gated_delta_rule_replayssm,
+)
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
@@ -489,6 +492,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
+        # ReplaySSM routes the non-spec decode wave through the ring-cached
+        # kernel instead of the packed one. The extra d/k/g pages are appended
+        # to this layer's state by gated_delta_net_cached_state_shape, so the
+        # flag and the state layout must be decided from the same config.
+        self.use_replayssm = vllm_config.cache_config.use_replayssm
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self.gdn_decode_kernel == "cuda":
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
@@ -1275,6 +1283,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
+            if self.use_replayssm:
+                return self._forward_core_decode_non_spec_cached(
+                    mixed_qkv=mixed_qkv,
+                    b=b,
+                    a=a,
+                    core_attn_out=core_attn_out,
+                    attn_metadata=attn_metadata,
+                )
             return self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -1681,6 +1697,78 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             initial_state=ssm_state,
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            use_qk_l2norm_in_kernel=True,
+        )
+        return
+
+    def _forward_core_decode_non_spec_cached(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ):
+        """Cached (ReplaySSM) non-spec decode.
+
+        Amortises the SSM-state HBM traffic by caching the per-step d/k/g
+        vectors in a ring buffer and reconstructing the output from a
+        checkpoint that is only rewritten every replayssm_buffer_len steps.
+        Layout mirrors _forward_core_decode_non_spec; the extra pages
+        (d/k/g_cache) come from gated_delta_net_cached_state_shape.
+        """
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        write_pos_d = attn_metadata.write_pos_d
+        if write_pos_d is None:
+            raise RuntimeError(
+                "ReplaySSM decode reached the cached path without a ring "
+                "cursor; GDNAttentionMetadataBuilder did not build write_pos_d"
+            )
+        self_kv_cache = self.kv_cache
+        # conv_state must be (..., dim, width-1) for the conv kernels.
+        # DS layout stores it that way directly; SD layout needs a transpose.
+        conv_state = (
+            self_kv_cache[0]
+            if is_conv_state_dim_first()
+            else self_kv_cache[0].transpose(-1, -2)
+        )
+        ssm_state = self_kv_cache[1]
+        d_cache = self_kv_cache[2]
+        k_cache = self_kv_cache[3]
+        g_cache = self_kv_cache[4]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        mixed_qkv_non_spec = causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            validate_data=False,
+        )
+        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        fused_recurrent_gated_delta_rule_replayssm(
+            mixed_qkv=mixed_qkv_non_spec,
+            a=a,
+            b=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            scale=self.head_k_dim**-0.5,
+            initial_state=ssm_state,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            out=out_buf,
+            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            write_pos=write_pos_d,
             use_qk_l2norm_in_kernel=True,
         )
         return

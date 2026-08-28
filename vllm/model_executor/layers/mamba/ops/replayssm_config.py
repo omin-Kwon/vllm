@@ -52,6 +52,20 @@ def _mamba2_output_only(dstate, L, is_blackwell):
     return 16, 1, _dstate_tile(dstate, 64), _dstate_tile(dstate, 128), 2
 
 
+def _l_bucket(cache_len: int) -> int:
+    """Bucket the ring length: L<=8 -> 8, 8<L<=16 -> 16, L>16 -> 32."""
+    if cache_len <= 8:
+        return 8
+    if cache_len <= 16:
+        return 16
+    return 32
+
+
+# (block_v, num_warps, num_stages, nk) for the GDN ReplaySSM decode kernel.
+# Measured on the deployment shape (bs=256, Qwen3.8 geometry): BV64/nk4/w1/s2.
+_GDN_DECODE_BY_L = {8: (64, 1, 2, 4), 16: (64, 1, 2, 4), 32: (64, 1, 2, 4)}
+
+
 def get_replayssm_config(kernel: str, **shape) -> tuple:
     """Return the launch config for ``kernel`` (override > tuned default).
 
@@ -63,4 +77,10 @@ def get_replayssm_config(kernel: str, **shape) -> tuple:
     bw = _is_blackwell()
     if kernel == "mamba2_output_only":
         return _mamba2_output_only(shape["dstate"], shape.get("L", 16), bw)
+    # ⚠ GDN port: add **only this key**. Wholesale-copying the fork's version of
+    # this file breaks Mamba2 — its mamba2_output_only returns a different arity
+    # (callers unpack 5, the fork returns 2) and decode dies with
+    # "not enough values to unpack". See scale/PORT_GDN_REPLAY.md.
+    if kernel == "gdn_decode":
+        return _GDN_DECODE_BY_L[_l_bucket(shape.get("L", 16))]
     raise ValueError(f"unknown ReplaySSM kernel config key: {kernel}")

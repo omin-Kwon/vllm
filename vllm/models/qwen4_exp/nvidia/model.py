@@ -38,6 +38,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
     _require_is_multimodal,
 )
 from vllm.model_executor.models.qwen3_5 import (
@@ -595,6 +596,7 @@ class Qwen4ExpModel(nn.Module):
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
+    SupportsReplaySSM,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -708,10 +710,14 @@ class Qwen4ExpForCausalLM(
     def get_gdn_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        # With ReplaySSM the layer's page gains the d/k/g ring caches, so the
+        # dtype tuple must grow with it or the state allocator and the kernel
+        # disagree on the page layout.
+        return MambaStateDtypeCalculator.gated_delta_net_cached_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            vllm_config.cache_config.use_replayssm,
         )
 
     @classmethod
@@ -726,13 +732,15 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        return MambaStateShapeCalculator.gated_delta_net_cached_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
             hf_config.linear_key_head_dim,
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
+            vllm_config.cache_config.use_replayssm,
+            vllm_config.cache_config.replayssm_buffer_len,
             num_spec,
         )
 
@@ -833,6 +841,7 @@ class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
 class Qwen4ExpForConditionalGeneration(
     Qwen3_5ForConditionalGeneration,
     HasInnerState,
+    SupportsReplaySSM,
     Qwen4ExpMixtureOfExperts,
 ):
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""

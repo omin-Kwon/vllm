@@ -78,6 +78,11 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # ReplaySSM standard decode: per-row ring cursor. None when use_replayssm
+    # is disabled. Unlike Mamba2 (mamba_attn.py) there is no is_flush_d: the
+    # GDN ring kernel takes only write_pos and handles the wrap internally.
+    write_pos_d: torch.Tensor | None = None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
@@ -115,6 +120,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
 
+        # ReplaySSM (GDN cached decode). Mirrors mamba_attn.py's Mamba2 plumbing.
+        self.use_replayssm: bool = vllm_config.cache_config.use_replayssm
+        self.replayssm_buffer_len: int = vllm_config.cache_config.replayssm_buffer_len
+
         self.decode_cudagraph_max_bs: int = (
             self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
         )
@@ -122,6 +131,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.decode_cudagraph_max_bs = min(
                 self.decode_cudagraph_max_bs,
                 self.compilation_config.max_cudagraph_capture_size,
+            )
+
+        # Fixed-address ring cursor for the captured decode graph.
+        if self.use_replayssm:
+            self.decode_write_pos_d: torch.Tensor = torch.empty(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.int32,
+                device=device,
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
@@ -473,6 +490,50 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
+        # ── ReplaySSM (GDN cached decode) ────────────────────────────────
+        # Mirrors mamba_attn.py's Mamba2 derivation, minus the flush/align
+        # machinery: the GDN ring kernel takes only write_pos and wraps
+        # internally, so there is no is_flush_d to compute. write_pos counts
+        # decode steps since the ring's last full-state write, which lets a
+        # resumed request re-anchor correctly.
+        write_pos_d = None
+        if self.use_replayssm and spec_sequence_masks is None and num_decodes > 0:
+            if self.vllm_config.cache_config.mamba_cache_mode == "align":
+                raise NotImplementedError(
+                    "GDN ReplaySSM has no flush path, so it cannot honour the "
+                    "align cache mode's block-boundary checkpoints; run with "
+                    "--mamba-cache-mode none"
+                )
+            decode_base_cpu = m.replayssm_decode_base_cpu
+            num_computed_tokens_cpu = m._num_computed_tokens_cpu
+            if decode_base_cpu is None or num_computed_tokens_cpu is None:
+                raise ValueError(
+                    "--use-replayssm requires CPU decode-base and "
+                    "computed-token counts to derive decode write positions"
+                )
+            decode_steps_cpu = (
+                num_computed_tokens_cpu[:num_decodes] - decode_base_cpu[:num_decodes]
+            )
+            decode_query_lens_cpu = (
+                query_start_loc_cpu[1 : num_decodes + 1]
+                - query_start_loc_cpu[:num_decodes]
+            )
+            # A single-token prefill row replayed as decode has no history yet
+            # (decode_steps < 0); anchor it at the ring start so it applies one
+            # recurrence step off the checkpoint, as the baseline kernel would.
+            valid_decode_rows = decode_query_lens_cpu > 0
+            decode_steps_cpu = torch.where(
+                valid_decode_rows & (decode_steps_cpu >= 0),
+                decode_steps_cpu,
+                torch.zeros_like(decode_steps_cpu),
+            )
+            write_pos_cpu = torch.remainder(decode_steps_cpu, self.replayssm_buffer_len)
+            write_pos_d = async_tensor_h2d(
+                write_pos_cpu.to(torch.int32).tolist(),
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
@@ -493,6 +554,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+
+            # The captured graph reads a fixed-address cursor; padded rows are
+            # NULL_BLOCK_ID state slots, so any in-range position is inert.
+            if write_pos_d is not None:
+                self.decode_write_pos_d[:num_decodes].copy_(
+                    write_pos_d[:num_decodes], non_blocking=True
+                )
+                write_pos_d = self.decode_write_pos_d[:batch_size]
+                write_pos_d[num_decodes:] = 0
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -519,6 +589,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            write_pos_d=write_pos_d,
         )
         return attn_metadata
 
