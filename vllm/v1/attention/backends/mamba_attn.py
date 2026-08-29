@@ -168,7 +168,17 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
         # ReplaySSM standard-decode CUDA-graph buffers: per-row ring cursor,
         # flush flag, and the k^T q precompute scratch.
-        if self.use_replayssm:
+        # ⚠ These describe the *Mamba2* ReplaySSM page
+        # (conv, ssm, x_cache, dt_cache, B_cache). This base builder is shared
+        # with short_conv and other Mamba-family layers whose page carries no
+        # ring, so with --use-replayssm on, reading shapes[4] for one of those
+        # raises IndexError before the engine can start -- which is what
+        # Qwen3.8-Flash-Next hit through ShortConvAttentionMetadataBuilder.
+        # (GDN is unaffected: it has its own builder in gdn_attn.py.)
+        self.has_mamba2_ring = (
+            len(kv_cache_spec.shapes) == 5 and len(kv_cache_spec.shapes[4]) == 3
+        )
+        if self.use_replayssm and self.has_mamba2_ring:
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
                 dtype=torch.int32,
@@ -586,7 +596,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     num_reqs - num_prefills : num_reqs
                 ]
 
-        if self.use_replayssm and num_decodes > 0:
+        # Same guard as __init__: short_conv and other ring-less Mamba-family
+        # layers share this builder, and with --use-replayssm on they would
+        # otherwise raise here for a page that has no ring to track.
+        if self.use_replayssm and self.has_mamba2_ring and num_decodes > 0:
             decode_base_cpu = common_attn_metadata.replayssm_decode_base_cpu
             num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
             if decode_base_cpu is None or num_computed_tokens_cpu is None:
@@ -769,7 +782,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     )
                     block_idx_last_scheduled_token_prev_step[metadata.num_decodes :] = 0
 
-            if self.use_replayssm:
+            if self.use_replayssm and self.has_mamba2_ring:
                 assert write_pos_d is not None
                 assert is_flush_d is not None
                 self.decode_write_pos_d[: metadata.num_decodes].copy_(
