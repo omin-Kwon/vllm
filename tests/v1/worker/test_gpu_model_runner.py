@@ -134,7 +134,8 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     connector._uses_cuda_inputs = False
     connector._pinned_input_buffers = []
     connector._d2h_stream = None
-    connector._input_ready_event = None
+    connector._input_ready_events = []
+    connector._launch_counter = 0
     connector._d2h_done_event = None
     connector._request_queue = queue.Queue(maxsize=1)
     connector._request_thread = None
@@ -238,7 +239,8 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
             == final_ptrs
         )
         connector._d2h_stream = torch.cuda.Stream(device=connector.device)
-        connector._input_ready_event = torch.cuda.Event()
+        connector._input_ready_events = [torch.cuda.Event()]
+        connector._launch_counter = 0
         connector._d2h_done_event = torch.cuda.Event()
         try:
             connector._launch(num_reqs=2, num_tokens=4)

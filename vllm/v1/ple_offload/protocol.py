@@ -35,6 +35,9 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Index into the connector's input-readiness event ring. Local to the
+    # requesting worker; the CPU offload process ignores it.
+    event_idx: int = 0
 
 
 _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)
