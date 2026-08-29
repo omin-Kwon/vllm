@@ -182,9 +182,12 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
+    ple_embedding_dtype: str | torch.dtype | None = None,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
 
+    if ple_embedding_dtype in ("float8_e4m3fn", torch.float8_e4m3fn):
+        return Qwen4ExpPLEFp8EmbeddingMethod()
     if not isinstance(quant_config, Fp8Config):
         return None
     if not quant_config.is_checkpoint_fp8_serialized:
@@ -283,7 +286,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
             quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
+                quant_config,
+                f"{prefix}.ngram_embedding",
+                getattr(config, "ple_embedding_dtype", None),
             ),
         )
         self.register_buffer(

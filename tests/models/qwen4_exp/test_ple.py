@@ -267,6 +267,16 @@ def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
     assert _get_ple_embedding_quant_method(quant_config, prefix) is None
 
 
+@pytest.mark.parametrize("dtype", ["float8_e4m3fn", torch.float8_e4m3fn])
+def test_ple_fp8_embedding_respects_explicit_checkpoint_dtype(dtype) -> None:
+    prefix = "model.layers.1.ple.ple_embedding.ngram_embedding"
+
+    assert isinstance(
+        _get_ple_embedding_quant_method(None, prefix, dtype),
+        Qwen4ExpPLEFp8EmbeddingMethod,
+    )
+
+
 def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> None:
     class RuntimeNGramEmbedding(nn.Module):
         def compute_ngram_ids(
