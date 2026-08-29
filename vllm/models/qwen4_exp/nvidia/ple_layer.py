@@ -711,8 +711,16 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
             retained: set[str] = set()
             quant_method = self._offload_quant_method
+            # AutoWeightsLoader groups a checkpoint stream with itertools.groupby
+            # and does not sort it first, so an interleaved prefix (here the
+            # vision tower) splits one module's weights across several
+            # load_weights() calls. Only validate calls that carry table
+            # weights; the others legitimately deliver nothing.
+            saw_table = False
             if isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
                 for name, loaded_weight in weights:
+                    if name.startswith("ngram_embedding."):
+                        saw_table = True
                     if name != "ngram_embedding.weight_scale":
                         continue
                     self.register_buffer(
@@ -723,11 +731,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         persistent=False,
                     )
                     retained.add(name)
-                if not retained:
+                if saw_table and not retained:
                     raise ValueError("FP8 PLE offload checkpoint is missing its scale")
             elif isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
                 outer_scales: dict[int, torch.Tensor] = {}
                 for name, loaded_weight in weights:
+                    if name.startswith("ngram_embedding."):
+                        saw_table = True
                     if not name.startswith(
                         "ngram_embedding.shard_"
                     ) or not name.endswith(".weight_scale_2"):
@@ -738,10 +748,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     shard_index = int(shard_text)
                     outer_scales[shard_index] = loaded_weight
                     retained.add(name)
-                if not retained:
+                if saw_table and not retained:
                     raise ValueError(
                         "NVFP4 PLE offload checkpoint is missing its global scale"
                     )
+                if not retained:
+                    return retained
                 scale_2 = _get_shared_nvfp4_outer_scale(outer_scales).to(
                     device=torch.accelerator.current_accelerator()
                 )
@@ -854,9 +866,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 continue
             regular_weights.append((name, loaded_weight))
 
-        if nvfp4_runtime:
-            if not packed_codes:
-                raise ValueError("NVFP4 PLE checkpoint contains no packed shards")
+        if nvfp4_runtime and packed_codes:
             for shard_index in packed_codes:
                 if (
                     shard_index not in packed_scales
@@ -917,7 +927,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
-        if fp8_runtime and "ngram_embedding.weight_scale" not in loaded:
+        # A call that carried the embedding table must also carry its scale.
+        # Calls that carry neither are the other half of a split stream.
+        if (
+            fp8_runtime
+            and "ngram_embedding.weight" in loaded
+            and "ngram_embedding.weight_scale" not in loaded
+        ):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
         return loaded
 
@@ -976,6 +992,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             ple_embedding._offload_quant_method = _get_ple_embedding_quant_method(
                 quant_config,
                 f"{prefix}.ple_embedding.ngram_embedding",
+                getattr(config, "ple_embedding_dtype", None),
             )
         self.ple_embedding: nn.Module = ple_embedding
         self.key_proj = ReplicatedLinear(
