@@ -527,13 +527,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     query_start_loc_cpu[1 : num_decodes + 1]
                     - query_start_loc_cpu[:num_decodes]
                 )
-                # A single-token prefill row replayed as decode has no history
-                # yet (decode_steps < 0); anchor it at the ring start so it
-                # applies one recurrence step off the checkpoint, as the
-                # baseline kernel would.
+                # ⚠ A row with decode_steps < 0 is a single-token prompt tail
+                # replayed as decode. Mamba2 handles it by forcing a one-token
+                # flush (is_flush=1), but the GDN ring kernel derives flush
+                # solely from the cursor -- fused_recurrent_replayssm.py:53,
+                # `b_is_flush = b_write_pos == MAX_CACHE_LEN - 1` -- and takes
+                # no per-row override. Pinning such a row to write_pos=0 would
+                # emit the right token but never commit its state, and the next
+                # token would overwrite ring entry 0, silently dropping the
+                # prompt tail's contribution.
+                # Fail loudly instead of returning quietly wrong numbers. The
+                # profiling waves never produce these rows (every request
+                # prefills in full before the decode barrier releases), so this
+                # is a guard, not a limitation we are working around.
                 valid_decode_rows = decode_query_lens_cpu > 0
+                leftover_prompt = valid_decode_rows & (decode_steps_cpu < 0)
+                if bool(torch.any(leftover_prompt)):
+                    raise NotImplementedError(
+                        "GDN ReplaySSM cannot serve a single-token prompt tail "
+                        "as a decode row: the ring kernel has no per-row flush, "
+                        "so that row's state would never be committed. Add "
+                        "flush support to fused_recurrent_gated_delta_rule_"
+                        "replayssm before enabling this workload."
+                    )
                 decode_steps_cpu = torch.where(
-                    valid_decode_rows & (decode_steps_cpu >= 0),
+                    valid_decode_rows,
                     decode_steps_cpu,
                     torch.zeros_like(decode_steps_cpu),
                 )

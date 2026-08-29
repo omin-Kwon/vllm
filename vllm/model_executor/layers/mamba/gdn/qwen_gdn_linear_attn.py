@@ -31,6 +31,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
@@ -353,15 +354,33 @@ class ChunkGatedDeltaRule(CustomOp):
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        # ⚠ This is what actually sizes the layer's cache: MambaSpec and
+        # bind_kv_cache are built from get_state_shape()/get_state_dtype()
+        # (mamba/abstract.py:38,72). The model-level calculator only feeds page
+        # padding, so extending it alone leaves self.kv_cache with two entries
+        # and the ReplaySSM decode path fails on kv_cache[2].
+        return MambaStateShapeCalculator.gated_delta_net_cached_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
             self.head_k_dim,
             self.head_v_dim,
             self.conv_kernel_size,
+            self.cache_config.use_replayssm,
+            self.cache_config.replayssm_buffer_len,
             self.num_spec,
+        )
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        # Overridden here rather than in GatedDeltaNetAttention (base.py):
+        # that base is shared with the Kimi and Olmo GDN layers, which have no
+        # ReplaySSM ring and must keep returning two dtypes.
+        return MambaStateDtypeCalculator.gated_delta_net_cached_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+            self.cache_config.use_replayssm,
         )
 
     def __init__(
@@ -520,7 +539,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -1090,7 +1109,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
+        state_dtype = self.get_state_dtype()[1]
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1277,20 +1296,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
-        if (
-            self.enable_packed_recurrent_decode
-            and attn_metadata.spec_sequence_masks is None
+        # ⚠ ReplaySSM is gated on the wave being a pure non-spec decode, NOT on
+        # the packed-decode env flag. Nesting it under
+        # VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE meant that with that flag off,
+        # --use-replayssm fell through to the generic path with no error -- an
+        # "ON" run silently measuring OFF.
+        is_non_spec_decode = (
+            attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
-        ):
-            if self.use_replayssm:
-                return self._forward_core_decode_non_spec_cached(
-                    mixed_qkv=mixed_qkv,
-                    b=b,
-                    a=a,
-                    core_attn_out=core_attn_out,
-                    attn_metadata=attn_metadata,
-                )
+        )
+
+        if self.use_replayssm and is_non_spec_decode:
+            return self._forward_core_decode_non_spec_cached(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+
+        if self.enable_packed_recurrent_decode and is_non_spec_decode:
             return self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
                 b=b,
