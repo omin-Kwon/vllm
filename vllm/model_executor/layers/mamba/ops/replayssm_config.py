@@ -22,6 +22,14 @@ def _is_blackwell() -> bool:
         return False
 
 
+@functools.cache
+def _is_sm103() -> bool:
+    try:
+        return current_platform.is_device_capability(103)
+    except Exception:
+        return False
+
+
 # Per-kernel overrides keyed by the kernel name passed to get_replayssm_config.
 _overrides: dict[str, tuple] = {}
 
@@ -62,8 +70,14 @@ def _l_bucket(cache_len: int) -> int:
 
 
 # (block_v, num_warps, num_stages, nk) for the GDN ReplaySSM decode kernel.
-# Measured on the deployment shape (bs=256, Qwen3.8 geometry): BV64/nk4/w1/s2.
+# The SM103 L=16 entry was selected from a 640-config B300 sweep at the
+# Qwen3.8-Flash-Next geometry and checked across B=64..512.
 _GDN_DECODE_BY_L = {8: (64, 1, 2, 4), 16: (64, 1, 2, 4), 32: (64, 1, 2, 4)}
+_GDN_DECODE_SM103_BY_L = {
+    8: (64, 1, 2, 4),
+    16: (128, 1, 1, 4),
+    32: (64, 1, 2, 4),
+}
 
 
 def get_replayssm_config(kernel: str, **shape) -> tuple:
@@ -82,5 +96,6 @@ def get_replayssm_config(kernel: str, **shape) -> tuple:
     # (callers unpack 5, the fork returns 2) and decode dies with
     # "not enough values to unpack". See scale/PORT_GDN_REPLAY.md.
     if kernel == "gdn_decode":
-        return _GDN_DECODE_BY_L[_l_bucket(shape.get("L", 16))]
+        configs = _GDN_DECODE_SM103_BY_L if _is_sm103() else _GDN_DECODE_BY_L
+        return configs[_l_bucket(shape.get("L", 16))]
     raise ValueError(f"unknown ReplaySSM kernel config key: {kernel}")
