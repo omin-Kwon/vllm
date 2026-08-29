@@ -122,6 +122,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # ReplaySSM (GDN cached decode). Mirrors mamba_attn.py's Mamba2 plumbing.
         self.use_replayssm: bool = vllm_config.cache_config.use_replayssm
+        self._in_cudagraph_capture: bool = False
         self.replayssm_buffer_len: int = vllm_config.cache_config.replayssm_buffer_len
 
         self.decode_cudagraph_max_bs: int = (
@@ -507,6 +508,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             decode_base_cpu = m.replayssm_decode_base_cpu
             num_computed_tokens_cpu = m._num_computed_tokens_cpu
             if decode_base_cpu is None or num_computed_tokens_cpu is None:
+                if not self._in_cudagraph_capture:
+                    raise RuntimeError(
+                        "GDN ReplaySSM needs replayssm_decode_base_cpu and "
+                        "_num_computed_tokens_cpu on every decode step, but "
+                        "this build has neither. The v2 model runner "
+                        "(vllm/v1/worker/gpu/) does not populate them -- only "
+                        "gpu_model_runner.py does. Run with "
+                        "VLLM_USE_V2_MODEL_RUNNER=0, or thread the tensors "
+                        "through gpu/attn_utils.build_attn_metadata. Falling "
+                        "back to write_pos=0 here would pin the ring at entry "
+                        "0 and silently stop the state from advancing."
+                    )
                 # CUDA-graph capture builds dummy metadata without the CPU-side
                 # counts (gpu/cudagraph_utils.py prepare_inputs_to_capture). A
                 # real decode step always has them: the model runner fills
@@ -646,4 +659,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+        # Mark the capture path so the ReplaySSM cursor fallback below can tell
+        # a dummy build from a real decode. Without this distinction the
+        # fallback fires on every real step under the v2 model runner, which
+        # never populates replayssm_decode_base_cpu -- write_pos stays 0, the
+        # ring never advances, and generation degenerates into repetition.
+        self._in_cudagraph_capture = True
+        try:
+            return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+        finally:
+            self._in_cudagraph_capture = False
