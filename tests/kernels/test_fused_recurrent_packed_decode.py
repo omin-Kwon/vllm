@@ -9,6 +9,9 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from vllm.third_party.flash_linear_attention.ops.fused_recurrent_replayssm import (
+    fused_recurrent_gated_delta_rule_replayssm,
+)
 
 DEVICE = current_platform.device_type
 
@@ -129,3 +132,205 @@ def test_packed_decode_supports_large_batch_head_grid():
     )
 
     assert torch.count_nonzero(out).item() == 0
+
+
+def test_replayssm_decode_advances_across_flush_boundary():
+    """Replay output and checkpoint must track the materialized recurrence."""
+    torch.manual_seed(0)
+    device = torch.device(DEVICE)
+    dtype = torch.float32
+    batch, num_k_heads, num_v_heads = 1, 2, 4
+    key_dim = value_dim = 128
+    cache_len = 4
+    num_steps = 2 * cache_len + 1
+    qkv_dim = 2 * num_k_heads * key_dim + num_v_heads * value_dim
+
+    mixed_qkv = 0.1 * torch.randn(num_steps, qkv_dim, device=device, dtype=dtype)
+    a = 0.1 * torch.randn(num_steps, num_v_heads, device=device, dtype=dtype)
+    b = 0.1 * torch.randn_like(a)
+    A_log = torch.zeros(num_v_heads, device=device, dtype=dtype)
+    dt_bias = torch.zeros_like(A_log)
+    state_indices = torch.tensor([1], device=device, dtype=torch.int32)
+    state_baseline = 0.1 * torch.randn(
+        2, num_v_heads, value_dim, key_dim, device=device, dtype=dtype
+    )
+    state_replay = state_baseline.clone()
+    d_cache = torch.empty(
+        2, num_v_heads, cache_len, value_dim, device=device, dtype=dtype
+    )
+    k_cache = torch.empty(
+        2, num_k_heads, cache_len, key_dim, device=device, dtype=dtype
+    )
+    g_cache = torch.empty(2, num_v_heads, cache_len, device=device, dtype=torch.float32)
+
+    for step in range(num_steps):
+        out_baseline = torch.empty(
+            batch, 1, num_v_heads, value_dim, device=device, dtype=dtype
+        )
+        out_replay = torch.empty_like(out_baseline)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv[step : step + 1],
+            a=a[step : step + 1],
+            b=b[step : step + 1],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=key_dim**-0.5,
+            initial_state=state_baseline,
+            out=out_baseline,
+            ssm_state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        fused_recurrent_gated_delta_rule_replayssm(
+            mixed_qkv=mixed_qkv[step : step + 1],
+            a=a[step : step + 1],
+            b=b[step : step + 1],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=key_dim**-0.5,
+            initial_state=state_replay,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            out=out_replay,
+            ssm_state_indices=state_indices,
+            write_pos=torch.tensor(
+                [step % cache_len], device=device, dtype=torch.int32
+            ),
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        torch.testing.assert_close(out_replay, out_baseline, rtol=3e-3, atol=3e-3)
+        if step % cache_len == cache_len - 1:
+            torch.testing.assert_close(
+                state_replay[1], state_baseline[1], rtol=3e-3, atol=3e-3
+            )
+
+
+def test_replayssm_matches_flash_next_precision_across_two_flushes():
+    """Exercise the Flash-Next head geometry and its mixed cache dtypes."""
+    torch.manual_seed(17)
+    device = torch.device(DEVICE)
+    activation_dtype = torch.bfloat16
+    state_dtype = torch.float32
+    batch, num_k_heads, num_v_heads = 1, 16, 48
+    key_dim = value_dim = 128
+    cache_len = 16
+    num_steps = 2 * cache_len + 1
+    qkv_dim = 2 * num_k_heads * key_dim + num_v_heads * value_dim
+
+    mixed_qkv = (0.1 * torch.randn(num_steps, qkv_dim, device=device)).to(
+        activation_dtype
+    )
+    a = (0.1 * torch.randn(num_steps, num_v_heads, device=device)).to(activation_dtype)
+    b = (0.1 * torch.randn_like(a)).to(activation_dtype)
+    A_log = torch.zeros(num_v_heads, device=device, dtype=activation_dtype)
+    dt_bias = torch.zeros_like(A_log)
+    state_indices = torch.tensor([1], device=device, dtype=torch.int32)
+    state_baseline = 0.1 * torch.randn(
+        2,
+        num_v_heads,
+        value_dim,
+        key_dim,
+        device=device,
+        dtype=state_dtype,
+    )
+    state_replay = state_baseline.clone()
+    d_cache = torch.empty(
+        2,
+        num_v_heads,
+        cache_len,
+        value_dim,
+        device=device,
+        dtype=activation_dtype,
+    )
+    k_cache = torch.empty(
+        2,
+        num_k_heads,
+        cache_len,
+        key_dim,
+        device=device,
+        dtype=activation_dtype,
+    )
+    g_cache = torch.empty(2, num_v_heads, cache_len, device=device, dtype=torch.float32)
+
+    for step in range(num_steps):
+        out_baseline = torch.empty(
+            batch,
+            1,
+            num_v_heads,
+            value_dim,
+            device=device,
+            dtype=activation_dtype,
+        )
+        out_replay = torch.empty_like(out_baseline)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv[step : step + 1],
+            a=a[step : step + 1],
+            b=b[step : step + 1],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=key_dim**-0.5,
+            initial_state=state_baseline,
+            out=out_baseline,
+            ssm_state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        fused_recurrent_gated_delta_rule_replayssm(
+            mixed_qkv=mixed_qkv[step : step + 1],
+            a=a[step : step + 1],
+            b=b[step : step + 1],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=key_dim**-0.5,
+            initial_state=state_replay,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            out=out_replay,
+            ssm_state_indices=state_indices,
+            write_pos=torch.tensor(
+                [step % cache_len], device=device, dtype=torch.int32
+            ),
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        if step == 0:
+            torch.testing.assert_close(out_replay, out_baseline, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(out_replay, out_baseline, rtol=5e-3, atol=5e-4)
+        if step % cache_len == cache_len - 1:
+            torch.testing.assert_close(
+                state_replay[1], state_baseline[1], rtol=5e-3, atol=5e-4
+            )
+
+
+def test_replayssm_rejects_short_cursor_metadata():
+    device = torch.device(DEVICE)
+    batch, num_k_heads, num_v_heads = 2, 1, 1
+    key_dim = value_dim = 16
+    mixed_qkv = torch.zeros(
+        batch,
+        2 * num_k_heads * key_dim + num_v_heads * value_dim,
+        device=device,
+    )
+    gates = torch.zeros(batch, num_v_heads, device=device)
+    params = torch.zeros(num_v_heads, device=device)
+    state = torch.zeros(2, num_v_heads, value_dim, key_dim, device=device)
+    out = torch.empty(batch, 1, num_v_heads, value_dim, device=device)
+
+    with pytest.raises(ValueError, match="at least B=2 entries"):
+        fused_recurrent_gated_delta_rule_replayssm(
+            mixed_qkv=mixed_qkv,
+            a=gates,
+            b=gates,
+            A_log=params,
+            dt_bias=params,
+            scale=key_dim**-0.5,
+            initial_state=state,
+            d_cache=torch.zeros(2, num_v_heads, 4, value_dim, device=device),
+            k_cache=torch.zeros(2, num_k_heads, 4, key_dim, device=device),
+            g_cache=torch.zeros(2, num_v_heads, 4, device=device, dtype=torch.float32),
+            out=out,
+            ssm_state_indices=torch.ones(batch, device=device, dtype=torch.int32),
+            write_pos=torch.zeros(1, device=device, dtype=torch.int32),
+        )

@@ -208,6 +208,18 @@ def fused_recurrent_gated_delta_rule_replayssm(
         raise ValueError("`write_pos` must be a 1D int32 tensor.")
 
     B = mixed_qkv.shape[0]
+    if ssm_state_indices.ndim != 1 or ssm_state_indices.dtype != torch.int32:
+        raise ValueError("`ssm_state_indices` must be a 1D int32 tensor.")
+    if write_pos.shape[0] < B or ssm_state_indices.shape[0] < B:
+        raise ValueError(
+            f"`write_pos` and `ssm_state_indices` must have at least B={B} entries."
+        )
+    if write_pos.device != mixed_qkv.device:
+        raise ValueError("`write_pos` must be on the same device as `mixed_qkv`.")
+    if ssm_state_indices.device != mixed_qkv.device:
+        raise ValueError(
+            "`ssm_state_indices` must be on the same device as `mixed_qkv`."
+        )
     num_state_slots, HV, V, K = initial_state.shape
     qkv_dim = mixed_qkv.shape[1]
     q_dim = (qkv_dim - HV * V) // 2

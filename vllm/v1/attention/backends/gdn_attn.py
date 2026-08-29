@@ -122,7 +122,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # ReplaySSM (GDN cached decode). Mirrors mamba_attn.py's Mamba2 plumbing.
         self.use_replayssm: bool = vllm_config.cache_config.use_replayssm
-        self._in_cudagraph_capture: bool = False
         self.replayssm_buffer_len: int = vllm_config.cache_config.replayssm_buffer_len
 
         self.decode_cudagraph_max_bs: int = (
@@ -266,8 +265,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
         if spec_sequence_masks is None:
+            # A one-token prompt tail must update the materialized state through
+            # the prefill path. GDN ReplaySSM cannot force an early ring flush.
+            treat_short_extends_as_decodes = m.is_prefilling is None
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m,
+                    decode_threshold=1,
+                    treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
@@ -492,85 +498,51 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         # ── ReplaySSM (GDN cached decode) ────────────────────────────────
-        # Mirrors mamba_attn.py's Mamba2 derivation, minus the flush/align
-        # machinery: the GDN ring kernel takes only write_pos and wraps
-        # internally, so there is no is_flush_d to compute. write_pos counts
-        # decode steps since the ring's last full-state write, which lets a
-        # resumed request re-anchor correctly.
+        # The host wraps write_pos modulo the ring length. The kernel flushes
+        # naturally at L - 1, but it has no independent force-flush input for
+        # align boundaries. The fixed base remains valid across natural flushes
+        # and is reset to prefill_len when a request is (re)admitted.
         write_pos_d = None
         if self.use_replayssm and spec_sequence_masks is None and num_decodes > 0:
             if self.vllm_config.cache_config.mamba_cache_mode == "align":
                 raise NotImplementedError(
-                    "GDN ReplaySSM has no flush path, so it cannot honour the "
-                    "align cache mode's block-boundary checkpoints; run with "
-                    "--mamba-cache-mode none"
+                    "GDN ReplaySSM cannot force a flush at an align cache "
+                    "block boundary; run with --mamba-cache-mode none"
                 )
             decode_base_cpu = m.replayssm_decode_base_cpu
             num_computed_tokens_cpu = m._num_computed_tokens_cpu
             if decode_base_cpu is None or num_computed_tokens_cpu is None:
-                if not self._in_cudagraph_capture:
-                    raise RuntimeError(
-                        "GDN ReplaySSM needs replayssm_decode_base_cpu and "
-                        "_num_computed_tokens_cpu on every decode step, but "
-                        "this build has neither. The v2 model runner "
-                        "(vllm/v1/worker/gpu/) does not populate them -- only "
-                        "gpu_model_runner.py does. Run with "
-                        "VLLM_USE_V2_MODEL_RUNNER=0, or thread the tensors "
-                        "through gpu/attn_utils.build_attn_metadata. Falling "
-                        "back to write_pos=0 here would pin the ring at entry "
-                        "0 and silently stop the state from advancing."
-                    )
-                # CUDA-graph capture builds dummy metadata without the CPU-side
-                # counts (gpu/cudagraph_utils.py prepare_inputs_to_capture). A
-                # real decode step always has them: the model runner fills
-                # replayssm_decode_base_cpu whenever use_replayssm is set,
-                # independent of the model. The captured pass writes into NULL
-                # state slots and its output is discarded, so anchoring every
-                # row at the ring start is inert -- and it is what lets the
-                # graph be captured at all. Upstream's Mamba2 builder raises
-                # here instead, which is why nemotron_h --use-replayssm cannot
-                # boot under the v2 model runner in this tree (mamba_attn.py:593).
-                write_pos_cpu = torch.zeros(num_decodes, dtype=torch.int32)
-            else:
-                decode_steps_cpu = (
-                    num_computed_tokens_cpu[:num_decodes]
-                    - decode_base_cpu[:num_decodes]
+                raise RuntimeError(
+                    "GDN ReplaySSM requires replayssm_decode_base_cpu and "
+                    "_num_computed_tokens_cpu on every decode and CUDA graph "
+                    "capture build. Falling back to write_pos=0 would pin the "
+                    "ring and silently stop the recurrent state from advancing."
                 )
-                decode_query_lens_cpu = (
-                    query_start_loc_cpu[1 : num_decodes + 1]
-                    - query_start_loc_cpu[:num_decodes]
+            decode_steps_cpu = (
+                num_computed_tokens_cpu[:num_decodes] - decode_base_cpu[:num_decodes]
+            )
+            decode_query_lens_cpu = (
+                query_start_loc_cpu[1 : num_decodes + 1]
+                - query_start_loc_cpu[:num_decodes]
+            )
+            # This is defensive: is_prefilling rows are classified as prefills
+            # above. A negative step here therefore signals inconsistent input
+            # metadata rather than a row that the cached kernel can safely run.
+            valid_decode_rows = decode_query_lens_cpu > 0
+            leftover_prompt = valid_decode_rows & (decode_steps_cpu < 0)
+            if bool(torch.any(leftover_prompt)):
+                raise RuntimeError(
+                    "GDN ReplaySSM received a decode row before its prefill "
+                    "anchor. Route is_prefilling rows through the prefill path."
                 )
-                # ⚠ A row with decode_steps < 0 is a single-token prompt tail
-                # replayed as decode. Mamba2 handles it by forcing a one-token
-                # flush (is_flush=1), but the GDN ring kernel derives flush
-                # solely from the cursor -- fused_recurrent_replayssm.py:53,
-                # `b_is_flush = b_write_pos == MAX_CACHE_LEN - 1` -- and takes
-                # no per-row override. Pinning such a row to write_pos=0 would
-                # emit the right token but never commit its state, and the next
-                # token would overwrite ring entry 0, silently dropping the
-                # prompt tail's contribution.
-                # Fail loudly instead of returning quietly wrong numbers. The
-                # profiling waves never produce these rows (every request
-                # prefills in full before the decode barrier releases), so this
-                # is a guard, not a limitation we are working around.
-                valid_decode_rows = decode_query_lens_cpu > 0
-                leftover_prompt = valid_decode_rows & (decode_steps_cpu < 0)
-                if bool(torch.any(leftover_prompt)):
-                    raise NotImplementedError(
-                        "GDN ReplaySSM cannot serve a single-token prompt tail "
-                        "as a decode row: the ring kernel has no per-row flush, "
-                        "so that row's state would never be committed. Add "
-                        "flush support to fused_recurrent_gated_delta_rule_"
-                        "replayssm before enabling this workload."
-                    )
-                decode_steps_cpu = torch.where(
-                    valid_decode_rows,
-                    decode_steps_cpu,
-                    torch.zeros_like(decode_steps_cpu),
-                )
-                write_pos_cpu = torch.remainder(
-                    decode_steps_cpu, self.replayssm_buffer_len
-                ).to(torch.int32)
+            decode_steps_cpu = torch.where(
+                valid_decode_rows,
+                decode_steps_cpu,
+                torch.zeros_like(decode_steps_cpu),
+            )
+            write_pos_cpu = torch.remainder(
+                decode_steps_cpu, self.replayssm_buffer_len
+            ).to(torch.int32)
             write_pos_d = async_tensor_h2d(
                 write_pos_cpu.tolist(),
                 dtype=torch.int32,
@@ -659,13 +631,4 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
-        # Mark the capture path so the ReplaySSM cursor fallback below can tell
-        # a dummy build from a real decode. Without this distinction the
-        # fallback fires on every real step under the v2 model runner, which
-        # never populates replayssm_decode_base_cpu -- write_pos stays 0, the
-        # ring never advances, and generation degenerates into repetition.
-        self._in_cudagraph_capture = True
-        try:
-            return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
-        finally:
-            self._in_cudagraph_capture = False
+        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)

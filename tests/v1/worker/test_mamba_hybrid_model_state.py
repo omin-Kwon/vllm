@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
@@ -14,6 +16,54 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+
+
+def test_prepare_attn_threads_padded_replayssm_cpu_metadata() -> None:
+    """V2 must preserve the per-request ring origin, including on resume."""
+    state = object.__new__(MambaHybridModelState)
+    state.cache_config = SimpleNamespace(use_replayssm=True)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+    state.max_model_len = 1024
+    state._align_mode = False
+    state.recoverssm = None
+
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_reqs_after_padding=4,
+        num_tokens=2,
+        num_tokens_after_padding=4,
+        query_start_loc_np=np.array([0, 1, 2, 2, 2], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+        num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([101, 106, 0, 0]),
+        is_prefilling_np=np.array([False, False]),
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int32),
+        prefill_len_np=np.array([100, 105], dtype=np.int32),
+        num_computed_tokens_np=np.array([100, 105], dtype=np.int32),
+        seq_lens=torch.tensor([101, 106, 0, 0], dtype=torch.int32),
+        dcp_local_seq_lens=None,
+        prompt_lens=None,
+    )
+
+    with patch(
+        "vllm.v1.worker.gpu.model_states.mamba_hybrid.build_attn_metadata",
+        return_value={"layer": object()},
+    ) as build_attn_metadata:
+        state.prepare_attn(
+            input_batch=input_batch,
+            cudagraph_mode=CUDAGraphMode.FULL,
+            block_tables=(torch.zeros((4, 1), dtype=torch.int32),),
+            slot_mappings=torch.zeros((1, 4), dtype=torch.int64),
+            attn_groups=[],
+            kv_cache_config=SimpleNamespace(),
+        )
+
+    model_metadata = build_attn_metadata.call_args.kwargs[
+        "model_specific_attn_metadata"
+    ]
+    common_kwargs = model_metadata.get_extra_common_attn_kwargs(0, num_reqs=4)
+    assert common_kwargs["replayssm_decode_base_cpu"].tolist() == [100, 105, 0, 0]
+    assert common_kwargs["_num_computed_tokens_cpu"].tolist() == [100, 105, 0, 0]
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

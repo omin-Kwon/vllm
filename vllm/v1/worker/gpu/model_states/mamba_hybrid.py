@@ -41,13 +41,22 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    replayssm_decode_base_cpu: torch.Tensor | None = None
+    num_computed_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        kwargs: dict[str, Any] = {"is_prefilling": self.is_prefilling[:num_reqs]}
+        if self.replayssm_decode_base_cpu is not None:
+            kwargs["replayssm_decode_base_cpu"] = self.replayssm_decode_base_cpu[
+                :num_reqs
+            ]
+        if self.num_computed_tokens_cpu is not None:
+            kwargs["_num_computed_tokens_cpu"] = self.num_computed_tokens_cpu[:num_reqs]
+        return kwargs
 
     def get_extra_attn_kwargs(
         self,
@@ -285,6 +294,22 @@ class MambaHybridModelState(DefaultModelState):
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
+        replayssm_decode_base_cpu = None
+        num_computed_tokens_cpu = None
+        if self.cache_config.use_replayssm:
+            # ReplaySSM metadata is request-indexed, so FULL CUDA graphs need
+            # zero-filled entries for request padding. prefill_len is the ring
+            # origin: on re-admission it includes output tokens being replayed.
+            replayssm_decode_base_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+            num_computed_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+            num_actual_reqs = input_batch.num_reqs
+            replayssm_decode_base_cpu[:num_actual_reqs].copy_(
+                torch.from_numpy(input_batch.prefill_len_np)
+            )
+            num_computed_tokens_cpu[:num_actual_reqs].copy_(
+                torch.from_numpy(input_batch.num_computed_tokens_np)
+            )
+
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
             aligned_index_builders = []
@@ -307,6 +332,8 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

@@ -125,6 +125,7 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    replayssm_buffer_len: int | None = None,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -133,6 +134,10 @@ def _create_gdn_builder(
     )
     if full_cuda_graph:
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    if replayssm_buffer_len is not None:
+        vllm_config.cache_config.use_replayssm = True
+        vllm_config.cache_config.replayssm_buffer_len = replayssm_buffer_len
+        vllm_config.cache_config.mamba_cache_mode = "none"
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
@@ -221,3 +226,53 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_replayssm_write_pos_uses_per_request_resume_anchor():
+    builder = _create_gdn_builder(replayssm_buffer_len=16)
+    batch = BatchSpec(seq_lens=[101, 106, 116], query_lens=[1, 1, 1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([False, False, False]),
+        replayssm_decode_base_cpu=torch.tensor([100, 105, 100]),
+    )
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert meta.write_pos_d is not None
+    assert meta.write_pos_d.tolist() == [0, 0, 15]
+
+
+def test_replayssm_write_pos_advances_and_wraps_twice():
+    cache_len = 16
+    num_steps = 2 * cache_len + 1
+    builder = _create_gdn_builder(replayssm_buffer_len=cache_len)
+    computed = torch.arange(100, 100 + num_steps, dtype=torch.int32)
+    batch = BatchSpec(
+        seq_lens=(computed + 1).tolist(),
+        query_lens=[1] * num_steps,
+    )
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.zeros(num_steps, dtype=torch.bool),
+        replayssm_decode_base_cpu=torch.full((num_steps,), 100, dtype=torch.int32),
+        _num_computed_tokens_cpu=computed,
+    )
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert meta.write_pos_d is not None
+    assert meta.write_pos_d.tolist() == list(range(cache_len)) * 2 + [0]
+
+
+def test_replayssm_routes_single_token_prefill_through_prefill_path():
+    builder = _create_gdn_builder(replayssm_buffer_len=16)
+    batch = BatchSpec(seq_lens=[100], query_lens=[1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([True]),
+        replayssm_decode_base_cpu=torch.tensor([100]),
+    )
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert meta.num_decodes == 0
+    assert meta.num_prefills == 1
+    assert meta.write_pos_d is None
