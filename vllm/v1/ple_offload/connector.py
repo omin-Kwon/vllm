@@ -28,6 +28,11 @@ from vllm.v1.ple_offload.protocol import (
 
 logger = init_logger(__name__)
 
+# Depth of the input-readiness event ring. The request queue holds one pending
+# request, so at most two are live (one queued, one being staged); the extra
+# slots are slack.
+_INPUT_READY_RING = 4
+
 
 def _cuda_check(result: Any, operation: str) -> Any:
     """Check the ``(CUresult, ...)`` tuple returned by cuda-python calls."""
@@ -102,7 +107,14 @@ class PleOffloadConnector:
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
         self._d2h_stream: torch.cuda.Stream | None = None
-        self._input_ready_event: torch.cuda.Event | None = None
+        # One reused event cannot express "inputs for request N are ready":
+        # the model thread runs ahead of the GPU, so re-recording it for
+        # request N+1 moves the wait behind request N's own ple_offload_wait
+        # spin, which only request N's reply can release. Give each in-flight
+        # request its own event. The queue holds one pending request, so a
+        # short ring is enough.
+        self._input_ready_events: list[torch.cuda.Event] = []
+        self._launch_counter = 0
         self._d2h_done_event: torch.cuda.Event | None = None
 
         try:
@@ -118,7 +130,9 @@ class PleOffloadConnector:
                     self._pin_input_buffers()
                     if self._uses_cuda_inputs:
                         self._d2h_stream = torch.cuda.Stream(device=self.device)
-                        self._input_ready_event = torch.cuda.Event()
+                        self._input_ready_events = [
+                            torch.cuda.Event() for _ in range(_INPUT_READY_RING)
+                        ]
                         self._d2h_done_event = torch.cuda.Event()
                 self._start_request_thread(ipc_addr)
         except Exception:
@@ -338,14 +352,15 @@ class PleOffloadConnector:
         """Stage MRV2 inputs on the background D2H stream."""
         if (
             self._d2h_stream is None
-            or self._input_ready_event is None
+            or not self._input_ready_events
             or self._d2h_done_event is None
         ):
             raise RuntimeError("PLE D2H resources are not initialized")
 
+        input_ready = self._input_ready_events[request.event_idx]
         with torch.accelerator.device_index(self.device.index):
             with torch.cuda.stream(self._d2h_stream):
-                self._d2h_stream.wait_event(self._input_ready_event)
+                self._d2h_stream.wait_event(input_ready)
                 with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
                     self._input_ids_buf[: request.num_tokens].copy_(
                         self._input_ids_source[: request.num_tokens],
@@ -378,15 +393,21 @@ class PleOffloadConnector:
         if self.tp_rank != 0:
             return
 
+        event_idx = 0
         if self._uses_cuda_inputs:
-            assert self._input_ready_event is not None
+            assert self._input_ready_events
+            event_idx = self._launch_counter % len(self._input_ready_events)
+            self._launch_counter += 1
             # The background copy stream waits for runner input production
             # without making the model stream wait for D2H completion.
-            self._input_ready_event.record(torch.cuda.current_stream(self.device))
+            self._input_ready_events[event_idx].record(
+                torch.cuda.current_stream(self.device)
+            )
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            event_idx=event_idx,
         )
         self._request_queue.put_nowait(request)
 
@@ -438,7 +459,7 @@ class PleOffloadConnector:
             with torch.accelerator.device_index(self.device.index):
                 self._unpin_input_buffers()
         self._d2h_done_event = None
-        self._input_ready_event = None
+        self._input_ready_events = []
         self._d2h_stream = None
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)
