@@ -507,29 +507,41 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             decode_base_cpu = m.replayssm_decode_base_cpu
             num_computed_tokens_cpu = m._num_computed_tokens_cpu
             if decode_base_cpu is None or num_computed_tokens_cpu is None:
-                raise ValueError(
-                    "--use-replayssm requires CPU decode-base and "
-                    "computed-token counts to derive decode write positions"
+                # CUDA-graph capture builds dummy metadata without the CPU-side
+                # counts (gpu/cudagraph_utils.py prepare_inputs_to_capture). A
+                # real decode step always has them: the model runner fills
+                # replayssm_decode_base_cpu whenever use_replayssm is set,
+                # independent of the model. The captured pass writes into NULL
+                # state slots and its output is discarded, so anchoring every
+                # row at the ring start is inert -- and it is what lets the
+                # graph be captured at all. Upstream's Mamba2 builder raises
+                # here instead, which is why nemotron_h --use-replayssm cannot
+                # boot under the v2 model runner in this tree (mamba_attn.py:593).
+                write_pos_cpu = torch.zeros(num_decodes, dtype=torch.int32)
+            else:
+                decode_steps_cpu = (
+                    num_computed_tokens_cpu[:num_decodes]
+                    - decode_base_cpu[:num_decodes]
                 )
-            decode_steps_cpu = (
-                num_computed_tokens_cpu[:num_decodes] - decode_base_cpu[:num_decodes]
-            )
-            decode_query_lens_cpu = (
-                query_start_loc_cpu[1 : num_decodes + 1]
-                - query_start_loc_cpu[:num_decodes]
-            )
-            # A single-token prefill row replayed as decode has no history yet
-            # (decode_steps < 0); anchor it at the ring start so it applies one
-            # recurrence step off the checkpoint, as the baseline kernel would.
-            valid_decode_rows = decode_query_lens_cpu > 0
-            decode_steps_cpu = torch.where(
-                valid_decode_rows & (decode_steps_cpu >= 0),
-                decode_steps_cpu,
-                torch.zeros_like(decode_steps_cpu),
-            )
-            write_pos_cpu = torch.remainder(decode_steps_cpu, self.replayssm_buffer_len)
+                decode_query_lens_cpu = (
+                    query_start_loc_cpu[1 : num_decodes + 1]
+                    - query_start_loc_cpu[:num_decodes]
+                )
+                # A single-token prefill row replayed as decode has no history
+                # yet (decode_steps < 0); anchor it at the ring start so it
+                # applies one recurrence step off the checkpoint, as the
+                # baseline kernel would.
+                valid_decode_rows = decode_query_lens_cpu > 0
+                decode_steps_cpu = torch.where(
+                    valid_decode_rows & (decode_steps_cpu >= 0),
+                    decode_steps_cpu,
+                    torch.zeros_like(decode_steps_cpu),
+                )
+                write_pos_cpu = torch.remainder(
+                    decode_steps_cpu, self.replayssm_buffer_len
+                ).to(torch.int32)
             write_pos_d = async_tensor_h2d(
-                write_pos_cpu.to(torch.int32).tolist(),
+                write_pos_cpu.tolist(),
                 dtype=torch.int32,
                 device=query_start_loc.device,
             )
