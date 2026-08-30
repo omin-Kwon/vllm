@@ -346,9 +346,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     dragged = decode_rows.clone()
                     dragged[:first] = False
                     if bool(torch.all(before_anchor[dragged])):
-                        m = m.replace(
-                            is_prefilling=m.is_prefilling | before_anchor
-                        )
+                        m = m.replace(is_prefilling=m.is_prefilling | before_anchor)
                     else:
                         logger.error(
                             "GDN ReplaySSM: %d row(s) sit before their ring "

@@ -14,7 +14,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 _PATH = os.environ.get("NS_GDN_PRUNE", "").strip()
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _CPU_MASKS: dict[int, Any] | None = None
@@ -55,22 +54,28 @@ def _load() -> tuple[dict[int, Any], dict[str, Any]]:
     layer_keys = {int(key) for key in layers}
     if layer_keys != set(expected_layers):
         raise RuntimeError(
-            f"DRRQR layer set mismatch: expected={expected_layers}, actual={sorted(layer_keys)}"
+            f"DRRQR layer set mismatch: expected={expected_layers}, "
+            f"actual={sorted(layer_keys)}"
         )
 
     masks: dict[int, Any] = {}
     kept_width: int | None = None
     for layer_index in expected_layers:
-        entry = layers[layer_index] if layer_index in layers else layers[str(layer_index)]
+        entry = (
+            layers[layer_index] if layer_index in layers else layers[str(layer_index)]
+        )
         keep = entry["keep_local_rrqr_order"].to(dtype=torch.int64)
         if keep.ndim != 2 or keep.shape[0] != num_heads:
             raise RuntimeError(
-                f"Layer {layer_index}: expected keep indices [16, kept], got {tuple(keep.shape)}"
+                f"Layer {layer_index}: expected keep indices [16, kept], "
+                f"got {tuple(keep.shape)}"
             )
         if kept_width is None:
             kept_width = int(keep.shape[1])
         if int(keep.shape[1]) != kept_width:
-            raise RuntimeError(f"Layer {layer_index}: inconsistent kept width {keep.shape[1]}")
+            raise RuntimeError(
+                f"Layer {layer_index}: inconsistent kept width {keep.shape[1]}"
+            )
         if kept_width <= 0 or kept_width > head_dim:
             raise RuntimeError(f"Layer {layer_index}: invalid kept width {kept_width}")
         if bool(((keep < 0) | (keep >= head_dim)).any()):
@@ -98,7 +103,9 @@ def configure_layer(layer: Any, prefix: str) -> None:
         )
     match = _LAYER_RE.search(prefix)
     if match is None:
-        raise RuntimeError(f"Cannot derive model layer index from GDN prefix: {prefix!r}")
+        raise RuntimeError(
+            f"Cannot derive model layer index from GDN prefix: {prefix!r}"
+        )
     layer_index = int(match.group(1))
     masks, metadata = _load()
     if layer_index not in masks:

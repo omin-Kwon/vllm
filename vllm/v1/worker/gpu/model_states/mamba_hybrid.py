@@ -286,7 +286,7 @@ class MambaHybridModelState(DefaultModelState):
         )
         prefill_len_cpu = None
         qmamba_num_computed_tokens_cpu = None
-        if self.gdn_qmamba_bits:
+        if getattr(self, "gdn_qmamba_bits", 0):
             prefill_len_cpu = torch.zeros(num_reqs, dtype=torch.int32)
             qmamba_num_computed_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
             prefill_len_cpu[: input_batch.num_reqs].copy_(
