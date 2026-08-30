@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -22,6 +23,8 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+logger = init_logger(__name__)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -267,6 +270,66 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if spec_sequence_masks is None:
             # A one-token prompt tail must update the materialized state through
             # the prefill path. GDN ReplaySSM cannot force an early ring flush.
+            #
+            # ⚠ `is_prefilling` is anchored on the **prompt** length
+            # (num_computed < num_prompt), but the ReplaySSM ring is anchored on
+            # `replayssm_decode_base` = the full context at (re)admission
+            # (`gpu_input_batch.add_request`). The two diverge whenever a request
+            # is re-admitted holding a token that is sampled but not yet
+            # computed: the base becomes num_computed + 1 while `is_prefilling`
+            # already reads False, the row lands in the decode section, and
+            # `decode_steps = num_computed - base` goes negative -- the guard
+            # further down then raises.
+            #
+            # vLLM evicts *"running requests that are not scheduled in this
+            # step"* from the persistent batch (`_update_states`), which is
+            # exactly what the profiling decode barrier does to every request it
+            # holds, and also what a token-budget-starved step does under load.
+            # Observed 2026-08-30 (DP4+EP4, B64): the whole cohort came back with
+            # num_computed=1024, base=1025 on the first step after release.
+            #
+            # Send those rows through the prefill path for the one step that
+            # re-materializes the state at the anchor; decode_steps then starts
+            # at 0 as the ring expects. The chunk kernel is what builds the ring
+            # and the state, so the prefill path is where they belong.
+            if (
+                self.use_replayssm
+                and m.is_prefilling is not None
+                and m.replayssm_decode_base_cpu is not None
+                and m._num_computed_tokens_cpu is not None
+            ):
+                num_rows = m.is_prefilling.shape[0]
+                query_lens_cpu = torch.diff(m.query_start_loc_cpu)[:num_rows]
+                decode_rows = (query_lens_cpu > 0) & ~m.is_prefilling
+                before_anchor = decode_rows & (
+                    m._num_computed_tokens_cpu[:num_rows]
+                    < m.replayssm_decode_base_cpu[:num_rows]
+                )
+                if bool(torch.any(before_anchor)):
+                    # `split_decodes_and_prefills` cuts the batch at the FIRST
+                    # prefill row, so marking a row in the middle of the decode
+                    # section would drag every later decode row into the prefill
+                    # path with it. Those rows would have their state
+                    # re-materialized while their ring cursor keeps counting, and
+                    # the next step would replay ring entries already folded into
+                    # the state -- silently wrong output. Only re-route when the
+                    # affected rows run to the end of the decode section (which is
+                    # the barrier case: the whole cohort is released together).
+                    # Otherwise leave the guard below to fail loudly.
+                    first = int(before_anchor.int().argmax().item())
+                    dragged = decode_rows.clone()
+                    dragged[:first] = False
+                    if bool(torch.all(before_anchor[dragged])):
+                        m = m.replace(
+                            is_prefilling=m.is_prefilling | before_anchor
+                        )
+                    else:
+                        logger.error(
+                            "GDN ReplaySSM: %d row(s) sit before their ring "
+                            "anchor but genuine decode rows follow them; "
+                            "re-routing would corrupt those rows' ring state.",
+                            int(before_anchor.sum().item()),
+                        )
             treat_short_extends_as_decodes = m.is_prefilling is None
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
