@@ -401,6 +401,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
+
+        _gdn_prune.configure_layer(self, prefix)
+        if self._gdn_prune_active and (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or current_platform.is_cpu()
+        ):
+            raise RuntimeError(
+                "NS_GDN_PRUNE is implemented only for the CUDA GDN path"
+            )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -517,6 +528,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # flag and the state layout must be decided from the same config.
         self.use_replayssm = vllm_config.cache_config.use_replayssm
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
+        if self._gdn_prune_active and self.gdn_decode_kernel == "cuda":
+            logger.info_once(
+                "GDN pruning forces the Triton decode path so the post-conv Q/K mask is not bypassed"
+            )
+            self.gdn_decode_kernel = "triton"
         if self.gdn_decode_kernel == "cuda":
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
             if reason is not None:
@@ -1101,6 +1117,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
+        if self._gdn_prune_active:
+            from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
+
+            _gdn_prune.prepare_device_mask(
+                self, qkv_or_qkvz.device, qkv_or_qkvz.dtype
+            )
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
@@ -1421,6 +1443,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
+        if self._gdn_prune_active:
+            from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
+
+            _gdn_prune.prune_mixed(self, mixed_qkv_spec)
+            _gdn_prune.prune_mixed(self, mixed_qkv_non_spec)
+
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
@@ -1712,6 +1740,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
+        if self._gdn_prune_active:
+            from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
+
+            _gdn_prune.prune_mixed(self, mixed_qkv_non_spec)
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
@@ -1780,6 +1812,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
+        if self._gdn_prune_active:
+            from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
+
+            _gdn_prune.prune_mixed(self, mixed_qkv_non_spec)
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_replayssm(
             mixed_qkv=mixed_qkv_non_spec,
