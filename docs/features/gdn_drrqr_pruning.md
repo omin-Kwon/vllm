@@ -98,6 +98,53 @@ The wrapper reuses the established Flash-Next NVFP4 protocol, including
 ReplaySSM buffer length 16, BF16 QSA KV, disabled FlashInfer autotune, v2 model
 runner, and the existing CUDA-graph profiling stages.
 
+## Q-Mamba DSQ baseline
+
+This tree also carries an accuracy-only Q-Mamba baseline for the materialized
+GDN recurrent state. It applies the paper's dynamic separable quantization
+(DSQ) to the last two state axes, `(value_dim, key_dim)`, using the
+square-root-mean channel scale and the state-axis maximum. Channel and state
+scales are each rounded to FP16 before multiplication, matching the existing
+`vllm_gdn` Q-Mamba protocol.
+
+The hook fake-quantizes the FP32 cache in place: it rounds to the selected
+integer grid and immediately dequantizes back to FP32. It therefore measures
+accuracy effects only; it does not allocate a packed integer cache and cannot
+be used to claim state-memory or throughput savings. No calibration or
+projector checkpoint is required.
+
+Supported widths are 10, 8, 6, and 4 bits:
+
+```bash
+NS_GDN_QBITS=8 \
+NS_GDN_QGRAN=dsq_qm \
+  <existing Qwen3.8-Flash-Next-NVFP4 vLLM command> \
+  --mamba-ssm-cache-dtype float32 \
+  --mamba-cache-mode none \
+  --no-enable-prefix-caching
+```
+
+ReplaySSM must be off for this arm. Speculative decoding and stochastic
+rounding/ESR are not implemented. Unsupported bit widths, another
+`NS_GDN_QGRAN`, `NS_GDN_QSR`, ReplaySSM, a non-FP32 SSM cache, or a Mamba cache
+mode other than `none` fail at startup.
+
+Scheduler chunking does not change the method: the v2 runner supplies the exact
+prompt length and computed-token count, the GDN metadata marks only the logical
+end of prefill, and the hook quantizes once there and once after every ordinary
+decode step. Intermediate prefill chunks and CUDA-graph padding rows are
+masked. CUDA graph capture uses the same fixed-address runtime mask that is
+updated before each replay.
+
+`NS_GDN_PRUNE` and `NS_GDN_QBITS` are technically composable in this tree, but
+a standalone Q-Mamba baseline should leave `NS_GDN_PRUNE` unset. Conversely,
+the DRRQR + ReplaySSM measurements above must leave `NS_GDN_QBITS` unset.
+
+The runtime environment
+`/disk2/omin/miniconda3/envs/vllm029_q38next` is an editable install pointing at
+`/disk2/omin/vllm-qwen38next`, so this source change is already the environment
+implementation; no site-packages overlay is needed.
+
 ## Required GPU validation before reporting results
 
 1. Run the extractor and confirm all four `validation.json` files pass.
@@ -107,3 +154,8 @@ runner, and the existing CUDA-graph profiling stages.
 3. Run ReplaySSM ON twice: unpruned and pruned, recording the index SHA-256,
    vLLM commit, model config hash, selected kernel, and generated output.
 4. Only then enable CUDA graphs and run the prepared breakdown wrapper.
+
+For Q-Mamba, add a separate eager smoke before accuracy evaluation: confirm the
+`[gdnq]` startup banner, compare one-shot and forced multi-chunk prefill, then
+compare eager and CUDA-graph decode. No Q-Mamba GPU forward was run while this
+port was prepared.

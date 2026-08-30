@@ -43,6 +43,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
     replayssm_decode_base_cpu: torch.Tensor | None = None
     num_computed_tokens_cpu: torch.Tensor | None = None
+    prefill_len_cpu: torch.Tensor | None = None
+    qmamba_num_computed_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -73,7 +75,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             ),
         ):
             return {}
-        return {
+        kwargs = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -81,6 +83,18 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+            kwargs["qmamba_prefill_len_cpu"] = (
+                None
+                if self.prefill_len_cpu is None
+                else self.prefill_len_cpu[:num_reqs]
+            )
+            kwargs["qmamba_num_computed_tokens_cpu"] = (
+                None
+                if self.qmamba_num_computed_tokens_cpu is None
+                else self.qmamba_num_computed_tokens_cpu[:num_reqs]
+            )
+        return kwargs
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -95,6 +109,9 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import bits_from_env
+
+        self.gdn_qmamba_bits = bits_from_env()
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -267,6 +284,17 @@ class MambaHybridModelState(DefaultModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
+        prefill_len_cpu = None
+        qmamba_num_computed_tokens_cpu = None
+        if self.gdn_qmamba_bits:
+            prefill_len_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+            qmamba_num_computed_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+            prefill_len_cpu[: input_batch.num_reqs].copy_(
+                torch.from_numpy(input_batch.prefill_len_np)
+            )
+            qmamba_num_computed_tokens_cpu[: input_batch.num_reqs].copy_(
+                torch.from_numpy(input_batch.num_computed_tokens_np)
+            )
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.
@@ -334,6 +362,8 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             replayssm_decode_base_cpu=replayssm_decode_base_cpu,
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            prefill_len_cpu=prefill_len_cpu,
+            qmamba_num_computed_tokens_cpu=qmamba_num_computed_tokens_cpu,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

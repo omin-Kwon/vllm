@@ -402,15 +402,37 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import bits_from_env
 
         _gdn_prune.configure_layer(self, prefix)
+        self._gdn_qmamba_bits = bits_from_env()
         if self._gdn_prune_active and (
             current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_cpu()
         ):
-            raise RuntimeError(
-                "NS_GDN_PRUNE is implemented only for the CUDA GDN path"
+            raise RuntimeError("NS_GDN_PRUNE is implemented only for the CUDA GDN path")
+        if self._gdn_qmamba_bits:
+            if not current_platform.is_cuda():
+                raise RuntimeError("Q-Mamba GDN DSQ is implemented only on CUDA")
+            if vllm_config.cache_config.use_replayssm:
+                raise RuntimeError(
+                    "Q-Mamba GDN DSQ and ReplaySSM cannot be enabled together"
+                )
+            if vllm_config.speculative_config is not None:
+                raise RuntimeError(
+                    "Q-Mamba GDN DSQ does not support speculative decoding"
+                )
+            if vllm_config.cache_config.mamba_cache_mode != "none":
+                raise RuntimeError("Q-Mamba GDN DSQ requires --mamba-cache-mode none")
+            if self.get_state_dtype()[1] != torch.float32:
+                raise RuntimeError(
+                    "Q-Mamba GDN DSQ requires --mamba-ssm-cache-dtype float32"
+                )
+            logger.info_once(
+                "[gdnq] Q-Mamba DSQ baseline: %d-bit fused Triton fake "
+                "quantization with FP16 channel/state scales",
+                self._gdn_qmamba_bits,
             )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
@@ -530,7 +552,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self._gdn_prune_active and self.gdn_decode_kernel == "cuda":
             logger.info_once(
-                "GDN pruning forces the Triton decode path so the post-conv Q/K mask is not bypassed"
+                "GDN pruning forces the Triton decode path so the post-conv "
+                "Q/K mask is not bypassed"
             )
             self.gdn_decode_kernel = "triton"
         if self.gdn_decode_kernel == "cuda":
@@ -854,6 +877,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def _quantize_qmamba_state(
+        self,
+        state: torch.Tensor,
+        state_indices: torch.Tensor | None,
+        row_mask: torch.Tensor | None,
+    ) -> None:
+        if not self._gdn_qmamba_bits:
+            return
+        if state_indices is None or row_mask is None:
+            raise RuntimeError(
+                "Q-Mamba GDN DSQ reached a state update without exact row metadata"
+            )
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import quantize_slots_
+
+        num_rows = row_mask.numel()
+        if state_indices.numel() < num_rows:
+            raise RuntimeError(
+                "Q-Mamba state-index metadata is shorter than its row mask: "
+                f"{state_indices.numel()} < {num_rows}"
+            )
+        quantize_slots_(
+            state,
+            state_indices.reshape(-1)[:num_rows],
+            self._gdn_qmamba_bits,
+            row_mask,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1120,9 +1170,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self._gdn_prune_active:
             from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
 
-            _gdn_prune.prepare_device_mask(
-                self, qkv_or_qkvz.device, qkv_or_qkvz.dtype
-            )
+            _gdn_prune.prepare_device_mask(self, qkv_or_qkvz.device, qkv_or_qkvz.dtype)
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
@@ -1557,6 +1605,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=non_spec_state_indices_tensor,
                 use_qk_l2norm_in_kernel=True,
             )
+            self._quantize_qmamba_state(
+                ssm_state,
+                non_spec_state_indices_tensor,
+                attn_metadata.qmamba_quantize_d,
+            )
         else:
             core_attn_out_decode = None
 
@@ -1590,6 +1643,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            self._quantize_qmamba_state(
+                ssm_state,
+                prefill_state_indices,
+                attn_metadata.qmamba_quantize_p,
+            )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1616,6 +1674,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
+            )
+            self._quantize_qmamba_state(
+                ssm_state,
+                non_spec_state_indices_tensor,
+                attn_metadata.qmamba_quantize_d,
             )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
@@ -1756,6 +1819,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
+        )
+        self._quantize_qmamba_state(
+            ssm_state,
+            non_spec_state_indices_tensor,
+            attn_metadata.qmamba_quantize_d,
         )
         return
 
