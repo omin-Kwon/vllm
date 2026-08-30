@@ -75,6 +75,8 @@ class GDNAttentionMetadata:
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    qmamba_quantize_p: torch.Tensor | None = None
+    qmamba_quantize_d: torch.Tensor | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -127,6 +129,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_replayssm: bool = vllm_config.cache_config.use_replayssm
         self.replayssm_buffer_len: int = vllm_config.cache_config.replayssm_buffer_len
 
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import bits_from_env
+
+        self.qmamba_bits = bits_from_env()
+        if self.qmamba_bits:
+            if self.use_replayssm:
+                raise ValueError(
+                    "Q-Mamba GDN DSQ and ReplaySSM cannot be enabled together"
+                )
+            if self.use_spec_decode:
+                raise ValueError(
+                    "Q-Mamba GDN DSQ does not support speculative decoding"
+                )
+            if vllm_config.cache_config.mamba_cache_mode != "none":
+                raise ValueError("Q-Mamba GDN DSQ requires --mamba-cache-mode none")
+
         self.decode_cudagraph_max_bs: int = (
             self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
         )
@@ -141,6 +158,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
                 dtype=torch.int32,
+                device=device,
+            )
+        if self.qmamba_bits:
+            self.decode_qmamba_quantize_d: torch.Tensor = torch.empty(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.bool,
                 device=device,
             )
 
@@ -234,6 +257,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        qmamba_prefill_len_cpu: torch.Tensor | None = None,
+        qmamba_num_computed_tokens_cpu: torch.Tensor | None = None,
+        qmamba_for_cudagraph_capture: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -503,6 +529,54 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             has_initial_state = None
 
+        qmamba_quantize_p = None
+        qmamba_quantize_d = None
+        if self.qmamba_bits:
+            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            if qmamba_for_cudagraph_capture:
+                if num_prefills:
+                    raise RuntimeError(
+                        "Q-Mamba CUDA graph capture only supports decode rows"
+                    )
+                qmamba_quantize_d_cpu = torch.zeros(m.num_reqs, dtype=torch.bool)
+            else:
+                if (
+                    qmamba_prefill_len_cpu is None
+                    or qmamba_num_computed_tokens_cpu is None
+                ):
+                    raise RuntimeError(
+                        "Q-Mamba GDN DSQ requires exact prefill lengths and "
+                        "computed-token counts from the v2 model runner"
+                    )
+                if (
+                    qmamba_prefill_len_cpu.numel() < m.num_reqs
+                    or qmamba_num_computed_tokens_cpu.numel() < m.num_reqs
+                ):
+                    raise RuntimeError(
+                        "Q-Mamba CPU metadata is shorter than the request batch"
+                    )
+                qmamba_quantize_d_cpu = query_lens_cpu[:num_decodes] > 0
+                if num_prefills:
+                    prefill_slice = slice(num_decodes, num_decodes + num_prefills)
+                    reaches_prompt_end = (
+                        qmamba_num_computed_tokens_cpu[prefill_slice]
+                        + query_lens_cpu[prefill_slice]
+                        >= qmamba_prefill_len_cpu[prefill_slice]
+                    )
+                    qmamba_quantize_p_cpu = (
+                        query_lens_cpu[prefill_slice] > 0
+                    ) & reaches_prompt_end
+                    qmamba_quantize_p = async_tensor_h2d(
+                        qmamba_quantize_p_cpu.tolist(),
+                        dtype=torch.bool,
+                        device=query_start_loc.device,
+                    )
+            qmamba_quantize_d = async_tensor_h2d(
+                qmamba_quantize_d_cpu.tolist(),
+                dtype=torch.bool,
+                device=query_start_loc.device,
+            )
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
@@ -641,6 +715,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 write_pos_d = self.decode_write_pos_d[:batch_size]
                 write_pos_d[num_decodes:] = 0
+            if qmamba_quantize_d is not None:
+                self.decode_qmamba_quantize_d[:num_decodes].copy_(
+                    qmamba_quantize_d[:num_decodes], non_blocking=True
+                )
+                qmamba_quantize_d = self.decode_qmamba_quantize_d[:batch_size]
+                qmamba_quantize_d[num_decodes:] = False
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -656,6 +736,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
+            qmamba_quantize_p=qmamba_quantize_p,
+            qmamba_quantize_d=qmamba_quantize_d,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
@@ -694,4 +776,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+        return self.build(
+            0,
+            m,
+            num_accepted_tokens,
+            num_decode_draft_tokens_cpu,
+            qmamba_for_cudagraph_capture=True,
+        )
