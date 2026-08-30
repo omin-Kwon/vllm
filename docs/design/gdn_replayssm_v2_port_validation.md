@@ -309,4 +309,3 @@ ReplaySSM ON에는 다음 옵션을 추가한다.
 - align mode (현재 의도적으로 미지원)
 - warmed cache에서 동일 조건으로 수행한 정식 tokens/s, TTFT, TPOT benchmark
 - perplexity 또는 downstream task 기반의 품질 영향 측정
-
