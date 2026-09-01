@@ -489,7 +489,9 @@ class ParallelConfig:
             )
 
         if envs.VLLM_PLE_CPU_OFFLOAD and not self._ple_offload_ipc_path:
-            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
+            self._ple_offload_ipc_path = (
+                envs.VLLM_PLE_OFFLOAD_IPC_PATH or get_open_zmq_ipc_path()
+            )
 
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(

@@ -82,7 +82,9 @@ def _load() -> tuple[dict[int, Any], dict[str, Any]]:
             raise RuntimeError(f"Layer {layer_index}: keep indices are out of range")
         if any(torch.unique(row).numel() != kept_width for row in keep):
             raise RuntimeError(f"Layer {layer_index}: duplicate keep indices")
-        mask = torch.zeros(num_heads, head_dim, dtype=torch.uint8)
+        mask = torch.zeros(
+            num_heads, head_dim, dtype=torch.uint8, device="cpu"
+        )
         mask.scatter_(1, keep, 1)
         masks[layer_index] = mask
 
