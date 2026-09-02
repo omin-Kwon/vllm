@@ -74,6 +74,7 @@ class _Shared:
         self.owner = None     # (NS,) int64  compact 행 → 블록 (-1 = 빈 행)
         self.seen = None      # (NS,) int64  마지막으로 본 스텝
         self.step = None      # (1,) int64   device 스텝 카운터 (그래프 안에서 +1)
+        self.never = None     # (1,) int64   1<<62 device 상수
         self.leader = None
         self.NS = 0
 
@@ -84,6 +85,7 @@ class _Shared:
         self.seen[0] = 1 << 62                                 # 행 0 = 패딩/쓰레기 행, 절대 안 준다
         self.owner[0] = 0
         self.step = torch.zeros(1, dtype=torch.int64, device=dev)
+        self.never = torch.full((1,), 1 << 62, dtype=torch.int64, device=dev)   # 그래프 안에서 host 스칼라 복사 금지
         self.NS = NS
 
 
@@ -131,7 +133,8 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         # Triton step/flush 는 G=128 도 받는다(검증용 완전 기저) — 배포는 CUDA 커널이라 64 가 천장.
         raise ValueError(f"층 {li}: m 최대 {int(mt.max())} → G={G} > 64 (CUDA step/flush 한계). --mmax 64 로 배분할 것")
     OM = d["omega"][li].double()                       # (HK,MM,K)
-    Z = torch.zeros(HK, K, G, dtype=torch.float64)
+    # 모델 구성은 default device=cuda 문맥에서 돈다 — ckpt 텐서(CPU)와 섞이지 않게 CPU 를 박는다.
+    Z = torch.zeros(HK, K, G, dtype=torch.float64, device="cpu")
     for h in range(HK):
         m_g = int(mg[h])
         if m_g == 0:
@@ -147,7 +150,7 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         Z=Z.float().to(dev).contiguous(), Zbar=Z.float().to(dev).contiguous(),
         Zrep=Z.float().repeat_interleave(rep, 0).to(dev).contiguous(),        # (HV,K,G)
         mh=mt.to(torch.int32).to(dev).contiguous(), nf=nf.to(torch.int32).to(dev).contiguous(),
-        cold=(torch.arange(K)[None, :] >= nf[:, None]).float().to(dev),         # (HV,K)
+        cold=(torch.arange(K, device="cpu")[None, :] >= nf[:, None]).float().to(dev),         # (HV,K)
         ns_env=int(os.environ.get("NS_GDN_LS6_NSLOT", "0")),
         max_num_seqs=int(vllm_config.scheduler_config.max_num_seqs) if vllm_config is not None else 0,
     )
@@ -176,10 +179,16 @@ def rotate_mixed(layer, mixed_qkv):
 # ─────────────────────────── ② 슬롯 버퍼 ───────────────────────────
 def _bufs(layer, ssm_state):
     b = layer._ls6_bufs
-    if b is not None:
+    NX = ssm_state.shape[0]
+    # 프로파일링 더미 실행은 NX=4 짜리 임시 state 로 돈다 — 실제 KV 캐시(NX≈수천)가 오면
+    # 배정표·버퍼를 버리고 다시 잡는다(그래프 캡처 전이라 안전).
+    if _SH.map is not None and _SH.map.shape[0] != NX:
+        logger.info("[ls6] NX %d → %d: 슬롯 배정표·버퍼 재할당", _SH.map.shape[0], NX)
+        _SH.map = None
+        b = None
+    if b is not None and b["ubar"].shape[0] == _SH.NS:
         return b
     L6 = layer._ls6
-    NX = ssm_state.shape[0]
     dev = ssm_state.device
     if _SH.map is None:
         NS = L6["ns_env"] or (L6["max_num_seqs"] + 8)
@@ -300,7 +309,7 @@ def decode_bookkeep(layer, ssm_state, mixed_dec, idx, write_pos, scale):
     if layer._ls6_leader:
         _SH.step += 1
         _SH.seen[c] = _SH.step
-        _SH.seen[0] = 1 << 62                         # 행 0 (패딩) 은 LRU 후보에서 항상 뺀다
+        _SH.seen[0:1].copy_(_SH.never)                # 행 0 (패딩) 은 LRU 후보에서 항상 뺀다 (device 상수)
     qk = mixed_dec[:, : 2 * HK * K].view(T, 2, HK, K)
     qh, kh = _qk_hat(qk, scale)                                              # (T,HK,K)
     b["qacc"].index_add_(0, c, qh)
