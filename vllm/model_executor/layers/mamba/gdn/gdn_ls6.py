@@ -8,7 +8,11 @@ gdn_flush_cuda}.py, v8e+map)은 이미 래치 산술을 다 갖고 있다. 여�
           state 는 그러면 저절로 S' = S Rᵀ 로 쌓인다(GDN 갱신이 직교 R 에 공변).
   ② 슬롯 버퍼  Ū (NS,HV,G,V) 등을 **compact 슬롯** NS(≈max_num_seqs) 로 잡고
           ls6_map (NX,) 으로 mamba 블록 → compact 행을 잇는다. NX 는 Flash-Next 에서
-          1.4k(페이지 등화로 attention 블록 수와 같다)라 직접 인덱싱은 Ū 만 80 GB 다.
+          ~2.9k(페이지 등화로 attention 블록 수와 같다)라 직접 인덱싱은 Ū 만 80 GB 다.
+          ⚠ 배정표는 **층마다** 따로다: vLLM 하이브리드 KV 캐시는 GDN 층을 여러 그룹으로
+          나누고 그룹마다 블록표가 달라 같은 요청이 층마다 다른 블록 번호를 받는다. 전역
+          배정표 하나를 leader 블록 번호로 채우면 다른 그룹 층은 미배정(행 0)을 읽는다 —
+          2026-09-02 e2e 에서 완전 기저가 plain 과 안 맞던 원인.
   ③ prefill 시딩  Ū = S Z̄, q̄/k̄ = 마지막 ≤W 토큰 평균(창끝 규약), aq/ak = Zᵀq̄/Zᵀk̄,
           fz_u/z = S q̄_cold. prefill 청크마다 정확한 state 에서 다시 시딩한다.
   ④ decode 부기  창 합 누적 → flush 행(write_pos==W-1)에서 q̄ ← (1-λ)q̄ + λ·mean,
@@ -67,7 +71,7 @@ def _ckpt():
 
 
 class _Shared:
-    """모든 층이 같은 mamba 블록 번호를 쓰므로 슬롯 배정표는 하나다. 첫 활성 층(leader)이 관리한다."""
+    """층 하나의 슬롯 배정표 (layer._ls6_sh). 블록 번호 공간이 층(그룹)마다 달라 층마다 하나씩이다."""
 
     def __init__(self):
         self.map = None       # (NX,) int32  블록 → compact 행 (0 = 미배정/패딩)
@@ -75,7 +79,6 @@ class _Shared:
         self.seen = None      # (NS,) int64  마지막으로 본 스텝
         self.step = None      # (1,) int64   device 스텝 카운터 (그래프 안에서 +1)
         self.never = None     # (1,) int64   1<<62 device 상수
-        self.leader = None
         self.NS = 0
 
     def init(self, NX, NS, dev):
@@ -89,7 +92,7 @@ class _Shared:
         self.NS = NS
 
 
-_SH = _Shared()
+_LEADER = [None]          # 로그·진단 카운터용 첫 활성 층
 
 
 def configure_layer(layer, prefix: str, vllm_config=None):
@@ -155,10 +158,12 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         max_num_seqs=int(vllm_config.scheduler_config.max_num_seqs) if vllm_config is not None else 0,
     )
     layer._ls6_bufs = None
+    layer._ls6_sh = _Shared()
     layer._ls6_active = True
-    if _SH.leader is None:
-        _SH.leader = prefix
-    layer._ls6_leader = _SH.leader == prefix
+    layer._ls6_name = f"L{li}"
+    if _LEADER[0] is None:
+        _LEADER[0] = prefix
+    layer._ls6_leader = _LEADER[0] == prefix
     logger.info("[ls6] %s: ckpt 층 %d  래치 head %d/%d  m max %d  G %d  r %d  W %d%s",
                 prefix, li, int((mt > 0).sum()), HV, int(mt.max()), G, r, W, "  (leader)" if layer._ls6_leader else "")
 
@@ -179,23 +184,26 @@ def rotate_mixed(layer, mixed_qkv):
 # ─────────────────────────── ② 슬롯 버퍼 ───────────────────────────
 def _bufs(layer, ssm_state):
     b = layer._ls6_bufs
+    sh = layer._ls6_sh
     NX = ssm_state.shape[0]
     # 프로파일링 더미 실행은 NX=4 짜리 임시 state 로 돈다 — 실제 KV 캐시(NX≈수천)가 오면
     # 배정표·버퍼를 버리고 다시 잡는다(그래프 캡처 전이라 안전).
-    if _SH.map is not None and _SH.map.shape[0] != NX:
-        logger.info("[ls6] NX %d → %d: 슬롯 배정표·버퍼 재할당", _SH.map.shape[0], NX)
-        _SH.map = None
+    if sh.map is not None and sh.map.shape[0] != NX:
+        if layer._ls6_leader:
+            logger.info("[ls6] NX %d → %d: 슬롯 배정표·버퍼 재할당", sh.map.shape[0], NX)
+        sh.map = None
         b = None
-    if b is not None and b["ubar"].shape[0] == _SH.NS:
+    if b is not None and b["ubar"].shape[0] == sh.NS:
         return b
     L6 = layer._ls6
     dev = ssm_state.device
-    if _SH.map is None:
+    if sh.map is None:
         NS = L6["ns_env"] or (L6["max_num_seqs"] + 8)
         NS = min(NS, NX)
-        _SH.init(NX, NS, dev)
-        logger.info("[ls6] 슬롯 배정표: NX=%d → compact NS=%d", NX, NS)
-    NS = _SH.NS
+        sh.init(NX, NS, dev)
+        if layer._ls6_leader:
+            logger.info("[ls6] 슬롯 배정표: NX=%d → compact NS=%d (층마다)", NX, NS)
+    NS = sh.NS
     HK, HV, K, V, W, G = (L6[k] for k in ("HK", "HV", "K", "V", "W", "G"))
     f32 = dict(dtype=torch.float32, device=dev)
     b = dict(
@@ -214,32 +222,32 @@ def _bufs(layer, ssm_state):
     return b
 
 
-def _assign_slots(pf_idx, has_init):
-    """leader 만. 새 시퀀스(has_init=False)에 compact 행을 준다: 이미 그 블록이 행을 갖고 있으면
+def _assign_slots(sh, pf_idx, has_init):
+    """층마다. 새 시퀀스(has_init=False)에 compact 행을 준다: 이미 그 블록이 행을 갖고 있으면
     재사용, 아니면 가장 오래 안 본 행(LRU)을 뺏는다. 살아 있는 요청은 스텝마다 보이므로 희생자는
     죽은 행이다 — 그래도 직전 스텝에 보인 행을 뺏게 되면 NS 가 모자란 것이니 죽인다."""
     xs = pf_idx.tolist()
     hi = has_init.tolist()
-    step = int(_SH.step.item())
+    step = int(sh.step.item())
     for x, h in zip(xs, hi):
         if x <= 0:
             continue
-        c = int(_SH.map[x])
-        if c > 0 and int(_SH.owner[c]) == x:
-            _SH.seen[c] = step
+        c = int(sh.map[x])
+        if c > 0 and int(sh.owner[c]) == x:
+            sh.seen[c] = step
             continue
         if h:
             raise RuntimeError(f"[ls6] 블록 {x} 의 prefill 이어붙임인데 compact 행이 없다 — 슬롯이 뺏겼다(NS 부족)")
-        v = int(torch.argmin(_SH.seen))
-        if int(_SH.seen[v]) >= step - 1 and int(_SH.owner[v]) >= 0:
-            raise RuntimeError(f"[ls6] compact 슬롯 부족: 희생자 행 {v} 가 스텝 {int(_SH.seen[v])} (지금 {step}) 에 보였다. "
-                               f"NS_GDN_LS6_NSLOT 을 올릴 것 (지금 {_SH.NS})")
-        old = int(_SH.owner[v])
+        v = int(torch.argmin(sh.seen))
+        if int(sh.seen[v]) >= step - 1 and int(sh.owner[v]) >= 0:
+            raise RuntimeError(f"[ls6] compact 슬롯 부족: 희생자 행 {v} 가 스텝 {int(sh.seen[v])} (지금 {step}) 에 보였다. "
+                               f"NS_GDN_LS6_NSLOT 을 올릴 것 (지금 {sh.NS})")
+        old = int(sh.owner[v])
         if old > 0:
-            _SH.map[old] = 0
-        _SH.owner[v] = x
-        _SH.map[x] = v
-        _SH.seen[v] = step
+            sh.map[old] = 0
+        sh.owner[v] = x
+        sh.map[x] = v
+        sh.seen[v] = step
 
 
 # ─────────────────────────── ③ prefill 시딩 ───────────────────────────
@@ -259,11 +267,11 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
         return
     L6 = layer._ls6
     b = _bufs(layer, ssm_state)
-    if layer._ls6_leader:
-        _assign_slots(pf_idx, has_init)
+    sh = layer._ls6_sh
+    _assign_slots(sh, pf_idx, has_init)
     HK, K, W, rep = L6["HK"], L6["K"], L6["W"], L6["rep"]
     x = pf_idx.long()
-    c = _SH.map[x].long()                                                    # (n,)
+    c = sh.map[x].long()                                                     # (n,)
     cu = cu_seqlens.long()
     st, en = cu[:-1], cu[1:]
     n = x.shape[0]
@@ -303,13 +311,13 @@ def decode_bookkeep(layer, ssm_state, mixed_dec, idx, write_pos, scale):
     L6 = layer._ls6
     b = _bufs(layer, ssm_state)
     HK, K, W, rep = L6["HK"], L6["K"], L6["W"], L6["rep"]
+    sh = layer._ls6_sh
     x = idx.long().clamp(min=0)
-    c = _SH.map[x].long()                                                    # (T,)  미배정 → 0
+    c = sh.map[x].long()                                                     # (T,)  미배정 → 0
     T = x.shape[0]
-    if layer._ls6_leader:
-        _SH.step += 1
-        _SH.seen[c] = _SH.step
-        _SH.seen[0:1].copy_(_SH.never)                # 행 0 (패딩) 은 LRU 후보에서 항상 뺀다 (device 상수)
+    sh.step += 1
+    sh.seen[c] = sh.step
+    sh.seen[0:1].copy_(sh.never)                      # 행 0 (패딩) 은 LRU 후보에서 항상 뺀다 (device 상수)
     qk = mixed_dec[:, : 2 * HK * K].view(T, 2, HK, K)
     qh, kh = _qk_hat(qk, scale)                                              # (T,HK,K)
     b["qacc"].index_add_(0, c, qh)
@@ -342,6 +350,69 @@ def kernel_kwargs(layer, ssm_state):
     b = _bufs(layer, ssm_state)
     return dict(
         ls6_ubar=b["ubar"], ls6_z=L6["Z"], ls6_zbar=L6["Zbar"], ls6_aq=b["aq"], ls6_ak=b["ak"],
-        ls6_fs=b["fs"], ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_r=L6["r"], ls6_map=_SH.map,
+        ls6_fs=b["fs"], ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_r=L6["r"], ls6_map=layer._ls6_sh.map,
         fz_nf=L6["nf"], fz_u=b["fz_u"], fz_z=b["fz_z"], fz_qbar=b["qbar"], fz_kbar=b["kbar"],
     )
+
+
+# ─────────────────────────── 진단: 층별 dense 대조 ───────────────────────────
+# NS_GDN_LS6_CHECK=1 이면 decode 스텝마다 같은 입력을 **LS6 없이**(dense, 행 복사본) 한 번 더
+# 돌려 층별 |Δ| 를 로그한다. 완전 기저(m=K, r=K, Z=I) 면 0 에 가까워야 한다. eager 전용.
+CHECK = bool(os.environ.get("NS_GDN_LS6_CHECK", ""))
+_CHK_STEPS = int(os.environ.get("NS_GDN_LS6_CHECK_STEPS", "40"))
+_chk_n = [0]
+
+
+@torch.no_grad()
+def check_begin(layer, ssm_state, d_cache, k_cache, g_cache, mixed, a, b, idx, write_pos, scale):
+    from vllm.third_party.flash_linear_attention.ops.fused_recurrent_replayssm import (
+        fused_recurrent_gated_delta_rule_replayssm as _gdn)
+
+    if not getattr(layer, "_ls6_active", False):
+        return None
+    if layer._ls6_leader:
+        _chk_n[0] += 1
+    if _chk_n[0] > _CHK_STEPS:
+        return None
+    x = idx.long()
+    valid = x > 0
+    xc = x.clamp(min=0)
+    B = x.shape[0]
+
+    def gather(t):
+        z = torch.zeros((1,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
+        return torch.cat([z, t[xc].clone()], 0)
+
+    S, D, Kc, G = gather(ssm_state), gather(d_cache), gather(k_cache), gather(g_cache)
+    ridx = torch.where(valid, torch.arange(1, B + 1, device=x.device), torch.zeros_like(x)).to(idx.dtype)
+    out = torch.empty(B, 1, layer.num_v_heads // layer.tp_size, layer.head_v_dim, dtype=mixed.dtype, device=mixed.device)
+    _gdn(mixed_qkv=mixed, a=a, b=b, A_log=layer.A_log, dt_bias=layer.dt_bias, scale=scale, initial_state=S,
+         d_cache=D, k_cache=Kc, g_cache=G, out=out, ssm_state_indices=ridx, write_pos=write_pos,
+         use_qk_l2norm_in_kernel=True)
+    # 버퍼 일관성: Ū 는 flush 사이에 S·Z̄ 여야 한다 (state 는 flush 에서만 바뀐다)
+    L6 = layer._ls6
+    b_ = _bufs(layer, ssm_state)
+    c = layer._ls6_sh.map[xc].long()
+    ue = torch.einsum("nhvk,hkg->nhgv", S[1:], L6["Zrep"])
+    du = ((b_["ubar"][c] - ue).flatten(1).abs().max(1).values / ue.flatten(1).abs().max(1).values.clamp(min=1e-6))
+    return dict(S=S, out=out, x=x, valid=valid, wp=write_pos, step=_chk_n[0], du=du[valid].tolist(), c=c.tolist())
+
+
+@torch.no_grad()
+def check_end(layer, chk, ssm_state, out_ls6):
+    if chk is None:
+        return
+    W = layer._ls6["W"]
+    ref = chk["out"].float().flatten(1)[chk["valid"]]
+    got = out_ls6.float().flatten(1)[chk["valid"]]
+    e = ((got - ref).abs().max(1).values / ref.abs().max(1).values.clamp(min=1e-6)).tolist()
+    fl = (chk["wp"] == W - 1) & chk["valid"]
+    es = ""
+    if bool(fl.any()):
+        xs = chk["x"][fl]
+        Sg = ssm_state[xs].float()
+        Sr = chk["S"][1:][fl].float()                                        # 참조 행 i+1 ↔ 배치 행 i
+        es = "  flush ΔS/|S| " + " ".join(f"{v:.1e}" for v in ((Sg - Sr).flatten(1).abs().max(1).values / Sr.flatten(1).abs().max(1).values.clamp(min=1e-6)).tolist())
+    logger.info("[ls6-check] step %d %s wp %s slot %s |Δy|/|y| %s  ΔŪ %s%s", chk["step"], layer._ls6_name,
+                chk["wp"].tolist(), chk["c"], " ".join(f"{v:.1e}" for v in e),
+                " ".join(f"{v:.1e}" for v in chk["du"]), es)

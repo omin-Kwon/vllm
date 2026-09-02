@@ -1952,6 +1952,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 write_pos_d, self.head_k_dim**-0.5,
             ) or {}
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        chk = None
+        if ls6_kw and _gdn_ls6.CHECK:
+            chk = _gdn_ls6.check_begin(
+                self, ssm_state, d_cache, k_cache, g_cache, mixed_qkv_non_spec, a, b,
+                non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                write_pos_d, self.head_k_dim**-0.5,
+            )
         fused_recurrent_gated_delta_rule_replayssm(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
@@ -1969,6 +1976,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             use_qk_l2norm_in_kernel=True,
             **ls6_kw,
         )
+        if chk is not None:
+            _gdn_ls6.check_end(self, chk, ssm_state, out_buf)
         return
 
     def _forward_core_decode_spec_fused_norm(
