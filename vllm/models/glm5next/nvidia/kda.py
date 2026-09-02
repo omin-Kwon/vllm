@@ -5,10 +5,12 @@
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -33,6 +35,10 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.glm5next.drrqr import (
+    apply_glm5_drrqr_mask,
+    build_glm5_drrqr_mask,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import (
     FusedRMSNormGated,
@@ -41,6 +47,8 @@ from vllm.third_party.flash_linear_attention.ops.kda import (
 )
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+logger = init_logger(__name__)
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -274,6 +282,101 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import bits_from_env
+
+        self._kda_qmamba_bits = bits_from_env()
+        if self._kda_qmamba_bits:
+            if not current_platform.is_cuda():
+                raise RuntimeError("Q-Mamba KDA DSQ is implemented only on CUDA")
+            if vllm_config.cache_config.use_replayssm:
+                raise RuntimeError(
+                    "Q-Mamba DSQ and ReplaySSM cannot be enabled together"
+                )
+            if vllm_config.speculative_config is not None:
+                raise RuntimeError("Q-Mamba DSQ does not support speculative decoding")
+            logger.info_once(
+                "GLM-5 KDA Q-Mamba DSQ enabled: bits=%d granularity=dsq_qm",
+                self._kda_qmamba_bits,
+            )
+
+        indices_source = envs.VLLM_GLM5_DRRQR_INDICES
+        sparsity = envs.VLLM_GLM5_DRRQR_SPARSITY
+        if (indices_source is None) != (sparsity is None):
+            raise ValueError(
+                "VLLM_GLM5_DRRQR_INDICES and "
+                "VLLM_GLM5_DRRQR_SPARSITY must be set together"
+            )
+        if indices_source is None:
+            self.register_buffer("_drrqr_qk_mask", None, persistent=False)
+        else:
+            if self._kda_qmamba_bits:
+                raise RuntimeError(
+                    "GLM DRRQR and Q-Mamba DSQ cannot be enabled together"
+                )
+            assert sparsity is not None
+            mask, kept_head_dim, indices_path = build_glm5_drrqr_mask(
+                source=indices_source,
+                sparsity=sparsity,
+                layer_idx=self.layer_idx,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+            self.register_buffer(
+                "_drrqr_qk_mask",
+                mask.to(device=self.A_log.device),
+                persistent=False,
+            )
+            logger.info(
+                "GLM-5 KDA DRRQR enabled: layer=%d sparsity=%.3f "
+                "kept_dim=%d indices=%s",
+                self.layer_idx,
+                sparsity,
+                kept_head_dim,
+                indices_path,
+            )
+
+    def _apply_drrqr_mask(
+        self, query: torch.Tensor, key: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mask = self._drrqr_qk_mask
+        if mask is None:
+            return query, key
+        return apply_glm5_drrqr_mask(
+            query,
+            key,
+            mask,
+            self.local_num_heads,
+            self.head_dim,
+        )
+
+    def _quantize_qmamba_state(
+        self,
+        state: torch.Tensor,
+        state_indices: torch.Tensor | None,
+        row_mask: torch.Tensor | None,
+    ) -> None:
+        if not self._kda_qmamba_bits:
+            return
+        if state_indices is None or row_mask is None:
+            raise RuntimeError(
+                "Q-Mamba KDA DSQ reached a state update without exact row metadata"
+            )
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import quantize_slots_
+
+        num_rows = row_mask.numel()
+        if state_indices.numel() < num_rows:
+            raise RuntimeError(
+                "Q-Mamba state-index metadata is shorter than its row mask: "
+                f"{state_indices.numel()} < {num_rows}"
+            )
+        quantize_slots_(
+            state,
+            state_indices.reshape(-1)[:num_rows],
+            self._kda_qmamba_bits,
+            row_mask,
+        )
 
     def forward(
         self,
@@ -441,6 +544,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 max_query_len=conv_mql,
             )
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
+            q_spec, k_spec = self._apply_drrqr_mask(q_spec, k_spec)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         q_ns = k_ns = v_ns = None
@@ -458,6 +562,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+            q_ns, k_ns = self._apply_drrqr_mask(q_ns, k_ns)
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
@@ -472,6 +577,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 conv_state_indices=decode_conv_indices,
             )
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+            q_ns, k_ns = self._apply_drrqr_mask(q_ns, k_ns)
 
         def _rearr(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
@@ -552,6 +658,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 last_recurrent_state,
                 non_spec_state_indices_tensor,
             )
+            if attn_metadata_narrowed.num_decodes > 0:
+                self._quantize_qmamba_state(
+                    recurrent_state,
+                    non_spec_state_indices_tensor[: attn_metadata_narrowed.num_decodes],
+                    attn_metadata_narrowed.qmamba_quantize_d,
+                )
+            self._quantize_qmamba_state(
+                recurrent_state,
+                non_spec_state_indices_tensor[attn_metadata_narrowed.num_decodes :],
+                attn_metadata_narrowed.qmamba_quantize_p,
+            )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
@@ -579,6 +696,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 g_bias=self.dt_bias,
                 compute_gate=True,
                 lower_bound=lower_bound,
+            )
+            self._quantize_qmamba_state(
+                recurrent_state,
+                non_spec_state_indices_tensor,
+                attn_metadata_narrowed.qmamba_quantize_d,
             )
 
         # --- merge spec / non-spec outputs back into token order ---

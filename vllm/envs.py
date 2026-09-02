@@ -128,6 +128,8 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GLM5_DRRQR_INDICES: str | None = None
+    VLLM_GLM5_DRRQR_SPARSITY: float | None = None
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1212,6 +1214,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["cuda", "triton"],
         case_sensitive=False,
+    ),
+    "VLLM_GLM5_DRRQR_INDICES": lambda: (
+        os.getenv("VLLM_GLM5_DRRQR_INDICES") or None
+    ),
+    "VLLM_GLM5_DRRQR_SPARSITY": lambda: (
+        float(value)
+        if (value := os.getenv("VLLM_GLM5_DRRQR_SPARSITY"))
+        else None
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

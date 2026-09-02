@@ -168,6 +168,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    KpoolTailSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -7332,7 +7333,12 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
+            # KpoolTailSpec is a one-block circular side cache. Its metadata
+            # builder owns pos % index_kpool addressing, so the generic token
+            # slot mapper must not treat its narrow table as sequence-wide.
+            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA or isinstance(
+                kv_cache_spec, KpoolTailSpec
+            ):
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)

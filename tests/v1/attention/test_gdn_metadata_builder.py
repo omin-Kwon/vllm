@@ -17,6 +17,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.gdn.gdn_quant import fake_quant_dsq
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
@@ -125,6 +126,9 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    use_replayssm: bool = False,
+    mamba_cache_mode: str | None = None,
+    async_scheduling: bool | None = None,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -133,6 +137,11 @@ def _create_gdn_builder(
     )
     if full_cuda_graph:
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    vllm_config.cache_config.use_replayssm = use_replayssm
+    if mamba_cache_mode is not None:
+        vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    if async_scheduling is not None:
+        vllm_config.scheduler_config.async_scheduling = async_scheduling
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
@@ -221,3 +230,96 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_qmamba_quantizes_only_the_logical_prefill_end(monkeypatch):
+    monkeypatch.setenv("NS_GDN_QBITS", "4")
+    builder = _create_gdn_builder(
+        mamba_cache_mode="none",
+        async_scheduling=False,
+    )
+    batch = BatchSpec(seq_lens=[64, 80], query_lens=[16, 16])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([True, True])
+    )
+
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        qmamba_prefill_len_cpu=torch.tensor([80, 80]),
+        qmamba_num_computed_tokens_cpu=torch.tensor([48, 64]),
+    )
+
+    assert meta.qmamba_quantize_p is not None
+    assert meta.qmamba_quantize_p.tolist() == [False, True]
+    assert meta.qmamba_quantize_d is not None
+    assert meta.qmamba_quantize_d.numel() == 0
+
+
+def test_qmamba_quantizes_decodes_but_not_cudagraph_padding(monkeypatch):
+    monkeypatch.setenv("NS_GDN_QBITS", "8")
+    builder = _create_gdn_builder(
+        full_cuda_graph=True,
+        mamba_cache_mode="none",
+        async_scheduling=False,
+    )
+    batch = BatchSpec(seq_lens=[101, 102, 0, 0], query_lens=[1, 1, 0, 0])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([False, False, False, False])
+    )
+
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        qmamba_prefill_len_cpu=torch.tensor([100, 100, 0, 0]),
+        qmamba_num_computed_tokens_cpu=torch.tensor([100, 101, 0, 0]),
+    )
+
+    assert meta.qmamba_quantize_d is not None
+    assert meta.qmamba_quantize_d.tolist() == [True, True, False, False]
+
+
+def test_qmamba_refuses_missing_runner_metadata(monkeypatch):
+    monkeypatch.setenv("NS_GDN_QBITS", "6")
+    builder = _create_gdn_builder(
+        mamba_cache_mode="none",
+        async_scheduling=False,
+    )
+    batch = BatchSpec(seq_lens=[80], query_lens=[16])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([True])
+    )
+
+    with pytest.raises(RuntimeError, match="exact prefill lengths"):
+        builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+
+def test_qmamba_refuses_incompatible_runtime_modes(monkeypatch):
+    monkeypatch.setenv("NS_GDN_QBITS", "10")
+    with pytest.raises(ValueError, match="ReplaySSM"):
+        _create_gdn_builder(use_replayssm=True, mamba_cache_mode="none")
+    with pytest.raises(ValueError, match="speculative decoding"):
+        _create_gdn_builder(
+            num_speculative_tokens=2,
+            mamba_cache_mode="none",
+        )
+    with pytest.raises(ValueError, match="async-scheduling"):
+        _create_gdn_builder(
+            mamba_cache_mode="none",
+            async_scheduling=True,
+        )
+
+
+@pytest.mark.parametrize("bits", [10, 8, 6, 4])
+def test_qmamba_dsq_cpu_reference(bits):
+    state = torch.linspace(-0.93, 0.87, 2 * 3 * 5).reshape(2, 3, 5)
+    magnitude = state.abs()
+    channel_scale = magnitude.mean(dim=-1, keepdim=True).sqrt()
+    channel_scale = channel_scale.clamp(min=5.96e-8).half().float()
+    state_scale = (magnitude / channel_scale).amax(dim=-2, keepdim=True)
+    state_scale = state_scale.clamp(min=5.96e-8).half().float()
+    qmax = 2 ** (bits - 1) - 1
+    scale = (channel_scale * state_scale).clamp(min=1e-12) / qmax
+    expected = (state / scale).round().clamp(-qmax - 1, qmax) * scale
+
+    torch.testing.assert_close(fake_quant_dsq(state, bits), expected, rtol=0, atol=0)
