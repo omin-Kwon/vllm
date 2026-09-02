@@ -1612,8 +1612,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 dtype=mixed_dec.dtype, device=mixed_dec.device,
             )
             ls6_kw = _gdn_ls6.decode_bookkeep(
-                self, ssm_state, mixed_dec, dec_idx, write_pos_d[:num_decode_tokens],
-                self.head_k_dim**-0.5,
+                self, ssm_state, mixed_dec, b[:num_decode_tokens], dec_idx,
+                write_pos_d[:num_decode_tokens], self.head_k_dim**-0.5,
             ) or {}
             fused_recurrent_gated_delta_rule_replayssm(
                 mixed_qkv=mixed_dec,
@@ -1947,7 +1947,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             _gdn_ls6.rotate_mixed(self, mixed_qkv_non_spec)
             ls6_kw = _gdn_ls6.decode_bookkeep(
-                self, ssm_state, mixed_qkv_non_spec,
+                self, ssm_state, mixed_qkv_non_spec, b,
                 non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
                 write_pos_d, self.head_k_dim**-0.5,
             ) or {}

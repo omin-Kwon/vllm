@@ -586,7 +586,11 @@ def _gdn_v2_step_kernel(
             hk += tl.sum(h_t * k_c[None, :], axis=1)
     if LS6_ON:
         if write_k:
-            zk_acc = tl.sum(zb_f * (k_f * k_rnorm)[:, None], axis=0)
+            # ⚠ 링에 저장된 k̂ (k_cache dtype, bf16 이면 반올림됨) 과 **같은 값**으로 zk 를 내야
+            #   flush 의 S 접기(k_r0 = 링) 와 Ū 재귀(zk) 가 일치한다. fp32 k̂ 로 내면 Ū 가
+            #   Z̄ᵀS 에서 bf16 몫(≈1e-3) 만큼 영구히 어긋난다 (ieee 항등 검사에서 잡힘, 2026-09-02).
+            k_st = (k_f * k_rnorm).to(k_cache.dtype.element_ty).to(tl.float32)
+            zk_acc = tl.sum(zb_f * k_st[:, None], axis=0)
             tl.store(ls6_zk + cidx * stride_ls6_zk_slot + (i_h * MAX_CACHE_LEN + b_write_pos) * LS6_G + o_g6,
                      zk_acc)
     kap_q = kap_q * b_replay_decay
@@ -660,19 +664,30 @@ def _gdn_v2_flush_kernel(
     h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_ptr,
     fz_nf, fz_u, fz_z, stride_fz_slot: tl.constexpr,
     fz_qbar, fz_kbar, stride_fzb_slot: tl.constexpr,
-    ls6_ubar, ls6_zk, ls6_map, stride_ls6_u_slot: tl.constexpr, stride_ls6_zk_slot: tl.constexpr,
+    ls6_ubar, ls6_z, ls6_zk, ls6_mh, ls6_beta, ls6_corr_ak,
+    ls6_corr_kbar, ls6_map,
+    stride_ls6_u_slot: tl.constexpr, stride_ls6_zk_slot: tl.constexpr,
+    stride_ls6_beta_slot: tl.constexpr,
+    stride_ls6_corr_ak_slot: tl.constexpr,
+    stride_ls6_corr_kbar_slot: tl.constexpr,
     stride_init_state_token: tl.constexpr,
     stride_state_h: tl.constexpr, stride_state_v: tl.constexpr, stride_state_k: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_d_slot: tl.constexpr, stride_k_slot: tl.constexpr, stride_g_slot: tl.constexpr,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-    BK: tl.constexpr, FBV: tl.constexpr, NSPLIT: tl.constexpr, BC: tl.constexpr,
+    BK: tl.constexpr, FBV: tl.constexpr,
+    NSPLIT: tl.constexpr, VJOBS: tl.constexpr, BC: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr, FZ_V2: tl.constexpr,
-    LS6_ON: tl.constexpr, LS6_G: tl.constexpr, NP: tl.constexpr,
+    LS6_ON: tl.constexpr, LS6_EXACT: tl.constexpr,
+    LS6_G: tl.constexpr, LS6_GP: tl.constexpr,
+    LS6_R: tl.constexpr, LS6_RP: tl.constexpr, NP: tl.constexpr,
     FDOT: tl.constexpr, LS6_MAP: tl.constexpr,
 ):
     """persistent flush. 일감 = (flush 행, hv) 하나 = state 한 장(V×K).
     S_new = tot'·S₀ + (r'∘D)ᵀ·K 를 텐서코어(tf32x3 ≈ fp32, FDOT=2 면 ieee)로 접는다.
+    LS6_EXACT 면 접기 전에 온라인 키-읽기 오차를 S₀에서 정확히 복원하고, 아래의
+    삼각 점화로 창 안의 모든 delta write 를 보정한다. 그러면 저장하는 창 경계
+    state 는 dense delta rule 결과와 같고, 래치 오차는 다음 창으로 넘어가지 않는다.
     링 K [W,BK] 는 일감당 한 번 올려 두고 V 를 FBV 씩 돌린다 — v-split 을 그리드에 펼치면
     K 링을 split 마다 다시 읽어(FBV=16 이면 S₀ 읽기와 같은 양) 스칼라 외적 루프가
     FMA 당 2.7 명령으로 발행 바운드(1024us)였다.
@@ -680,15 +695,17 @@ def _gdn_v2_flush_kernel(
     Ū 재귀는 스텝이 넣어 둔 zk 링으로 g 마다 [FBV,W] 곱-합."""
     pid = tl.program_id(0)
     n_flush = tl.load(n_ptr)
-    n_work = n_flush * HV
+    n_work = n_flush * HV * VJOBS
     o_c = tl.arange(0, BC)
     m_c = o_c < MAX_CACHE_LEN          # BC 는 16 이상으로 올림된다 — W<16 이면 마스크 필수
     o_kf = tl.arange(0, BK)
     m_kf = o_kf < K
     o_16 = tl.arange(0, 16)
     for w in range(pid, n_work, NP):
-        r = w // HV
-        i_hv = w % HV
+        work = w // VJOBS
+        i_vjob = w % VJOBS
+        r = work // HV
+        i_hv = work % HV
         i_h = i_hv // (HV // H)
         state_idx = tl.load(flush_list + r).to(tl.int64)
         if LS6_MAP:
@@ -698,9 +715,10 @@ def _gdn_v2_flush_kernel(
         # 균일 재생: 슬롯 W-1(현재 토큰) 포함. tot' = exp(Σ_{s<W} g), r'_s = exp(Σ_{s<W} g − prefix_s)
         p_gs = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN
         g_all = tl.load(p_gs + o_c, mask=m_c, other=0.0).to(tl.float32)
+        g_prefix = tl.cumsum(g_all, axis=0)
         g_total = tl.sum(g_all, axis=0)
         tot = tl.exp(g_total)
-        replay = tl.where(m_c, tl.exp(g_total - tl.cumsum(g_all, axis=0)), 0.0)
+        replay = tl.where(m_c, tl.exp(g_total - g_prefix), 0.0)
         p_kr0 = k_cache + state_idx * stride_k_slot + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_kf[None, :]
         k_r0 = tl.load(p_kr0, mask=m_c[:, None] & m_kf[None, :], other=0).to(tl.float32)
         if FZ_V2:
@@ -712,14 +730,143 @@ def _gdn_v2_flush_kernel(
                              tl.where(o_16[None, :] == 1, _kb[:, None], 0.0))
         if LS6_ON:
             p_zk = ls6_zk + cidx * stride_ls6_zk_slot + (i_h * MAX_CACHE_LEN + o_c) * LS6_G
-        for i_vs in range(NSPLIT):
+            o_gp = tl.arange(0, LS6_GP)
+            m_gall = o_gp < LS6_G
+        if LS6_EXACT:
+            # 스텝이 쓴 hat(d)_s 를 dense delta-rule d_s 로 되돌리는 삼각 보정.
+            # 현재 창의 앵커는 host 부기가 다음 창 값으로 바꾸기 전에 corr_* 에 복사했다.
+            mh = tl.load(ls6_mh + i_hv).to(tl.int32)
+            nf_h = tl.load(fz_nf + i_hv).to(tl.int32)
+            m_gp = o_gp < mh
+            o_rp = tl.arange(0, LS6_RP)
+            m_rp = (o_rp < LS6_R) & (o_rp < K)
+            z_r = tl.load(
+                ls6_z + i_h * K * LS6_G
+                + o_rp[:, None] * LS6_G + o_gp[None, :],
+                mask=m_rp[:, None] & m_gp[None, :], other=0.0,
+            ).to(tl.float32)
+            p_krr = (
+                k_cache + state_idx * stride_k_slot
+                + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K
+                + o_rp[None, :]
+            )
+            k_rr = tl.load(
+                p_krr, mask=m_c[:, None] & m_rp[None, :], other=0.0
+            ).to(tl.float32)
+            kbar_r = tl.load(
+                ls6_corr_kbar + cidx * stride_ls6_corr_kbar_slot
+                + i_h * K + o_rp,
+                mask=m_rp, other=0.0,
+            ).to(tl.float32)
+            ak = tl.load(
+                ls6_corr_ak + cidx * stride_ls6_corr_ak_slot
+                + i_hv * LS6_G + o_gp,
+                mask=m_gp, other=0.0,
+            ).to(tl.float32)
+            if FDOT == 2:
+                xk = ak[None, :] + tl.dot(
+                    k_rr - kbar_r[None, :], z_r,
+                    input_precision="ieee",
+                )
+                kappa = tl.dot(
+                    k_r0, tl.trans(k_r0), input_precision="ieee"
+                )
+            else:
+                xk = ak[None, :] + tl.dot(
+                    k_rr - kbar_r[None, :], z_r,
+                    input_precision="tf32x3",
+                )
+                kappa = tl.dot(
+                    k_r0, tl.trans(k_r0), input_precision="tf32x3"
+                )
+            beta_all = tl.load(
+                ls6_beta + cidx * stride_ls6_beta_slot
+                + i_hv * MAX_CACHE_LEN + o_c,
+                mask=m_c, other=0.0,
+            ).to(tl.float32)
+        for i_vlocal in range(NSPLIT):
+            i_vs = i_vjob * NSPLIT + i_vlocal
             o_vf = i_vs * FBV + tl.arange(0, FBV)
             m_vf = o_vf < V
             p_dT = d_cache + state_idx * stride_d_slot + (i_hv * MAX_CACHE_LEN + o_c[None, :]) * V + o_vf[:, None]
-            d_T = tl.load(p_dT, mask=m_vf[:, None] & m_c[None, :], other=0).to(tl.float32) * replay[None, :]
+            d_fold = tl.load(
+                p_dT, mask=m_vf[:, None] & m_c[None, :], other=0
+            ).to(tl.float32)
             p_hf = h0 + state_idx * stride_init_state_token + i_hv * stride_state_h \
                 + o_vf[:, None] * stride_state_v + o_kf[None, :] * stride_state_k
-            S_t = tl.load(p_hf, mask=m_vf[:, None] & m_kf[None, :], other=0).to(tl.float32) * tot
+            S_0 = tl.load(
+                p_hf, mask=m_vf[:, None] & m_kf[None, :], other=0
+            ).to(tl.float32)
+            if LS6_ON:
+                p_u_all = (
+                    ls6_ubar + cidx * stride_ls6_u_slot
+                    + i_hv * (LS6_G * V)
+                    + o_gp[None, :] * V + o_vf[:, None]
+                )
+                ub_old = tl.load(
+                    p_u_all,
+                    mask=m_vf[:, None] & m_gall[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            if LS6_EXACT:
+                # hot prefix 읽기는 온라인과 dense 양쪽에 동일하므로 소거한다.
+                # epsilon_s = exp(prefix_s) * (Ubar*x_s - S0*k_s,cold).
+                k_cold = tl.where(
+                    (o_kf[None, :] >= nf_h) & m_c[:, None],
+                    k_r0,
+                    0.0,
+                )
+                ub_active = tl.where(m_gp[None, :], ub_old, 0.0)
+                if FDOT == 2:
+                    h_latch = tl.dot(
+                        ub_active, tl.trans(xk), input_precision="ieee"
+                    )
+                    h_cold = tl.dot(
+                        S_0, tl.trans(k_cold), input_precision="ieee"
+                    )
+                else:
+                    h_latch = tl.dot(
+                        ub_active, tl.trans(xk), input_precision="tf32x3"
+                    )
+                    h_cold = tl.dot(
+                        S_0, tl.trans(k_cold), input_precision="tf32x3"
+                    )
+                epsilon = tl.where(
+                    o_c[None, :] < MAX_CACHE_LEN - 1,
+                    (h_latch - h_cold) * tl.exp(g_prefix)[None, :],
+                    0.0,
+                )
+                delta = tl.zeros([FBV, BC], dtype=tl.float32)
+                # delta_s = -beta_s (epsilon_s + sum_{j<s} rho_{j,s} delta_j)
+                # rho_{j,s} = <k_j,k_s> exp(prefix_s-prefix_j).
+                for ss in range(MAX_CACHE_LEN):
+                    epsilon_s = tl.sum(
+                        tl.where(o_c[None, :] == ss, epsilon, 0.0),
+                        axis=1,
+                    )
+                    prefix_s = tl.sum(
+                        tl.where(o_c == ss, g_prefix, 0.0), axis=0
+                    )
+                    kappa_s = tl.sum(
+                        tl.where(o_c[None, :] == ss, kappa, 0.0),
+                        axis=1,
+                    )
+                    rho_s = tl.where(
+                        (o_c < ss) & m_c,
+                        kappa_s * tl.exp(prefix_s - g_prefix),
+                        0.0,
+                    )
+                    prev_s = tl.sum(delta * rho_s[None, :], axis=1)
+                    beta_s = tl.sum(
+                        tl.where(o_c == ss, beta_all, 0.0), axis=0
+                    )
+                    delta_s = -beta_s * (epsilon_s + prev_s)
+                    delta = tl.where(
+                        o_c[None, :] == ss, delta_s[:, None], delta
+                    )
+                d_fold -= delta
+            d_T = d_fold * replay[None, :]
+            S_t = S_0 * tot
             if FDOT == 2:
                 S_t = tl.dot(d_T, k_r0, acc=S_t, input_precision="ieee")
             else:
@@ -738,14 +885,26 @@ def _gdn_v2_flush_kernel(
                          tl.sum(tl.where(o_16[None, :] == 1, uz, 0.0), axis=1), mask=m_vf)
             if LS6_ON:
                 # Ū 재귀: Ū_new = tot'·Ū_old + Σ_{s<W} r'_s d_s (Z̄ᵀk_s).  Ū_old = S₀Z̄ 가 전제(호스트 시딩).
-                #   ⚠ 3D 브로드캐스트 곱-합은 Triton 이 tl.dot(tf32) 로 바꾼다(G=64 에서 3e-4 실측) — g 마다 2D 로.
-                #   r' 는 d_T 에 이미 접혀 있다.
-                for gg in range(LS6_G):
-                    zk_g = tl.load(p_zk + gg, mask=m_c, other=0.0).to(tl.float32)
-                    p_u = ls6_ubar + cidx * stride_ls6_u_slot + i_hv * (LS6_G * V) + gg * V + o_vf
-                    u_old = tl.load(p_u, mask=m_vf, other=0.0).to(tl.float32)
-                    u_new = tot * u_old + tl.sum(d_T * zk_g[None, :], axis=1)
-                    tl.store(p_u, u_new, mask=m_vf)
+                #   exact 보정에서 읽은 Ū_old 타일을 재사용하고,
+                #   G 열 스칼라 루프를 dot 하나로 바꿘다. r' 는 d_T 에 접혀 있다.
+                zk_all = tl.load(
+                    p_zk[:, None] + o_gp[None, :],
+                    mask=m_c[:, None] & m_gall[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if FDOT == 2:
+                    u_new = tot * ub_old + tl.dot(
+                        d_T, zk_all, input_precision="ieee"
+                    )
+                else:
+                    u_new = tot * ub_old + tl.dot(
+                        d_T, zk_all, input_precision="tf32x3"
+                    )
+                tl.store(
+                    p_u_all,
+                    u_new,
+                    mask=m_vf[:, None] & m_gall[None, :],
+                )
 
 
 _SM_COUNT = {}
@@ -778,7 +937,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
     use_qk_l2norm_in_kernel: bool = False,
     # [nested_ssm 2026-08-25] freeze. 셋 다 주면 켜진다(부분만 주면 죽는다 —
     # 조용히 프리즈 없이 도는 것을 막는다).
-    # [nested_ssm 2026-09-02] LS6 래치. 여섯을 **다 주면** 켜진다(일부만 주면 죽는다 —
+    # [nested_ssm 2026-09-02] LS6 래치. 일곱을 **다 주면** 켜진다(일부만 주면 죽는다 —
     #   반쯤 켜진 상태가 조용히 틀린 값을 내는 것보다 낫다).
     ls6_ubar: torch.Tensor | None = None,
     ls6_z: torch.Tensor | None = None,
@@ -789,6 +948,10 @@ def fused_recurrent_gated_delta_rule_replayssm(
     ls6_mh: torch.Tensor | None = None,
     # v2 전용: zk 링 (NX,H,W,G) = Z̄ᵀk̂_s. 스텝이 쓰고 flush 의 Ū 재귀가 읽는다.
     ls6_zk: torch.Tensor | None = None,
+    # v2 exact-flush: beta 링과 flush 직전의 이전-창 key 앵커.
+    ls6_beta: torch.Tensor | None = None,
+    ls6_corr_ak: torch.Tensor | None = None,
+    ls6_corr_kbar: torch.Tensor | None = None,
     ls6_r: int = 0,
     # 슬롯 간접 (NX,) int32: fz_*/ls6_* 버퍼의 dim0 이 NX 가 아니라 compact NS 일 때. None = 항등.
     ls6_map: torch.Tensor | None = None,
@@ -928,11 +1091,34 @@ def fused_recurrent_gated_delta_rule_replayssm(
     _n_ls6 = sum(t is not None for t in _ls6_t)
     if _n_ls6 not in (0, len(_ls6_t)):
         raise ValueError(
-            "LS6 인자는 여섯을 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
+            "LS6 인자는 일곱을 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
             f"조용히 틀린 값이 나온다 (지금 {_n_ls6}/{len(_ls6_t)})")
     _ls6_on = _n_ls6 == len(_ls6_t)
     _ls6_g = int(ls6_ubar.shape[-2]) if _ls6_on else 1
     _ls6_r = int(ls6_r) if _ls6_on else 0
+    _corr_t = (ls6_beta, ls6_corr_ak, ls6_corr_kbar)
+    _n_corr = sum(t is not None for t in _corr_t)
+    if _n_corr not in (0, len(_corr_t)):
+        raise ValueError(
+            "LS6 exact-flush 인자는 beta/corr_ak/corr_kbar 세 개를 다 "
+            f"주거나 하나도 주지 말아야 한다 (지금 {_n_corr}/3)"
+        )
+    if _n_corr and not _ls6_on:
+        raise ValueError("LS6 래치 없이 exact-flush 버퍼만 줄 수 없다")
+    _exact_env = os.environ.get("NS_GDN_LS6_EXACT_FLUSH", "")
+    if _exact_env not in ("", "0", "1"):
+        raise ValueError("NS_GDN_LS6_EXACT_FLUSH는 0 또는 1이어야 한다")
+    # 새 host hook은 보정 버퍼를 주므로 기본 exact. 기존 low-level
+    # LS6 호출은 버퍼가 없으면 근사 flush를 유지하되, 1을 명시하면 없이 못 돈다.
+    _ls6_exact = _ls6_on and (
+        _exact_env == "1" or (_exact_env == "" and _n_corr == len(_corr_t))
+    )
+    if _ls6_exact and _n_corr != len(_corr_t):
+        raise ValueError(
+            "LS6 exact-flush를 켰으므로 "
+            "ls6_beta/ls6_corr_ak/ls6_corr_kbar가 필요하다. "
+            "예전 근사 flush 재현은 NS_GDN_LS6_EXACT_FLUSH=0."
+        )
     # 링이 delta-rule 갱신을 담으면 소거는 이미 그 안에 있다 — 기본 끔.
     _ls6_erase = bool(int(os.environ.get('NS_GDN_LS6_ERASE', '0')))
     if _ls6_on and (_ls6_g & (_ls6_g - 1)):
@@ -978,6 +1164,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
             "참조만 exact 가 되어 조용히 다른 결과가 나온다.")
     # [nested_ssm 2026-09-02] v2 커널(기본). NS_GDN_KERNEL=v1 로 이전 융합 커널.
     _kv = os.environ.get("NS_GDN_KERNEL", "v2")
+    if _ls6_exact and _kv != "v2":
+        raise ValueError("LS6 exact-flush는 NS_GDN_KERNEL=v2에만 구현되어 있다")
     if ls6_map is not None:
         if _kv != "v2":
             raise ValueError("ls6_map(슬롯 간접)은 v2 커널에만 있다")
@@ -986,7 +1174,9 @@ def fused_recurrent_gated_delta_rule_replayssm(
         if ls6_map.shape[0] < initial_state.shape[0]:
             raise ValueError(f"ls6_map 길이 {ls6_map.shape[0]} < NX={initial_state.shape[0]}")
         for _nm, _t in (("ls6_ubar", ls6_ubar), ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak), ("ls6_fs", ls6_fs),
-                        ("ls6_zk", ls6_zk), ("fz_u", fz_u), ("fz_z", fz_z), ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar)):
+                        ("ls6_zk", ls6_zk), ("ls6_beta", ls6_beta), ("ls6_corr_ak", ls6_corr_ak),
+                        ("ls6_corr_kbar", ls6_corr_kbar), ("fz_u", fz_u), ("fz_z", fz_z),
+                        ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar)):
             if _t is not None and _t.shape[0] != ls6_ubar.shape[0]:
                 raise ValueError(f"ls6_map 사용 시 슬롯 버퍼 dim0 은 모두 NS 로 같아야 한다: {_nm} {_t.shape[0]} != {ls6_ubar.shape[0]}")
     if _kv == "v2":
@@ -997,6 +1187,31 @@ def fused_recurrent_gated_delta_rule_replayssm(
         if _ls6_on and tuple(ls6_zk.shape) != (ls6_ubar.shape[0], H, max_cache_len, _ls6_g):
             raise ValueError(f"ls6_zk 형상 {tuple(ls6_zk.shape)} != (NX,H,W,G)="
                              f"{(ls6_ubar.shape[0], H, max_cache_len, _ls6_g)}")
+        if _ls6_exact:
+            if not _fz_on:
+                raise ValueError("LS6 exact-flush는 head별 hot prefix(fz_nf)가 필요하다")
+            _exact_shapes = {
+                "ls6_beta": (ls6_ubar.shape[0], HV, max_cache_len),
+                "ls6_corr_ak": (ls6_ubar.shape[0], HV, _ls6_g),
+                "ls6_corr_kbar": (ls6_ubar.shape[0], H, K),
+            }
+            for _nm, _t in zip(_exact_shapes, _corr_t):
+                if tuple(_t.shape) != _exact_shapes[_nm]:
+                    raise ValueError(
+                        f"{_nm} 형상 {tuple(_t.shape)} != {_exact_shapes[_nm]}"
+                    )
+                if _t.dtype != torch.float32 or not _t.is_contiguous():
+                    raise TypeError(
+                        f"{_nm}은 연속 float32여야 한다: "
+                        f"{_t.dtype}, contiguous={_t.is_contiguous()}"
+                    )
+            if any(
+                t.dtype != torch.float32
+                for t in (initial_state, d_cache, k_cache)
+            ):
+                raise TypeError(
+                    "LS6 exact-flush는 state/d/k 링을 float32로 유지해야 한다"
+                )
         _stcfg = os.environ.get("NS_GDN_V2_CFG", "128,4,1,2")      # 스텝: bv,nk,nw,ns
         _sbv, _snk, _snw, _sns = (int(x) for x in _stcfg.split(","))
         if block_v is not None:
@@ -1011,7 +1226,10 @@ def fused_recurrent_gated_delta_rule_replayssm(
         while _nk2 > 1 and BK % _nk2 != 0:
             _nk2 -= 1
         _ls6_rp = max(16, triton.next_power_of_2(max(1, _ls6_r))) if _ls6_on else 16
-        _flcfg = os.environ.get("NS_GDN_FLUSH_CFG", "32,8,1")       # flush: fbv, CTA/SM, nw
+        _ls6_gp = max(16, triton.next_power_of_2(_ls6_g)) if _ls6_on else 16
+        # exact 보정은 dot 누산기가 많아 2 warp가 B300에서 낫다.
+        _fl_default = "32,12,2" if _ls6_exact else "32,8,1"
+        _flcfg = os.environ.get("NS_GDN_FLUSH_CFG", _fl_default)
         _fbv, _fps, _fnw = (int(x) for x in _flcfg.split(","))
         _fbv = min(_fbv, V)
         _nsplit = triton.cdiv(V, _fbv)
@@ -1086,7 +1304,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
                                          stride_indices_seq=ssm_state_indices.stride(0),
                                          MAX_CACHE_LEN=max_cache_len,
                                          BB=triton.next_power_of_2(B), num_warps=4)
-            if os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") == "cuda" and _ls6_g <= 64 and max_cache_len <= 16 \
+            if not _ls6_exact and os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") == "cuda" and _ls6_g <= 64 and max_cache_len <= 16 \
                     and initial_state.dtype == torch.float32 and d_cache.dtype == torch.float32:
                 # CUDA flush(기본). Triton 판은 발행 바운드였다 — gdn_flush_cuda.py 머리말 참조.
                 from .gdn_flush_cuda import gdn_flush_cuda
@@ -1107,8 +1325,21 @@ def fused_recurrent_gated_delta_rule_replayssm(
                 fz_qbar=fz_qbar if _fz_v2 else mixed_qkv,
                 fz_kbar=fz_kbar if _fz_v2 else mixed_qkv,
                 ls6_ubar=ls6_ubar if _ls6_on else mixed_qkv,
+                ls6_z=ls6_z if _ls6_on else mixed_qkv,
+                ls6_mh=ls6_mh if _ls6_on else write_pos,
+                ls6_beta=ls6_beta if _ls6_exact else mixed_qkv,
+                ls6_corr_ak=ls6_corr_ak if _ls6_exact else mixed_qkv,
+                ls6_corr_kbar=ls6_corr_kbar if _ls6_exact else mixed_qkv,
                 ls6_map=ls6_map if ls6_map is not None else write_pos, LS6_MAP=ls6_map is not None,
-                FBV=_fbv, NSPLIT=_nsplit, NP=_np,
+                stride_ls6_beta_slot=(ls6_beta.stride(0) if _ls6_exact else 0),
+                stride_ls6_corr_ak_slot=(ls6_corr_ak.stride(0) if _ls6_exact else 0),
+                stride_ls6_corr_kbar_slot=(ls6_corr_kbar.stride(0) if _ls6_exact else 0),
+                FBV=_fbv,
+                NSPLIT=1 if _ls6_exact else _nsplit,
+                VJOBS=_nsplit if _ls6_exact else 1,
+                NP=_np,
+                LS6_EXACT=_ls6_exact, LS6_GP=_ls6_gp,
+                LS6_R=_ls6_r, LS6_RP=_ls6_rp,
                 FDOT=int(os.environ.get("NS_GDN_FLUSH_DOT", "1")),   # 1 tf32x3(≈fp32), 2 ieee
                 num_warps=_fnw, num_stages=1, **_common)
         return out, initial_state

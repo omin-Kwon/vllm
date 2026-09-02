@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
@@ -147,7 +148,11 @@ class MambaStateDtypeCalculator:
         )
         if not use_replayssm:
             return conv_dtype, ssm_dtype
-        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        # NS_GDN_RING_DTYPE=float32: d/k rings in fp32 (the CUDA v8m step and v5m
+        # flush take fp32 rings only; bf16 rings fall back to the Triton step).
+        ring_default = "float32" if os.environ.get("NS_GDN_LS6") else "auto"
+        ring_dt = os.environ.get("NS_GDN_RING_DTYPE", ring_default)
+        activation_dtype = get_kv_cache_torch_dtype(ring_dt, model_dtype)
         return conv_dtype, ssm_dtype, activation_dtype, activation_dtype, torch.float32
 
     @classmethod

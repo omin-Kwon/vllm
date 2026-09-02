@@ -29,8 +29,8 @@ bake_super_embed 와 같은 처리).
 켜기: NS_GDN_LS6=<q38fn_ls6_*_dn.pt>  (--use-replayssm, state fp32 필수)
   NS_GDN_LS6_NSLOT   compact 슬롯 수 (기본 max_num_seqs+8)
   NS_GDN_LS6_LAM     앵커 EMA λ (기본 0.45 — 캘리브와 같아야 한다)
+  NS_GDN_LS6_EXACT_FLUSH=0  예전 근사 flush 재현용(기본 exact)
 """
-import math
 import os
 import re
 
@@ -210,6 +210,9 @@ def _bufs(layer, ssm_state):
         ubar=torch.zeros(NS, HV, G, V, **f32),
         aq=torch.zeros(NS, HV, G, **f32), ak=torch.zeros(NS, HV, G, **f32),
         fs=torch.zeros(NS, HV, W, G, **f32), zk=torch.zeros(NS, HK, W, G, **f32),
+        beta=torch.zeros(NS, HV, W, **f32),
+        corr_ak=torch.zeros(NS, HV, G, **f32),
+        corr_kbar=torch.zeros(NS, HK, K, **f32),
         fz_u=torch.zeros(NS, HV, V, **f32), fz_z=torch.zeros(NS, HV, V, **f32),
         qbar=torch.zeros(NS, HK, K, **f32), kbar=torch.zeros(NS, HK, K, **f32),
         qacc=torch.zeros(NS, HK, K, **f32), kacc=torch.zeros(NS, HK, K, **f32),
@@ -274,7 +277,6 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
     c = sh.map[x].long()                                                     # (n,)
     cu = cu_seqlens.long()
     st, en = cu[:-1], cu[1:]
-    n = x.shape[0]
     pos = en[:, None] - W + torch.arange(W, device=x.device)[None, :]         # (n,W) 창끝 W 토큰
     valid = pos >= st[:, None]
     pos = pos.clamp(min=0, max=max(int(mixed_pf.shape[0]) - 1, 0))
@@ -292,6 +294,8 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
     Z = L6["Z"]
     b["aq"][c] = torch.einsum("hkg,nhk->nhg", Z, qbar).repeat_interleave(rep, 1)
     b["ak"][c] = torch.einsum("hkg,nhk->nhg", Z, kbar).repeat_interleave(rep, 1)
+    b["corr_ak"][c] = b["ak"][c]
+    b["corr_kbar"][c] = kbar
     S = ssm_state[x].float()                                                 # (n,HV,V,K)
     b["ubar"][c] = torch.einsum("nhvk,hkg->nhgv", S, L6["Zrep"])
     cold = L6["cold"]
@@ -299,12 +303,15 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
     b["fz_z"][c] = torch.einsum("nhvk,nhk->nhv", S, kbar.repeat_interleave(rep, 1) * cold)
     b["fs"][c] = 0
     b["zk"][c] = 0
+    b["beta"][c] = 0
     del S
 
 
 # ─────────────────────────── ④ decode 부기 ───────────────────────────
 @torch.no_grad()
-def decode_bookkeep(layer, ssm_state, mixed_dec, idx, write_pos, scale):
+def decode_bookkeep(
+    layer, ssm_state, mixed_dec, beta_logits, idx, write_pos, scale
+):
     """커널 호출 **앞**. 고정 형상·device 연산만(그래프 캡처 가능). 패딩 행(idx≤0)은 행 0 으로."""
     if not getattr(layer, "_ls6_active", False):
         return None
@@ -323,12 +330,17 @@ def decode_bookkeep(layer, ssm_state, mixed_dec, idx, write_pos, scale):
     b["qacc"].index_add_(0, c, qh)
     b["kacc"].index_add_(0, c, kh)
     b["cnt"].index_add_(0, c, torch.ones_like(c, dtype=torch.float32))
+    beta = torch.sigmoid(beta_logits.float()).to(beta_logits.dtype).float()
+    b["beta"][c, :, write_pos.long()] = beta
     fl = (write_pos == (W - 1))                                              # (T,) flush 행
     cnt = b["cnt"][c].clamp(min=1)[:, None, None]
     qb_old, kb_old = b["qbar"][c], b["kbar"][c]
     qb_new = (1 - _LAM) * qb_old + _LAM * (b["qacc"][c] / cnt)
     kb_new = (1 - _LAM) * kb_old + _LAM * (b["kacc"][c] / cnt)
     f3 = fl[:, None, None]
+    b["corr_kbar"][c] = torch.where(f3, kb_old, b["corr_kbar"][c])
+    ak_old = b["ak"][c]
+    b["corr_ak"][c] = torch.where(f3, ak_old, b["corr_ak"][c])
     qb = torch.where(f3, qb_new, qb_old)
     kb = torch.where(f3, kb_new, kb_old)
     b["qbar"][c] = qb
@@ -351,6 +363,7 @@ def kernel_kwargs(layer, ssm_state):
     return dict(
         ls6_ubar=b["ubar"], ls6_z=L6["Z"], ls6_zbar=L6["Zbar"], ls6_aq=b["aq"], ls6_ak=b["ak"],
         ls6_fs=b["fs"], ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_r=L6["r"], ls6_map=layer._ls6_sh.map,
+        ls6_beta=b["beta"], ls6_corr_ak=b["corr_ak"], ls6_corr_kbar=b["corr_kbar"],
         fz_nf=L6["nf"], fz_u=b["fz_u"], fz_z=b["fz_z"], fz_qbar=b["qbar"], fz_kbar=b["kbar"],
     )
 
@@ -403,9 +416,15 @@ def check_end(layer, chk, ssm_state, out_ls6):
     if chk is None:
         return
     W = layer._ls6["W"]
+    _MANT = {torch.bfloat16: 8, torch.float16: 11, torch.float32: 24}[out_ls6.dtype]
     ref = chk["out"].float().flatten(1)[chk["valid"]]
     got = out_ls6.float().flatten(1)[chk["valid"]]
     e = ((got - ref).abs().max(1).values / ref.abs().max(1).values.clamp(min=1e-6)).tolist()
+    # 출력은 모델 dtype(bf16) 으로 저장되므로 |Δy| 는 반올림 경계에서 1 ulp 가 튄다 — 원소별 ulp 로 나눈
+    # 최대값과 다른 원소 수를 같이 찍는다. 항등 구성이면 "≤1 ulp, 몇 개" 여야 한다.
+    ulp = torch.ldexp(torch.ones_like(ref), torch.frexp(ref.clamp(min=1e-30).abs())[1] - _MANT)
+    eu = ((got - ref).abs() / ulp).max(1).values.tolist()
+    nd = (got != ref).sum(1).tolist()
     fl = (chk["wp"] == W - 1) & chk["valid"]
     es = ""
     if bool(fl.any()):
@@ -413,6 +432,7 @@ def check_end(layer, chk, ssm_state, out_ls6):
         Sg = ssm_state[xs].float()
         Sr = chk["S"][1:][fl].float()                                        # 참조 행 i+1 ↔ 배치 행 i
         es = "  flush ΔS/|S| " + " ".join(f"{v:.1e}" for v in ((Sg - Sr).flatten(1).abs().max(1).values / Sr.flatten(1).abs().max(1).values.clamp(min=1e-6)).tolist())
-    logger.info("[ls6-check] step %d %s wp %s slot %s |Δy|/|y| %s  ΔŪ %s%s", chk["step"], layer._ls6_name,
-                chk["wp"].tolist(), chk["c"], " ".join(f"{v:.1e}" for v in e),
+    logger.info("[ls6-check] step %d %s wp %s slot %s |Δy|/|y| %s  ulp %s  n≠ %s  ΔŪ %s%s", chk["step"],
+                layer._ls6_name, chk["wp"].tolist(), chk["c"], " ".join(f"{v:.1e}" for v in e),
+                " ".join(f"{v:.1f}" for v in eu), " ".join(str(int(v)) for v in nd),
                 " ".join(f"{v:.1e}" for v in chk["du"]), es)
