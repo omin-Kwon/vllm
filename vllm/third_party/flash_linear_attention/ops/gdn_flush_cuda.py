@@ -91,7 +91,10 @@ gdn_exact_delta_kernel(
                 const float y = __shfl_up_sync(0xffffffffu, pre, o);
                 if (t >= o) pre += y;
             }
-            if (t < W) sPrefix[t] = __expf(pre);
+            // Keep log-prefixes.  exp(prefix_s)/exp(prefix_j) becomes 0/0
+            // under strong real-model decay, while exp(prefix_s-prefix_j)
+            // is equivalent and its argument is always non-positive.
+            if (t < W) sPrefix[t] = pre;
         }
         __syncthreads();
 
@@ -102,7 +105,7 @@ gdn_exact_delta_kernel(
             if (j < s) {
                 for (int kk = 0; kk < K; ++kk)
                     kap = fmaf(sK[j * K + kk], sK[s * K + kk], kap);
-                kap *= sPrefix[s] / sPrefix[j];
+                kap *= __expf(sPrefix[s] - sPrefix[j]);
             }
             sRho[ix] = kap;
         }
@@ -140,7 +143,7 @@ gdn_exact_delta_kernel(
                     #pragma unroll
                     for (int o = TK / 2; o > 0; o >>= 1)
                         e += __shfl_xor_sync(0xffffffffu, e, o);
-                    e *= sPrefix[s];
+                    e *= __expf(sPrefix[s]);
                 }
                 eps[s] = e;
             }
@@ -220,7 +223,8 @@ gdn_exact_delta_tc_128_kernel(
                 const float y = __shfl_up_sync(0xffffffffu, pre, o);
                 if (t >= o) pre += y;
             }
-            if (t < W) sPrefix[t] = __expf(pre);
+            // Store log-prefixes to avoid exp-underflow ratios (0/0).
+            if (t < W) sPrefix[t] = pre;
         }
         __syncthreads();
 
@@ -230,7 +234,7 @@ gdn_exact_delta_tc_128_kernel(
             if (j < s) {
                 for (int kk = 0; kk < K; ++kk)
                     kap = fmaf(sK[j * K + kk], sK[s * K + kk], kap);
-                kap *= sPrefix[s] / sPrefix[j];
+                kap *= __expf(sPrefix[s] - sPrefix[j]);
             }
             sRho[ix] = kap;
         }
@@ -287,7 +291,7 @@ gdn_exact_delta_tc_128_kernel(
                     for (int j = 0; j < WMAX; ++j)
                         if (j < s) prev = fmaf(sRho[j * W + s], delta[j], prev);
                     // The final slot was evaluated exactly by the step kernel.
-                    const float eps = (s < W - 1) ? sEps[t * WMAX + s] * sPrefix[s] : 0.f;
+                    const float eps = (s < W - 1) ? sEps[t * WMAX + s] * __expf(sPrefix[s]) : 0.f;
                     delta[s] = -sBeta[s] * (eps + prev);
                     pd[(long)s * V + v] -= delta[s];
                 } else {
@@ -605,7 +609,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_flush_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_flush_v6i", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_flush_v6j", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_flush"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
