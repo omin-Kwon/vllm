@@ -680,3 +680,19 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+
+
+def test_ple_worker_does_not_materialize_ls6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.mamba.gdn import gdn_ls6
+
+    monkeypatch.setattr(gdn_ls6, "_PATH", "/must/not/be/loaded.pt")
+    monkeypatch.setattr(ple_offload_layer, "_offload_worker_flag", True)
+    layer = SimpleNamespace()
+
+    # An invalid layer prefix would fail if configure_layer continued into the
+    # LS6 checkpoint path. The PLE metadata worker must stop before that point.
+    gdn_ls6.configure_layer(layer, "ple-metadata-only")
+
+    assert layer._ls6_active is False

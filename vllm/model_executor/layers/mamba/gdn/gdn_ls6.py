@@ -99,6 +99,13 @@ def configure_layer(layer, prefix: str, vllm_config=None):
     layer._ls6_active = False
     if not armed():
         return
+    # The PLE offload subprocess builds the full model under torch.device("meta")
+    # only to discover the CPU-owned PLE layer. It never executes GDN. Do not
+    # load the LS6 checkpoint or materialize CUDA bases in that process.
+    from vllm.model_executor.layers.ple_offload_layer import is_offload_process
+
+    if is_offload_process():
+        return
     m = _LAYER_RE.search(prefix)
     if m is None:
         raise ValueError(f"NS_GDN_LS6: prefix {prefix!r} 에서 층 번호를 못 읽는다")
