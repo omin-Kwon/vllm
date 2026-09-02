@@ -163,10 +163,11 @@ gdn_step_kernel(
     const float* __restrict__ fz_qbar, const float* __restrict__ fz_kbar,
     const float* __restrict__ ls6_ubar, const float* __restrict__ ls6_z, const float* __restrict__ ls6_zbar,
     const int* __restrict__ ls6_mh, const float* __restrict__ ls6_aq, const float* __restrict__ ls6_ak,
-    float* __restrict__ ls6_zk, const int* __restrict__ ls6_map,
+    float* __restrict__ ls6_zk, float* __restrict__ ls6_xk,
+    const int* __restrict__ ls6_map,
     long s_mix, long s_a, long s_b, long s_h0_slot, long s_h0_h, long s_ind,
     long s_d_slot, long s_k_slot, long s_g_slot, long s_fz_slot, long s_fzb_slot,
-    long s_u_slot, long s_a6_slot, long s_zk_slot,
+    long s_u_slot, long s_a6_slot, long s_zk_slot, long s_xk_slot,
     int H, int HV, int W, int G, int R, int flags)
 {
     using SM = Smem<K, V, HPG>;
@@ -573,6 +574,12 @@ gdn_step_kernel(
                 #pragma unroll
                 for (int w = 0; w < NW; ++w) sx += sX[w][2 * GT + e];
                 ls6_zk[cidx * s_zk_slot + ((i_h * W + wp) * G + e)] = sx;
+                if (!is_flush && latch_any) {
+                    float xk = ls6_ak[cidx * s_a6_slot + (hv0 * G + e)];
+                    #pragma unroll
+                    for (int w = 0; w < NW; ++w) xk += sX[w][GT + e];
+                    ls6_xk[cidx * s_xk_slot + ((i_h * W + wp) * G + e)] = xk;
+                }
             }
         }
         __syncwarp();
@@ -637,7 +644,8 @@ static void launch(cudaStream_t st, int B,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
     c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_z, c10::optional<torch::Tensor> ls6_zbar,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_aq, c10::optional<torch::Tensor> ls6_ak,
-    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_xk,
+    c10::optional<torch::Tensor> ls6_map,
     int H, int HV, int W, int G, int R, int flags)
 {
     const bool fz = fz_u.has_value(), fz2 = fz_qbar.has_value(), ls6 = ls6_ubar.has_value();
@@ -660,11 +668,13 @@ static void launch(cudaStream_t st, int B,
         ls6 ? ls6_zbar->data_ptr<float>() : nullptr, ls6 ? ls6_mh->data_ptr<int>() : nullptr,
         ls6 ? ls6_aq->data_ptr<float>() : nullptr, ls6 ? ls6_ak->data_ptr<float>() : nullptr,
         ls6 ? ls6_zk->data_ptr<float>() : nullptr,
+        ls6 ? ls6_xk->data_ptr<float>() : nullptr,
         ls6_map.has_value() ? ls6_map->data_ptr<int>() : nullptr,
         mixed_qkv.stride(0), a.stride(0), b.stride(0), h0.stride(0), h0.stride(1), ssm_state_indices.stride(0),
         d_cache.stride(0), k_cache.stride(0), g_cache.stride(0),
         fz ? fz_u->stride(0) : 0, fz2 ? fz_qbar->stride(0) : 0,
-        ls6 ? ls6_ubar->stride(0) : 0, ls6 ? ls6_aq->stride(0) : 0, ls6 ? ls6_zk->stride(0) : 0,
+        ls6 ? ls6_ubar->stride(0) : 0, ls6 ? ls6_aq->stride(0) : 0,
+        ls6 ? ls6_zk->stride(0) : 0, ls6 ? ls6_xk->stride(0) : 0,
         H, HV, W, G, R, flags);
 }
 
@@ -676,7 +686,8 @@ void gdn_step(int B,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
     c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_z, c10::optional<torch::Tensor> ls6_zbar,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_aq, c10::optional<torch::Tensor> ls6_ak,
-    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_xk,
+    c10::optional<torch::Tensor> ls6_map,
     int H, int HV, int K, int V, int W, int G, int R, int flags)
 {
     TORCH_CHECK(W <= WMAX, "W<=16");
@@ -684,7 +695,7 @@ void gdn_step(int B,
     const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : 64);
     const int io = dt_code(mixed_qkv);
     const int hpg = HV / H;
-#define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_map, H, HV, W, G, R, flags
+#define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk, ls6_map, H, HV, W, G, R, flags
 #define CASE_T(KK, VV, GG, HH) \
     if (K == KK && V == VV && gt == GG && hpg == HH) { \
         if (io == 0) { launch<KK, VV, GG, HH, float>(ARGS); return; } \
@@ -711,7 +722,8 @@ void gdn_step(int B,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
     c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_z, c10::optional<torch::Tensor> ls6_zbar,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_aq, c10::optional<torch::Tensor> ls6_ak,
-    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_xk,
+    c10::optional<torch::Tensor> ls6_map,
     int H, int HV, int K, int V, int W, int G, int R, int flags);
 """
 
@@ -727,7 +739,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_step_v8m", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_step_v8n", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_step"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
@@ -774,11 +786,12 @@ def gdn_step_supported(mixed_qkv, out, h0, d_cache, k_cache, g_cache, ssm_state_
 def gdn_step_cuda(B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache,
                   ssm_state_indices, write_pos, scale,
                   fz_nf, fz_u, fz_z, fz_qbar, fz_kbar,
-                  ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk,
+                  ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk,
                   H, HV, K, V, W, G, R, use_qk_l2norm, evict, ls6_map=None):
     for nm, tt in (("fz_u", fz_u), ("fz_z", fz_z), ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar),
                    ("ls6_ubar", ls6_ubar), ("ls6_z", ls6_z), ("ls6_zbar", ls6_zbar),
-                   ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak), ("ls6_zk", ls6_zk)):
+                   ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak), ("ls6_zk", ls6_zk),
+                   ("ls6_xk", ls6_xk)):
         if tt is not None and tt.dtype != torch.float32:
             raise TypeError(f"gdn_step_cuda: {nm} 은 fp32 여야 한다 (받음 {tt.dtype})")
     if a.dtype != b.dtype or A_log.dtype != dt_bias.dtype:
@@ -796,5 +809,5 @@ def gdn_step_cuda(B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache,
     _ext().gdn_step(int(B), mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache,
                     ssm_state_indices, write_pos, float(scale),
                     fz_nf, fz_u, fz_z, fz_qbar, fz_kbar,
-                    ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_map,
+                    ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk, ls6_map,
                     H, HV, K, V, W, G, R, flags)

@@ -27,11 +27,277 @@ import torch
 _SRC = r"""
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #define TK 16
 #define WMAX 16
 #define GMAX 64
+
+// Correct the approximate delta ring before the ordinary fold.  One block owns
+// (flush row, value head); each 16-lane subgroup owns V/TV rows.  The checkpoint
+// row and Ubar coefficients stay in registers while the subgroup forms all W
+// key reads.  Only lane tk=0 solves the W-step triangular recurrence and writes
+// the corrected d values back to the ring.
+template <int K, int V, int TV>
+__global__ void __launch_bounds__(TV * TK, 2)
+gdn_exact_delta_kernel(
+    const float* __restrict__ h0, float* __restrict__ d_cache,
+    const float* __restrict__ k_cache, const float* __restrict__ g_cache,
+    const int* __restrict__ flush_list, const int* __restrict__ n_ptr,
+    const int* __restrict__ fz_nf, const float* __restrict__ ls6_ubar,
+    const float* __restrict__ ls6_xk, const int* __restrict__ ls6_mh,
+    const float* __restrict__ ls6_beta,
+    const int* __restrict__ ls6_map,
+    long s_h0_slot, long s_h0_h, long s_d_slot, long s_k_slot,
+    long s_g_slot, long s_u_slot, long s_xk_slot, long s_beta_slot,
+    int H, int HV, int W, int G)
+{
+    constexpr int NT = TV * TK;
+    constexpr int KPT = K / TK;
+    constexpr int VPT = V / TV;
+    constexpr int GPT = GMAX / TK;
+    __shared__ __align__(16) float sK[WMAX * K];
+    __shared__ float sX[WMAX * GMAX];
+    __shared__ float sRho[WMAX * WMAX];
+    __shared__ float sPrefix[WMAX];
+    __shared__ float sBeta[WMAX];
+    const int t = threadIdx.x;
+    const int tk = t % TK, tv = t / TK;
+    const int k0 = tk * KPT, v0 = tv * VPT;
+    const int n_work = n_ptr[0] * HV;
+    const int hpg = HV / H;
+    for (int w = blockIdx.x; w < n_work; w += gridDim.x) {
+        const int rr = w / HV, i_hv = w % HV, i_h = i_hv / hpg;
+        const int mh = ls6_mh[i_hv];
+        if (mh <= 0) continue;
+        const int nf = fz_nf[i_hv];
+        const long sidx = (long)flush_list[rr];
+        const long cidx = ls6_map ? (long)ls6_map[sidx] : sidx;
+        const float* pk = k_cache + sidx * s_k_slot + (long)i_h * W * K;
+        const float* pg = g_cache + sidx * s_g_slot + (long)i_hv * W;
+        const float* px = ls6_xk + cidx * s_xk_slot + (long)i_h * W * G;
+        const float* pb = ls6_beta + cidx * s_beta_slot + (long)i_hv * W;
+
+        for (int i = t; i < W * K; i += NT) sK[i] = pk[i];
+        for (int i = t; i < W * G; i += NT)
+            sX[i] = (i % G < mh) ? px[i] : 0.f;
+        if (t < W) sBeta[t] = pb[t];
+        const float gv = (t < W) ? pg[t] : 0.f;
+        if (t < 32) {
+            float pre = gv;
+            #pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const float y = __shfl_up_sync(0xffffffffu, pre, o);
+                if (t >= o) pre += y;
+            }
+            if (t < W) sPrefix[t] = __expf(pre);
+        }
+        __syncthreads();
+
+        // rho_{j,s} = <k_j,k_s> exp(prefix_s-prefix_j).
+        for (int ix = t; ix < W * W; ix += NT) {
+            const int j = ix / W, s = ix - j * W;
+            float kap = 0.f;
+            if (j < s) {
+                for (int kk = 0; kk < K; ++kk)
+                    kap = fmaf(sK[j * K + kk], sK[s * K + kk], kap);
+                kap *= sPrefix[s] / sPrefix[j];
+            }
+            sRho[ix] = kap;
+        }
+        __syncthreads();
+
+        const float* ph = h0 + sidx * s_h0_slot + (long)i_hv * s_h0_h;
+        const float* pu = ls6_ubar + cidx * s_u_slot + (long)i_hv * G * V;
+        float* pd = d_cache + sidx * s_d_slot + (long)i_hv * W * V;
+        #pragma unroll
+        for (int vi = 0; vi < VPT; ++vi) {
+            const int v = v0 + vi;
+            float hv[KPT];
+            #pragma unroll
+            for (int j = 0; j < KPT; ++j)
+                hv[j] = ((k0 + j) >= nf) ? ph[(long)v * K + k0 + j] : 0.f;
+            float uv[GPT];
+            #pragma unroll
+            for (int q = 0; q < GPT; ++q) {
+                const int gg = tk + q * TK;
+                uv[q] = (gg < mh) ? pu[(long)gg * V + v] : 0.f;
+            }
+            float eps[WMAX];
+            #pragma unroll
+            for (int s = 0; s < WMAX; ++s) {
+                float e = 0.f;
+                if (s < W - 1) {
+                    #pragma unroll
+                    for (int j = 0; j < KPT; ++j)
+                        e = fmaf(-hv[j], sK[s * K + k0 + j], e);
+                    #pragma unroll
+                    for (int q = 0; q < GPT; ++q) {
+                        const int gg = tk + q * TK;
+                        if (gg < mh) e = fmaf(uv[q], sX[s * G + gg], e);
+                    }
+                    #pragma unroll
+                    for (int o = TK / 2; o > 0; o >>= 1)
+                        e += __shfl_xor_sync(0xffffffffu, e, o);
+                    e *= sPrefix[s];
+                }
+                eps[s] = e;
+            }
+            if (tk == 0) {
+                float delta[WMAX];
+                #pragma unroll
+                for (int s = 0; s < WMAX; ++s) {
+                    float prev = 0.f;
+                    if (s < W) {
+                        #pragma unroll
+                        for (int j = 0; j < WMAX; ++j)
+                            if (j < s) prev = fmaf(sRho[j * W + s], delta[j], prev);
+                        delta[s] = -sBeta[s] * (eps[s] + prev);
+                        pd[(long)s * V + v] -= delta[s];
+                    } else {
+                        delta[s] = 0.f;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Flash-Next production geometry.  The step kernel stores the coefficient
+// x_s = a_k + Z_r^T(k_s-kbar) once per key head.  Two 64-row CTAs per value
+// head evaluate Ubar^T x - S0 k_cold with TF32 tensor cores; the triangular
+// solve remains fp32.  This avoids rebuilding x in every value-head CTA and
+// gives the small 128x(128+G)x16 product enough independent output tiles.
+__global__ void __launch_bounds__(128, 4)
+gdn_exact_delta_tc_128_kernel(
+    const float* __restrict__ h0, float* __restrict__ d_cache,
+    const float* __restrict__ k_cache, const float* __restrict__ g_cache,
+    const int* __restrict__ flush_list, const int* __restrict__ n_ptr,
+    const int* __restrict__ fz_nf, const float* __restrict__ ls6_ubar,
+    const float* __restrict__ ls6_xk,
+    const int* __restrict__ ls6_mh, const float* __restrict__ ls6_beta,
+    const int* __restrict__ ls6_map,
+    long s_h0_slot, long s_h0_h, long s_d_slot, long s_k_slot,
+    long s_g_slot, long s_u_slot, long s_xk_slot, long s_beta_slot,
+    int H, int HV, int W, int G)
+{
+    constexpr int K = 128, V = 128, VT = 64, NT = 128;
+    __shared__ __align__(16) float sK[WMAX * K];
+    __shared__ __align__(16) float sX[WMAX * GMAX];
+    __shared__ __align__(16) float sEps[VT * WMAX];
+    __shared__ float sRho[WMAX * WMAX];
+    __shared__ float sPrefix[WMAX];
+    __shared__ float sBeta[WMAX];
+    const int t = threadIdx.x;
+    const int n_work = n_ptr[0] * HV * 2;
+    const int hpg = HV / H;
+    for (int work = blockIdx.x; work < n_work; work += gridDim.x) {
+        const int tile = work & 1;
+        const int wh = work >> 1;
+        const int rr = wh / HV, i_hv = wh % HV, i_h = i_hv / hpg;
+        const int vbase = tile * VT;
+        const int mh = ls6_mh[i_hv];
+        if (mh <= 0) continue;
+        const int nf = fz_nf[i_hv];
+        const long sidx = (long)flush_list[rr];
+        const long cidx = ls6_map ? (long)ls6_map[sidx] : sidx;
+        const float* pk = k_cache + sidx * s_k_slot + (long)i_h * W * K;
+        const float* pg = g_cache + sidx * s_g_slot + (long)i_hv * W;
+        const float* px = ls6_xk + cidx * s_xk_slot + (long)i_h * W * G;
+        const float* pb = ls6_beta + cidx * s_beta_slot + (long)i_hv * W;
+
+        for (int i = t; i < W * K; i += NT) sK[i] = pk[i];
+        for (int i = t; i < W * G; i += NT)
+            sX[i] = (i % G < mh) ? px[i] : 0.f;
+        if (t < W) sBeta[t] = pb[t];
+        const float gv = (t < W) ? pg[t] : 0.f;
+        if (t < 32) {
+            float pre = gv;
+            #pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const float y = __shfl_up_sync(0xffffffffu, pre, o);
+                if (t >= o) pre += y;
+            }
+            if (t < W) sPrefix[t] = __expf(pre);
+        }
+        __syncthreads();
+
+        for (int ix = t; ix < W * W; ix += NT) {
+            const int j = ix / W, s = ix - j * W;
+            float kap = 0.f;
+            if (j < s) {
+                for (int kk = 0; kk < K; ++kk)
+                    kap = fmaf(sK[j * K + kk], sK[s * K + kk], kap);
+                kap *= sPrefix[s] / sPrefix[j];
+            }
+            sRho[ix] = kap;
+        }
+        __syncthreads();
+        // The W-by-K ring is the column-major K-by-W operand.  Zero its hot
+        // prefix and negate the cold suffix so one accumulator can add both
+        // Ubar^T x and -S0 k_cold.
+        for (int i = t; i < W * K; i += NT)
+            sK[i] = (i % K >= nf) ? -sK[i] : 0.f;
+        __syncthreads();
+
+        using namespace nvcuda;
+        const int warp = t >> 5;
+        const int vl = warp * 16;
+        const int vg = vbase + vl;
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+        const float* ph = h0 + sidx * s_h0_slot + (long)i_hv * s_h0_h;
+        #pragma unroll
+        for (int kk = 0; kk < K; kk += 8) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8,
+                           wmma::precision::tf32, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8,
+                           wmma::precision::tf32, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, ph + (long)vg * K + kk, K);
+            wmma::load_matrix_sync(bf, sK + kk, K);
+            wmma::mma_sync(acc, af, bf, acc);
+        }
+        const float* pu = ls6_ubar + cidx * s_u_slot + (long)i_hv * G * V;
+        #pragma unroll
+        for (int gg = 0; gg < GMAX; gg += 8) {
+            if (gg >= G) break;
+            wmma::fragment<wmma::matrix_a, 16, 16, 8,
+                           wmma::precision::tf32, wmma::col_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8,
+                           wmma::precision::tf32, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, pu + (long)gg * V + vg, V);
+            wmma::load_matrix_sync(bf, sX + gg, G);
+            wmma::mma_sync(acc, af, bf, acc);
+        }
+        wmma::store_matrix_sync(sEps + vl * WMAX, acc, WMAX,
+                                wmma::mem_row_major);
+        __syncthreads();
+
+        float* pd = d_cache + sidx * s_d_slot + (long)i_hv * W * V;
+        if (t < VT) {
+            const int v = vbase + t;
+            float delta[WMAX];
+            #pragma unroll
+            for (int s = 0; s < WMAX; ++s) {
+                float prev = 0.f;
+                if (s < W) {
+                    #pragma unroll
+                    for (int j = 0; j < WMAX; ++j)
+                        if (j < s) prev = fmaf(sRho[j * W + s], delta[j], prev);
+                    // The final slot was evaluated exactly by the step kernel.
+                    const float eps = (s < W - 1) ? sEps[t * WMAX + s] * sPrefix[s] : 0.f;
+                    delta[s] = -sBeta[s] * (eps + prev);
+                    pd[(long)s * V + v] -= delta[s];
+                } else {
+                    delta[s] = 0.f;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
 
 template <int K, int V, int TV>
 __global__ void __launch_bounds__(TV * TK, (TV >= 32 ? 2 : 2))
@@ -236,11 +502,52 @@ static void launch(int grid, cudaStream_t st,
     torch::Tensor ssm_state_indices, torch::Tensor flush_list, int n_off,
     c10::optional<torch::Tensor> fz_nf, c10::optional<torch::Tensor> fz_u, c10::optional<torch::Tensor> fz_z,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
-    c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_zk,
+    c10::optional<torch::Tensor> ls6_xk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_beta,
     int H, int HV, int W, int G, int dbg)
 {
     const bool fz = fz_u.has_value();
     const bool ls6 = ls6_ubar.has_value();
+    const bool exact = ls6_beta.has_value();
+    if (exact) {
+        if constexpr (K == 128 && V == 128) {
+            if (G >= 8 && G % 8 == 0) {
+                gdn_exact_delta_tc_128_kernel<<<grid, 128, 0, st>>>(
+                h0.data_ptr<float>(), d_cache.data_ptr<float>(), k_cache.data_ptr<float>(),
+                g_cache.data_ptr<float>(), flush_list.data_ptr<int>(),
+                flush_list.data_ptr<int>() + n_off, fz_nf->data_ptr<int>(),
+                ls6_ubar->data_ptr<float>(), ls6_xk->data_ptr<float>(),
+                ls6_mh->data_ptr<int>(), ls6_beta->data_ptr<float>(),
+                ls6_map.has_value() ? ls6_map->data_ptr<int>() : nullptr,
+                h0.stride(0), h0.stride(1), d_cache.stride(0), k_cache.stride(0),
+                g_cache.stride(0), ls6_ubar->stride(0), ls6_xk->stride(0),
+                ls6_beta->stride(0), H, HV, W, G);
+            } else {
+                gdn_exact_delta_kernel<K, V, TV><<<grid, TV * TK, 0, st>>>(
+                    h0.data_ptr<float>(), d_cache.data_ptr<float>(), k_cache.data_ptr<float>(),
+                    g_cache.data_ptr<float>(), flush_list.data_ptr<int>(),
+                    flush_list.data_ptr<int>() + n_off, fz_nf->data_ptr<int>(),
+                    ls6_ubar->data_ptr<float>(), ls6_xk->data_ptr<float>(),
+                    ls6_mh->data_ptr<int>(), ls6_beta->data_ptr<float>(),
+                    ls6_map.has_value() ? ls6_map->data_ptr<int>() : nullptr,
+                    h0.stride(0), h0.stride(1), d_cache.stride(0), k_cache.stride(0),
+                    g_cache.stride(0), ls6_ubar->stride(0), ls6_xk->stride(0),
+                    ls6_beta->stride(0), H, HV, W, G);
+            }
+        } else {
+            gdn_exact_delta_kernel<K, V, TV><<<grid, TV * TK, 0, st>>>(
+                h0.data_ptr<float>(), d_cache.data_ptr<float>(), k_cache.data_ptr<float>(),
+                g_cache.data_ptr<float>(), flush_list.data_ptr<int>(),
+                flush_list.data_ptr<int>() + n_off, fz_nf->data_ptr<int>(),
+                ls6_ubar->data_ptr<float>(), ls6_xk->data_ptr<float>(),
+                ls6_mh->data_ptr<int>(), ls6_beta->data_ptr<float>(),
+                ls6_map.has_value() ? ls6_map->data_ptr<int>() : nullptr,
+                h0.stride(0), h0.stride(1), d_cache.stride(0), k_cache.stride(0),
+                g_cache.stride(0), ls6_ubar->stride(0), ls6_xk->stride(0),
+                ls6_beta->stride(0), H, HV, W, G);
+        }
+    }
     gdn_flush_kernel<K, V, TV><<<grid, TV * TK, 0, st>>>(
         h0.data_ptr<float>(), d_cache.data_ptr<float>(), k_cache.data_ptr<float>(), g_cache.data_ptr<float>(),
         ssm_state_indices.data_ptr<int>(), flush_list.data_ptr<int>(), flush_list.data_ptr<int>() + n_off,
@@ -258,12 +565,14 @@ void gdn_flush(int grid,
     torch::Tensor ssm_state_indices, torch::Tensor flush_list, int n_off,
     c10::optional<torch::Tensor> fz_nf, c10::optional<torch::Tensor> fz_u, c10::optional<torch::Tensor> fz_z,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
-    c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_zk,
+    c10::optional<torch::Tensor> ls6_xk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_beta,
     int H, int HV, int K, int V, int W, int G, int tv, int dbg)
 {
     TORCH_CHECK(W <= WMAX && G <= GMAX, "W<=16, G<=64");
     auto st = at::cuda::getCurrentCUDAStream().stream();
-#define CASE(KK, VV, TVV) if (K == KK && V == VV && tv == TVV) { launch<KK, VV, TVV>(grid, st, h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_off, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, ls6_map, H, HV, W, G, dbg); return; }
+#define CASE(KK, VV, TVV) if (K == KK && V == VV && tv == TVV) { launch<KK, VV, TVV>(grid, st, h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_off, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, ls6_xk, ls6_map, ls6_mh, ls6_beta, H, HV, W, G, dbg); return; }
     CASE(128, 128, 8) CASE(128, 128, 16) CASE(128, 128, 32)
     CASE(64, 128, 8) CASE(64, 128, 16) CASE(64, 128, 32)
     CASE(64, 64, 8) CASE(64, 64, 16) CASE(32, 32, 8) CASE(128, 64, 8) CASE(128, 64, 16)
@@ -279,7 +588,9 @@ void gdn_flush(int grid,
     torch::Tensor ssm_state_indices, torch::Tensor flush_list, int n_off,
     c10::optional<torch::Tensor> fz_nf, c10::optional<torch::Tensor> fz_u, c10::optional<torch::Tensor> fz_z,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
-    c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_zk,
+    c10::optional<torch::Tensor> ls6_xk, c10::optional<torch::Tensor> ls6_map,
+    c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_beta,
     int H, int HV, int K, int V, int W, int G, int tv, int dbg);
 """
 
@@ -294,17 +605,20 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_flush_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_flush_v5m", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_flush_v6i", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_flush"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
 
 
 def gdn_flush_cuda(grid, h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_off,
-                   fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, H, HV, K, V, W, G, ls6_map=None):
+                   fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, ls6_xk,
+                   H, HV, K, V, W, G,
+                   ls6_map=None, ls6_mh=None, ls6_beta=None):
     for nm, tt in (("h0", h0), ("d_cache", d_cache), ("k_cache", k_cache), ("g_cache", g_cache),
                    ("fz_u", fz_u), ("fz_z", fz_z), ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar),
-                   ("ls6_ubar", ls6_ubar), ("ls6_zk", ls6_zk)):
+                   ("ls6_ubar", ls6_ubar), ("ls6_zk", ls6_zk), ("ls6_xk", ls6_xk),
+                   ("ls6_beta", ls6_beta)):
         if tt is not None and tt.dtype != torch.float32:
             raise TypeError(f"gdn_flush_cuda: {nm} 은 fp32 여야 한다 (받음 {tt.dtype}) — state 는 fp32 규약")
     if h0.stride(3) != 1 or h0.stride(2) != K:
@@ -316,6 +630,19 @@ def gdn_flush_cuda(grid, h0, d_cache, k_cache, g_cache, ssm_state_indices, flush
     tv = min(int(os.environ.get("NS_GDN_FLUSH_TV", "32")), max(8, V // 4))
     if ls6_map is not None and (ls6_map.dtype != torch.int32 or not ls6_map.is_contiguous() or ls6_map.dim() != 1):
         raise TypeError(f"gdn_flush_cuda: ls6_map 은 연속 int32 (NX,) 여야 한다 (받음 {ls6_map.dtype} {tuple(ls6_map.shape)})")
+    corr = (ls6_mh, ls6_beta)
+    n_corr = sum(t is not None for t in corr)
+    if n_corr not in (0, len(corr)):
+        raise ValueError(
+            f"gdn_flush_cuda: exact 인자는 모두 주거나 빼야 한다 ({n_corr}/2)"
+        )
+    if n_corr and ls6_xk is None:
+        raise ValueError("gdn_flush_cuda: exact-flush에는 ls6_xk 계수 링이 필요하다")
+    if ls6_mh is not None and ls6_mh.dtype != torch.int32:
+        raise TypeError(
+            f"gdn_flush_cuda: ls6_mh 는 int32여야 한다 ({ls6_mh.dtype})"
+        )
     _ext().gdn_flush(int(grid), h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, int(n_off),
-                     fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, ls6_map, H, HV, K, V, W, G, tv,
+                     fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, ls6_xk, ls6_map,
+                     ls6_mh, ls6_beta, H, HV, K, V, W, G, tv,
                      int(os.environ.get('NS_GDN_FLUSH_DBG', '0')))

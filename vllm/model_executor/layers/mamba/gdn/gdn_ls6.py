@@ -209,10 +209,8 @@ def _bufs(layer, ssm_state):
     b = dict(
         ubar=torch.zeros(NS, HV, G, V, **f32),
         aq=torch.zeros(NS, HV, G, **f32), ak=torch.zeros(NS, HV, G, **f32),
-        fs=torch.zeros(NS, HV, W, G, **f32), zk=torch.zeros(NS, HK, W, G, **f32),
+        zk=torch.zeros(NS, HK, W, G, **f32), xk=torch.zeros(NS, HK, W, G, **f32),
         beta=torch.zeros(NS, HV, W, **f32),
-        corr_ak=torch.zeros(NS, HV, G, **f32),
-        corr_kbar=torch.zeros(NS, HK, K, **f32),
         fz_u=torch.zeros(NS, HV, V, **f32), fz_z=torch.zeros(NS, HV, V, **f32),
         qbar=torch.zeros(NS, HK, K, **f32), kbar=torch.zeros(NS, HK, K, **f32),
         qacc=torch.zeros(NS, HK, K, **f32), kacc=torch.zeros(NS, HK, K, **f32),
@@ -294,15 +292,13 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
     Z = L6["Z"]
     b["aq"][c] = torch.einsum("hkg,nhk->nhg", Z, qbar).repeat_interleave(rep, 1)
     b["ak"][c] = torch.einsum("hkg,nhk->nhg", Z, kbar).repeat_interleave(rep, 1)
-    b["corr_ak"][c] = b["ak"][c]
-    b["corr_kbar"][c] = kbar
     S = ssm_state[x].float()                                                 # (n,HV,V,K)
     b["ubar"][c] = torch.einsum("nhvk,hkg->nhgv", S, L6["Zrep"])
     cold = L6["cold"]
     b["fz_u"][c] = torch.einsum("nhvk,nhk->nhv", S, qbar.repeat_interleave(rep, 1) * cold)
     b["fz_z"][c] = torch.einsum("nhvk,nhk->nhv", S, kbar.repeat_interleave(rep, 1) * cold)
-    b["fs"][c] = 0
     b["zk"][c] = 0
+    b["xk"][c] = 0
     b["beta"][c] = 0
     del S
 
@@ -338,9 +334,6 @@ def decode_bookkeep(
     qb_new = (1 - _LAM) * qb_old + _LAM * (b["qacc"][c] / cnt)
     kb_new = (1 - _LAM) * kb_old + _LAM * (b["kacc"][c] / cnt)
     f3 = fl[:, None, None]
-    b["corr_kbar"][c] = torch.where(f3, kb_old, b["corr_kbar"][c])
-    ak_old = b["ak"][c]
-    b["corr_ak"][c] = torch.where(f3, ak_old, b["corr_ak"][c])
     qb = torch.where(f3, qb_new, qb_old)
     kb = torch.where(f3, kb_new, kb_old)
     b["qbar"][c] = qb
@@ -362,8 +355,9 @@ def kernel_kwargs(layer, ssm_state):
     b = _bufs(layer, ssm_state)
     return dict(
         ls6_ubar=b["ubar"], ls6_z=L6["Z"], ls6_zbar=L6["Zbar"], ls6_aq=b["aq"], ls6_ak=b["ak"],
-        ls6_fs=b["fs"], ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_r=L6["r"], ls6_map=layer._ls6_sh.map,
-        ls6_beta=b["beta"], ls6_corr_ak=b["corr_ak"], ls6_corr_kbar=b["corr_kbar"],
+        ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_xk=b["xk"],
+        ls6_r=L6["r"], ls6_map=layer._ls6_sh.map,
+        ls6_beta=b["beta"],
         fz_nf=L6["nf"], fz_u=b["fz_u"], fz_z=b["fz_z"], fz_qbar=b["qbar"], fz_kbar=b["kbar"],
     )
 
