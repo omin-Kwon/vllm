@@ -32,7 +32,7 @@ _SRC = r"""
 
 #define TK 16
 #define WMAX 16
-#define GMAX 64
+#define GMAX 128
 
 // Correct the approximate delta ring before the ordinary fold.  One block owns
 // (flush row, value head); each 16-lane subgroup owns V/TV rows.  The checkpoint
@@ -574,7 +574,7 @@ void gdn_flush(int grid,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_beta,
     int H, int HV, int K, int V, int W, int G, int tv, int dbg)
 {
-    TORCH_CHECK(W <= WMAX && G <= GMAX, "W<=16, G<=64");
+    TORCH_CHECK(W <= WMAX && G <= GMAX, "W<=16, G<=128");
     auto st = at::cuda::getCurrentCUDAStream().stream();
 #define CASE(KK, VV, TVV) if (K == KK && V == VV && tv == TVV) { launch<KK, VV, TVV>(grid, st, h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_off, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_zk, ls6_xk, ls6_map, ls6_mh, ls6_beta, H, HV, W, G, dbg); return; }
     CASE(128, 128, 8) CASE(128, 128, 16) CASE(128, 128, 32)
@@ -609,7 +609,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_flush_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_flush_v6j", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_flush_v6k", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_flush"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT

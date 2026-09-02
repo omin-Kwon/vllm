@@ -23,8 +23,9 @@ v7→v8 이력(B=256, step-only, us; dense / G8 / floor): v7 144.7/40.5/22.8 →
   남은 격차(G8 33 vs DRAM 23us)는 트래픽이 아니라 발행(≈1450 명령/워프, 발행 효율 48%).
   상세: docs/latch/GDN_STEP_KERNEL_OPT_20260902.md
 
-Triton 판(`_gdn_v2_step_kernel`)과 **같은 의미·같은 버퍼 규약**이다. 지원 못 하는 형상
-(K ∉ {32,64,128}, V≠128, G ∉ {≤8,16,64}, HPG ∉ 2..4, W>16, 캐시 비-fp32)이면 래퍼가 Triton 으로 되돌린다.
+Triton 판(`_gdn_v2_step_kernel`)과 **같은 의미·같은 버퍼 규약**이다. Qwen Flash-Next
+(K=V=128, HPG=3)는 G=128 특수화를 추가로 갖고, 나머지 지원 못 하는 형상은
+래퍼가 Triton 으로 되돌린다.
 """
 import os
 
@@ -692,7 +693,7 @@ void gdn_step(int B,
 {
     TORCH_CHECK(W <= WMAX, "W<=16");
     auto st = at::cuda::getCurrentCUDAStream().stream();
-    const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : 64);
+    const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : (G <= 64 ? 64 : 128));
     const int io = dt_code(mixed_qkv);
     const int hpg = HV / H;
 #define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk, ls6_map, H, HV, W, G, R, flags
@@ -704,6 +705,10 @@ void gdn_step(int B,
 #define CASE_G(KK, VV, HH) CASE_T(KK, VV, 8, HH) CASE_T(KK, VV, 16, HH) CASE_T(KK, VV, 64, HH)
 #define CASE(KK, VV) CASE_G(KK, VV, 2) CASE_G(KK, VV, 3) CASE_G(KK, VV, 4)
     CASE(128, 128) CASE(64, 128) CASE(32, 128)
+    // Qwen3.8 Flash-Next: K=V=128, three value heads per key head.
+    // Compile only this G=128 geometry instead of multiplying the complete
+    // specialization matrix; other geometries still fall back to Triton.
+    CASE_T(128, 128, 128, 3)
 #undef CASE
 #undef CASE_G
 #undef CASE_T
@@ -739,7 +744,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_step_v8n", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_step_v8p", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_step"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
@@ -762,8 +767,10 @@ def gdn_step_supported(mixed_qkv, out, h0, d_cache, k_cache, g_cache, ssm_state_
     for nm, x in (("d_cache", d_cache), ("k_cache", k_cache), ("g_cache", g_cache), ("state", h0)):
         if x.data_ptr() % 16 or x.stride(0) % 4:
             return f"{nm} 16B 정렬 아님 (bulk copy)"
-    if ls6_on and (G < 4 or G > 64 or G % 4):
-        return f"G={G} 는 4..64 (4 의 배수) 만"
+    if ls6_on and (G < 4 or G > 128 or G % 4):
+        return f"G={G} 는 4..128 (4 의 배수) 만"
+    if ls6_on and G > 64 and (K, V, HV // H) != (128, 128, 3):
+        return f"G={G}>64 특수화는 (K,V,HV/H)=(128,128,3) 만"
     if ls6_on and R % (K // 32):
         return f"R={R} 는 K/32={K // 32} 의 배수만"
     for nm, tt in (("h0", h0), ("d_cache", d_cache), ("k_cache", k_cache), ("g_cache", g_cache)):

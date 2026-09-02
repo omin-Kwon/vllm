@@ -139,9 +139,14 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         logger.info("[ls6] %s: 층 전체 dense — 훅 없음", prefix)
         return
     G = max(4, 1 << (int(mt.max()) - 1).bit_length())
-    if G > 64 and os.environ.get("NS_GDN_STEP_IMPL", "cuda") == "cuda":
-        # Triton step/flush 는 G=128 도 받는다(검증용 완전 기저) — 배포는 CUDA 커널이라 64 가 천장.
-        raise ValueError(f"층 {li}: m 최대 {int(mt.max())} → G={G} > 64 (CUDA step/flush 한계). --mmax 64 로 배분할 것")
+    if G > 128:
+        raise ValueError(f"층 {li}: m 최대 {int(mt.max())} → G={G} > 128")
+    if G > 64 and os.environ.get("NS_GDN_STEP_IMPL", "cuda") == "cuda" \
+            and (K, V, HV // HK) != (128, 128, 3):
+        # G=128 CUDA 특수화는 실제 Qwen Flash-Next 기하에만 컴파일한다.
+        raise ValueError(
+            f"층 {li}: G={G}>64 CUDA step 특수화는 "
+            f"(K,V,rep)=(128,128,3) 만 (받음 {(K, V, HV // HK)})")
     OM = d["omega"][li].double()                       # (HK,MM,K)
     # 모델 구성은 default device=cuda 문맥에서 돈다 — ckpt 텐서(CPU)와 섞이지 않게 CPU 를 박는다.
     Z = torch.zeros(HK, K, G, dtype=torch.float64, device="cpu")
