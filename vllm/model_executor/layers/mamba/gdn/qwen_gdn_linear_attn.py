@@ -549,6 +549,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # to this layer's state by gated_delta_net_cached_state_shape, so the
         # flag and the state layout must be decided from the same config.
         self.use_replayssm = vllm_config.cache_config.use_replayssm
+        # [nested_ssm 2026-09-02] LS6 래치 훅 (NS_GDN_LS6=<ckpt>). gdn_ls6.py 머리말.
+        from vllm.model_executor.layers.mamba.gdn import gdn_ls6 as _gdn_ls6
+
+        _gdn_ls6.configure_layer(self, prefix, vllm_config)
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self._gdn_prune_active and self.gdn_decode_kernel == "cuda":
             logger.info_once(
@@ -1496,6 +1500,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             _gdn_prune.prune_mixed(self, mixed_qkv_spec)
             _gdn_prune.prune_mixed(self, mixed_qkv_non_spec)
+        if self._ls6_active:
+            # [nested_ssm 2026-09-02] LS6 ①: conv 뒤·l2norm 앞 q/k 회전 (prefill + 혼합 웨이브 decode)
+            from vllm.model_executor.layers.mamba.gdn import gdn_ls6 as _gdn_ls6
+
+            if mixed_qkv_spec is not None:
+                raise RuntimeError("NS_GDN_LS6 는 spec-decode 웨이브를 지원하지 않는다")
+            _gdn_ls6.rotate_mixed(self, mixed_qkv_non_spec)
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
@@ -1585,7 +1596,43 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
-        if split_non_spec:
+        if split_non_spec and self.use_replayssm:
+            # [nested_ssm 2026-09-02] LS6 ⑤ / ReplaySSM 혼합 웨이브: 벗겨낸 decode 행을
+            # dense 갱신이 아니라 **링 커널**로 보낸다. dense 로 보내면 write_pos 는 전진하는데
+            # 링(d/k/g)은 비어 있어 다음 flush 가 틀린다 (vllm_gdn 의 hook ⑦ 과 같은 수정).
+            from vllm.model_executor.layers.mamba.gdn import gdn_ls6 as _gdn_ls6
+
+            write_pos_d = attn_metadata.write_pos_d
+            if write_pos_d is None:
+                raise RuntimeError("ReplaySSM 혼합 웨이브에 write_pos_d 가 없다")
+            dec_idx = non_spec_state_indices_tensor[:num_decode_tokens]  # type: ignore[index]
+            mixed_dec = mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+            core_attn_out_decode = torch.empty(
+                (1, num_decode_tokens, *core_attn_out.shape[1:]),
+                dtype=mixed_dec.dtype, device=mixed_dec.device,
+            )
+            ls6_kw = _gdn_ls6.decode_bookkeep(
+                self, ssm_state, mixed_dec, dec_idx, write_pos_d[:num_decode_tokens],
+                self.head_k_dim**-0.5,
+            ) or {}
+            fused_recurrent_gated_delta_rule_replayssm(
+                mixed_qkv=mixed_dec,
+                a=a[:num_decode_tokens],
+                b=b[:num_decode_tokens],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=self.head_k_dim**-0.5,
+                initial_state=ssm_state,
+                d_cache=self_kv_cache[2],
+                k_cache=self_kv_cache[3],
+                g_cache=self_kv_cache[4],
+                out=core_attn_out_decode,
+                ssm_state_indices=dec_idx,
+                write_pos=write_pos_d[:num_decode_tokens],
+                use_qk_l2norm_in_kernel=True,
+                **ls6_kw,
+            )
+        elif split_non_spec:
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
@@ -1648,6 +1695,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prefill_state_indices,
                 attn_metadata.qmamba_quantize_p,
             )
+            if self._ls6_active:
+                # [nested_ssm 2026-09-02] LS6 ③: 정확한 state 에서 Ū·앵커 시딩 (청크마다)
+                from vllm.model_executor.layers.mamba.gdn import gdn_ls6 as _gdn_ls6
+
+                _gdn_ls6.seed_prefill(
+                    self, ssm_state, prefill_state_indices, prefill_has_initial_state,
+                    conv_output_prefill, attn_metadata.prefill_query_start_loc,
+                    self.head_k_dim**-0.5,
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1884,6 +1940,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             from vllm.model_executor.layers.mamba.gdn import gdn_prune as _gdn_prune
 
             _gdn_prune.prune_mixed(self, mixed_qkv_non_spec)
+        ls6_kw = {}
+        if self._ls6_active:
+            # [nested_ssm 2026-09-02] LS6 ①④: 회전 → 앵커 부기(커널 앞) → 래치 인자
+            from vllm.model_executor.layers.mamba.gdn import gdn_ls6 as _gdn_ls6
+
+            _gdn_ls6.rotate_mixed(self, mixed_qkv_non_spec)
+            ls6_kw = _gdn_ls6.decode_bookkeep(
+                self, ssm_state, mixed_qkv_non_spec,
+                non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                write_pos_d, self.head_k_dim**-0.5,
+            ) or {}
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_replayssm(
             mixed_qkv=mixed_qkv_non_spec,
@@ -1900,6 +1967,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             write_pos=write_pos_d,
             use_qk_l2norm_in_kernel=True,
+            **ls6_kw,
         )
         return
 
