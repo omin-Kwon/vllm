@@ -466,9 +466,9 @@ def _gdn_v2_step_kernel(
     d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale,
     fz_nf, fz_u, fz_z, stride_fz_slot: tl.constexpr,
     fz_qbar, fz_kbar, stride_fzb_slot: tl.constexpr,
-    ls6_ubar, ls6_z, ls6_zbar, ls6_zk, ls6_xk, ls6_aq, ls6_ak, ls6_mh, ls6_map,
+    ls6_ubar, ls6_z, ls6_zbar, ls6_zk, ls6_fs, ls6_aq, ls6_ak, ls6_mh, ls6_map,
     stride_ls6_u_slot: tl.constexpr, stride_ls6_a_slot: tl.constexpr,
-    stride_ls6_zk_slot: tl.constexpr, stride_ls6_xk_slot: tl.constexpr,
+    stride_ls6_zk_slot: tl.constexpr, stride_ls6_fs_slot: tl.constexpr,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr, stride_b_tok: tl.constexpr,
     stride_init_state_token: tl.constexpr,
@@ -526,11 +526,16 @@ def _gdn_v2_step_kernel(
         nf_h = tl.load(fz_nf + i_hv).to(tl.int32)
     else:
         nf_h = K
-    # flush 행은 exact — state 를 전부 읽는다(hot 경계 무시). 래치/cold 항도 안 쓴다.
-    if b_is_flush:
-        nf_eff = K
+    # Latch heads keep a state-independent raw-write ring, including on the
+    # flush step.  Dense fallback heads keep the legacy exact delta ring and
+    # may therefore read the full checkpoint on a flush.
+    if LS6_ON and FZ_ON:
+        mh_head = tl.load(ls6_mh + i_hv).to(tl.int32)
+        raw_latch = mh_head > 0
     else:
-        nf_eff = nf_h
+        mh_head = 0
+        raw_latch = False
+    nf_eff = tl.where(b_is_flush & (not raw_latch), K, nf_h)
 
     o_k = tl.arange(0, BK)
     mask_k = o_k < K
@@ -593,46 +598,26 @@ def _gdn_v2_step_kernel(
             zk_acc = tl.sum(zb_f * k_st[:, None], axis=0)
             tl.store(ls6_zk + cidx * stride_ls6_zk_slot + (i_h * MAX_CACHE_LEN + b_write_pos) * LS6_G + o_g6,
                      zk_acc)
-            # exact-flush가 과거 온라인 key-read를 같은 계수로 재현하도록 x^k_s도
-            # key head당 한 번 저장한다. 현재 flush 슬롯은 step이 dense로 읽어 보정이
-            # 필요 없으므로 쓰지 않는다.
-            if not b_is_flush:
-                o_r6 = tl.arange(0, LS6_RP)
-                m_r6 = (o_r6 < LS6_R) & (o_r6 < K)
-                z6 = tl.load(
-                    ls6_z + i_h * K * LS6_G
-                    + o_r6[:, None] * LS6_G + o_g6[None, :],
-                    mask=m_r6[:, None], other=0.0,
-                ).to(tl.float32)
-                kr6 = tl.load(
-                    p_mix + H * K + i_h * K + o_r6,
-                    mask=m_r6, other=0.0,
-                ).to(tl.float32) * k_rnorm
-                kb6 = tl.load(
-                    fz_kbar + cidx * stride_fzb_slot + i_h * K + o_r6,
-                    mask=m_r6, other=0.0,
-                ).to(tl.float32)
-                ak6 = tl.load(
-                    ls6_ak + cidx * stride_ls6_a_slot
-                    + (i_h * (HV // H)) * LS6_G + o_g6,
-                ).to(tl.float32)
-                xk6 = ak6 + tl.sum(z6 * (kr6 - kb6)[:, None], axis=0)
-                tl.store(
-                    ls6_xk + cidx * stride_ls6_xk_slot
-                    + (i_h * MAX_CACHE_LEN + b_write_pos) * LS6_G + o_g6,
-                    xk6,
-                )
-    kap_q = kap_q * b_replay_decay
-    kap_k = kap_k * b_replay_decay
+    # Keep the un-decayed key Gram contractions for the normalized projected
+    # factors F_s.  Replay uses the decay-weighted versions below.
+    kap_q_raw = kap_q
+    kap_k_raw = kap_k
+    kap_q = kap_q_raw * b_replay_decay
+    kap_k = kap_k_raw * b_replay_decay
     p_dr = d_cache + state_idx * stride_d_slot + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * V + o_v[None, :]
     d_ring = tl.load(p_dr, mask=cache_valid[:, None] & mask_v[None, :], other=0).to(tl.float32)
     s_q = tl.sum(d_ring * kap_q[:, None], axis=0)
     s_k = tl.sum(d_ring * kap_k[:, None], axis=0)
 
     if LS6_ON and FZ_ON:
-        # 래치: x = d_[t]·(A + Ẑᵀδ),  읽기 = Ū x.  mh=0 이면 dense fallback (건너뜀)
-        mh = tl.load(ls6_mh + i_hv).to(tl.int32)
-        if (mh > 0) and (not b_is_flush):
+        # Raw-write/projected-WY path.  f_s is stored after division by the
+        # accumulated scalar decay, which removes every dangerous gamma ratio:
+        #   F_t = beta_t [Z^T k_t - sum_{s<t} F_s <k_s,k_t>]
+        #   b_t = gamma_t [Z^T q_t - sum_{s<=t} F_s <k_s,q_t>].
+        # The key contraction is approximated only for this checkpoint-output
+        # coefficient.  It never enters the write or the persistent state.
+        mh = mh_head
+        if mh > 0:
             o_g = tl.arange(0, LS6_G)
             m_g = o_g < mh
             o_r = tl.arange(0, LS6_RP)
@@ -647,22 +632,41 @@ def _gdn_v2_step_kernel(
             zdk = tl.sum(z_t * (k_r - kb)[:, None], axis=0)
             aq = tl.load(ls6_aq + cidx * stride_ls6_a_slot + i_hv * LS6_G + o_g, mask=m_g, other=0.0).to(tl.float32)
             ak = tl.load(ls6_ak + cidx * stride_ls6_a_slot + i_hv * LS6_G + o_g, mask=m_g, other=0.0).to(tl.float32)
-            xq = aq + zdq
+            f_prev = tl.load(
+                ls6_fs + cidx * stride_ls6_fs_slot
+                + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * LS6_G
+                + o_g[None, :],
+                mask=cache_valid[:, None] & m_g[None, :], other=0.0,
+            ).to(tl.float32)
             xk = ak + zdk
+            f_cur = beta_val * (xk - tl.sum(f_prev * kap_k_raw[:, None], axis=0))
+            xq = aq + zdq - tl.sum(f_prev * kap_q_raw[:, None], axis=0) \
+                - f_cur * tl.sum(cur_kq)
             ub = tl.load(ls6_ubar + cidx * stride_ls6_u_slot + i_hv * (LS6_G * V)
                          + o_g[:, None] * V + o_v[None, :],
                          mask=m_g[:, None] & mask_v[None, :], other=0.0).to(tl.float32)
             hq += tl.sum(ub * xq[:, None], axis=0)
-            hk += tl.sum(ub * xk[:, None], axis=0)
+            if i_v == 0:
+                tl.store(
+                    ls6_fs + cidx * stride_ls6_fs_slot
+                    + (i_hv * MAX_CACHE_LEN + b_write_pos) * LS6_G + o_g,
+                    f_cur, mask=m_g,
+                )
     elif FZ_ON:
         if not b_is_flush:
             hq += tl.load(fz_u + cidx * stride_fz_slot + i_hv * V + o_v, mask=mask_v, other=0).to(tl.float32)
             hk += tl.load(fz_z + cidx * stride_fz_slot + i_hv * V + o_v, mask=mask_v, other=0).to(tl.float32)
 
-    b_state_q = alpha_val * (hq * b_total_decay + s_q)
-    b_state_k = alpha_val * (hk * b_total_decay + s_k)
     b_v = tl.load(p_mix + (2 * H * K) + i_hv * V + o_v, mask=mask_v, other=0).to(tl.float32)
-    b_d_cur = beta_val * (b_v - b_state_k)
+    b_state_q = alpha_val * (hq * b_total_decay + s_q)
+    if raw_latch:
+        # u_t is the state-independent transformed raw write.  Only earlier
+        # replay writes occur here; the checkpoint key-read is represented by
+        # f_t in b_state_q and must not be folded into u_t.
+        b_d_cur = beta_val * (b_v - alpha_val * s_k)
+    else:
+        b_state_k = alpha_val * (hk * b_total_decay + s_k)
+        b_d_cur = beta_val * (b_v - b_state_k)
     b_o = b_state_q + b_d_cur * tl.sum(cur_kq)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
     # flush 행이면 슬롯 W-1 — flush 커널이 균일 재생으로 접는다.
@@ -689,13 +693,105 @@ def _gdn_v2_compact_kernel(write_pos, ssm_state_indices, flush_list, B,
 
 
 @triton.jit
+def _gdn_v2_raw_to_delta_kernel(
+    h0, d_cache, k_cache, g_cache, flush_list, n_ptr,
+    ls6_mh, ls6_beta, ls6_map,
+    stride_init_state_token: tl.constexpr,
+    stride_state_h: tl.constexpr, stride_state_v: tl.constexpr,
+    stride_state_k: tl.constexpr, stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr, stride_g_slot: tl.constexpr,
+    stride_ls6_beta_slot: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BK: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr, LS6_MAP: tl.constexpr,
+    FDOT: tl.constexpr,
+):
+    """Convert state-independent raw-WY writes u_s to exact delta writes.
+
+    This small pre-kernel is used before the hand-written CUDA fold.  It writes
+    only flush rows and only latch heads.  The following fold can consequently
+    stay identical to the mature decay-plus-delta ReplaySSM kernel.
+    """
+    i_v = tl.program_id(0)
+    work = tl.program_id(1)
+    r = work // HV
+    i_hv = work % HV
+    if r >= tl.load(n_ptr):
+        return
+    if tl.load(ls6_mh + i_hv).to(tl.int32) <= 0:
+        return
+    i_h = i_hv // (HV // H)
+    state_idx = tl.load(flush_list + r).to(tl.int64)
+    if LS6_MAP:
+        cidx = tl.load(ls6_map + state_idx).to(tl.int64)
+    else:
+        cidx = state_idx
+    o_c = tl.arange(0, BC)
+    m_c = o_c < MAX_CACHE_LEN
+    o_k = tl.arange(0, BK)
+    m_k = o_k < K
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+
+    g = tl.load(
+        g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c,
+        mask=m_c, other=0.0,
+    ).to(tl.float32)
+    prefix = tl.cumsum(g, axis=0)
+    beta = tl.load(
+        ls6_beta + cidx * stride_ls6_beta_slot
+        + i_hv * MAX_CACHE_LEN + o_c,
+        mask=m_c, other=0.0,
+    ).to(tl.float32)
+    keys = tl.load(
+        k_cache + state_idx * stride_k_slot
+        + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_k[None, :],
+        mask=m_c[:, None] & m_k[None, :], other=0.0,
+    ).to(tl.float32)
+    S0 = tl.load(
+        h0 + state_idx * stride_init_state_token + i_hv * stride_state_h
+        + o_v[:, None] * stride_state_v + o_k[None, :] * stride_state_k,
+        mask=m_v[:, None] & m_k[None, :], other=0.0,
+    ).to(tl.float32)
+    if FDOT == 2:
+        gram = tl.dot(keys, tl.trans(keys), input_precision="ieee")
+        s0k = tl.dot(S0, tl.trans(keys), input_precision="ieee")
+    else:
+        gram = tl.dot(keys, tl.trans(keys), input_precision="tf32x3")
+        s0k = tl.dot(S0, tl.trans(keys), input_precision="tf32x3")
+
+    hproj = tl.zeros([BV, BC], dtype=tl.float32)
+    for ss in range(MAX_CACHE_LEN):
+        ps = tl.sum(tl.where(o_c == ss, prefix, 0.0), axis=0)
+        bs = tl.sum(tl.where(o_c == ss, beta, 0.0), axis=0)
+        s0ks = tl.sum(
+            tl.where(o_c[None, :] == ss, s0k, 0.0), axis=1
+        )
+        grams = tl.sum(
+            tl.where(o_c[None, :] == ss, gram, 0.0), axis=1
+        )
+        arow = tl.where(
+            (o_c < ss) & m_c,
+            bs * grams * tl.exp(ps - prefix),
+            0.0,
+        )
+        hs = bs * tl.exp(ps) * s0ks \
+            - tl.sum(hproj * arow[None, :], axis=1)
+        hproj = tl.where(o_c[None, :] == ss, hs[:, None], hproj)
+
+    p_u = d_cache + state_idx * stride_d_slot \
+        + (i_hv * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None]
+    u = tl.load(p_u, mask=m_v[:, None] & m_c[None, :], other=0.0).to(tl.float32)
+    tl.store(p_u, u - hproj, mask=m_v[:, None] & m_c[None, :])
+
+
+@triton.jit
 def _gdn_v2_flush_kernel(
     h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_ptr,
     fz_nf, fz_u, fz_z, stride_fz_slot: tl.constexpr,
     fz_qbar, fz_kbar, stride_fzb_slot: tl.constexpr,
-    ls6_ubar, ls6_zk, ls6_xk, ls6_mh, ls6_beta, ls6_map,
+    ls6_ubar, ls6_zk, ls6_mh, ls6_beta, ls6_map,
     stride_ls6_u_slot: tl.constexpr, stride_ls6_zk_slot: tl.constexpr,
-    stride_ls6_xk_slot: tl.constexpr,
     stride_ls6_beta_slot: tl.constexpr,
     stride_init_state_token: tl.constexpr,
     stride_state_h: tl.constexpr, stride_state_v: tl.constexpr, stride_state_k: tl.constexpr,
@@ -712,9 +808,10 @@ def _gdn_v2_flush_kernel(
 ):
     """persistent flush. 일감 = (flush 행, hv) 하나 = state 한 장(V×K).
     S_new = tot'·S₀ + (r'∘D)ᵀ·K 를 텐서코어(tf32x3 ≈ fp32, FDOT=2 면 ieee)로 접는다.
-    LS6_EXACT 면 접기 전에 온라인 키-읽기 오차를 S₀에서 정확히 복원하고, 아래의
-    삼각 점화로 창 안의 모든 delta write 를 보정한다. 그러면 저장하는 창 경계
-    state 는 dense delta rule 결과와 같고, 래치 오차는 다음 창으로 넘어가지 않는다.
+    LS6_EXACT 면 latch head의 d_cache는 delta가 아니라 state-independent raw-WY
+    write u_s이다. 접기 전에 full checkpoint가 resident인 자리에서 full WY factor
+    w_s를 만들고 d_s=u_s-S₀w_s로 변환한다. 그러면 저장하는 창 경계 state는
+    dense delta rule 결과와 같고, 래치 오차는 write에 들어간 적이 없다.
     링 K [W,BK] 는 일감당 한 번 올려 두고 V 를 FBV 씩 돌린다 — v-split 을 그리드에 펼치면
     K 링을 split 마다 다시 읽어(FBV=16 이면 S₀ 읽기와 같은 양) 스칼라 외적 루프가
     FMA 당 2.7 명령으로 발행 바운드(1024us)였다.
@@ -760,16 +857,11 @@ def _gdn_v2_flush_kernel(
             o_gp = tl.arange(0, LS6_GP)
             m_gall = o_gp < LS6_G
         if LS6_EXACT:
-            # 스텝이 쓴 hat(d)_s 를 dense delta-rule d_s 로 되돌리는 삼각 보정.
+            # Raw u_s -> exact delta d_s conversion.  The triangular matrix is
+            # the same compact-WY solve used to create u_s, but its RHS is the
+            # checkpoint key-read gamma_s S0 k_s.
             mh = tl.load(ls6_mh + i_hv).to(tl.int32)
-            nf_h = tl.load(fz_nf + i_hv).to(tl.int32)
-            m_gp = o_gp < mh
-            xk = tl.load(
-                ls6_xk + cidx * stride_ls6_xk_slot
-                + (i_h * MAX_CACHE_LEN + o_c[:, None]) * LS6_G
-                + o_gp[None, :],
-                mask=m_c[:, None] & m_gp[None, :], other=0.0,
-            ).to(tl.float32)
+            raw_latch = mh > 0
             if FDOT == 2:
                 kappa = tl.dot(
                     k_r0, tl.trans(k_r0), input_precision="ieee"
@@ -808,62 +900,41 @@ def _gdn_v2_flush_kernel(
                     other=0.0,
                 ).to(tl.float32)
             if LS6_EXACT:
-                # hot prefix 읽기는 온라인과 dense 양쪽에 동일하므로 소거한다.
-                # epsilon_s = exp(prefix_s) * (Ubar*x_s - S0*k_s,cold).
-                k_cold = tl.where(
-                    (o_kf[None, :] >= nf_h) & m_c[:, None],
-                    k_r0,
-                    0.0,
-                )
-                ub_active = tl.where(m_gp[None, :], ub_old, 0.0)
+                # h_s = S0 w_s, where
+                # w_s = beta_s gamma_s k_s
+                #       - sum_{j<s} beta_s gamma_s/gamma_j <k_j,k_s> w_j.
+                # Then d_s = u_s - h_s and the ordinary decay-only fold below
+                # is exactly the original full-transition recurrence.
                 if FDOT == 2:
-                    h_latch = tl.dot(
-                        ub_active, tl.trans(xk), input_precision="ieee"
-                    )
-                    h_cold = tl.dot(
-                        S_0, tl.trans(k_cold), input_precision="ieee"
-                    )
+                    s0k = tl.dot(S_0, tl.trans(k_r0), input_precision="ieee")
                 else:
-                    h_latch = tl.dot(
-                        ub_active, tl.trans(xk), input_precision="tf32x3"
-                    )
-                    h_cold = tl.dot(
-                        S_0, tl.trans(k_cold), input_precision="tf32x3"
-                    )
-                epsilon = tl.where(
-                    o_c[None, :] < MAX_CACHE_LEN - 1,
-                    (h_latch - h_cold) * tl.exp(g_prefix)[None, :],
-                    0.0,
-                )
-                delta = tl.zeros([FBV, BC], dtype=tl.float32)
-                # delta_s = -beta_s (epsilon_s + sum_{j<s} rho_{j,s} delta_j)
-                # rho_{j,s} = <k_j,k_s> exp(prefix_s-prefix_j).
+                    s0k = tl.dot(S_0, tl.trans(k_r0), input_precision="tf32x3")
+                hproj = tl.zeros([FBV, BC], dtype=tl.float32)
                 for ss in range(MAX_CACHE_LEN):
-                    epsilon_s = tl.sum(
-                        tl.where(o_c[None, :] == ss, epsilon, 0.0),
-                        axis=1,
-                    )
                     prefix_s = tl.sum(
                         tl.where(o_c == ss, g_prefix, 0.0), axis=0
+                    )
+                    s0k_s = tl.sum(
+                        tl.where(o_c[None, :] == ss, s0k, 0.0), axis=1
                     )
                     kappa_s = tl.sum(
                         tl.where(o_c[None, :] == ss, kappa, 0.0),
                         axis=1,
                     )
-                    rho_s = tl.where(
-                        (o_c < ss) & m_c,
-                        kappa_s * tl.exp(prefix_s - g_prefix),
-                        0.0,
-                    )
-                    prev_s = tl.sum(delta * rho_s[None, :], axis=1)
                     beta_s = tl.sum(
                         tl.where(o_c == ss, beta_all, 0.0), axis=0
                     )
-                    delta_s = -beta_s * (epsilon_s + prev_s)
-                    delta = tl.where(
-                        o_c[None, :] == ss, delta_s[:, None], delta
+                    arow = tl.where(
+                        (o_c < ss) & m_c,
+                        beta_s * kappa_s * tl.exp(prefix_s - g_prefix),
+                        0.0,
                     )
-                d_fold -= delta
+                    h_s = beta_s * tl.exp(prefix_s) * s0k_s \
+                        - tl.sum(hproj * arow[None, :], axis=1)
+                    hproj = tl.where(
+                        o_c[None, :] == ss, h_s[:, None], hproj
+                    )
+                d_fold = tl.where(raw_latch, d_fold - hproj, d_fold)
             d_T = d_fold * replay[None, :]
             S_t = S_0 * tot
             if FDOT == 2:
@@ -910,6 +981,7 @@ _SM_COUNT = {}
 
 
 _STEP_FALLBACK_WARNED: dict = {}
+_FLUSH_FALLBACK_WARNED: dict = {}
 
 
 def _sm_count():
@@ -947,9 +1019,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
     ls6_mh: torch.Tensor | None = None,
     # v2 전용: zk 링 (NX,H,W,G) = Z̄ᵀk̂_s. 스텝이 쓰고 flush 의 Ū 재귀가 읽는다.
     ls6_zk: torch.Tensor | None = None,
-    # v2 exact-flush: 온라인 key-read 계수 x^k_s (NX,H,W,G).
-    ls6_xk: torch.Tensor | None = None,
-    # v2 exact-flush: delta-rule beta 링. x^k_s 계수는 ls6_xk에 있다.
+    # v2 exact-flush: delta-rule beta ring used to turn raw writes into exact
+    # checkpoint deltas immediately before the ordinary decay-plus-delta fold.
     ls6_beta: torch.Tensor | None = None,
     ls6_r: int = 0,
     # 슬롯 간접 (NX,) int32: fz_*/ls6_* 버퍼의 dim0 이 NX 가 아니라 compact NS 일 때. None = 항등.
@@ -1086,11 +1157,11 @@ def fused_recurrent_gated_delta_rule_replayssm(
             "일부만 주면 프리즈가 조용히 빠진 채 돈다.")
     _fz_on = _n_fz == 3
     _n_v2 = sum(t is not None for t in (fz_qbar, fz_kbar))
-    _ls6_t = (ls6_ubar, ls6_z, ls6_zbar, ls6_aq, ls6_ak, ls6_mh)
+    _ls6_t = (ls6_ubar, ls6_z, ls6_zbar, ls6_aq, ls6_ak, ls6_fs, ls6_mh)
     _n_ls6 = sum(t is not None for t in _ls6_t)
     if _n_ls6 not in (0, len(_ls6_t)):
         raise ValueError(
-            "LS6 인자는 여섯을 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
+            "LS6 인자는 일곱을 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
             f"조용히 틀린 값이 나온다 (지금 {_n_ls6}/{len(_ls6_t)})")
     _ls6_on = _n_ls6 == len(_ls6_t)
     _ls6_g = int(ls6_ubar.shape[-2]) if _ls6_on else 1
@@ -1107,16 +1178,16 @@ def fused_recurrent_gated_delta_rule_replayssm(
     _exact_env = os.environ.get("NS_GDN_LS6_EXACT_FLUSH", "")
     if _exact_env not in ("", "0", "1"):
         raise ValueError("NS_GDN_LS6_EXACT_FLUSH는 0 또는 1이어야 한다")
-    # 새 host hook은 보정 버퍼를 주므로 기본 exact. 기존 low-level
-    # LS6 호출은 버퍼가 없으면 근사 flush를 유지하되, 1을 명시하면 없이 못 돈다.
-    _ls6_exact = _ls6_on and (
-        _exact_env == "1" or (_exact_env == "" and _n_corr == len(_corr_t))
-    )
+    if _ls6_on and _exact_env == "0":
+        raise ValueError(
+            "raw-write f_s 경로는 exact boundary refresh가 필수다; "
+            "NS_GDN_LS6_EXACT_FLUSH=0은 더 이상 지원하지 않는다"
+        )
+    _ls6_exact = _ls6_on
     if _ls6_exact and _n_corr != len(_corr_t):
         raise ValueError(
             "LS6 exact-flush를 켰으므로 "
-            "ls6_beta와 ls6_xk가 필요하다. "
-            "예전 근사 flush 재현은 NS_GDN_LS6_EXACT_FLUSH=0."
+            "raw-write ring을 exact delta로 바꾸려면 ls6_beta가 필요하다."
         )
     # 링이 delta-rule 갱신을 담으면 소거는 이미 그 안에 있다 — 기본 끔.
     _ls6_erase = bool(int(os.environ.get('NS_GDN_LS6_ERASE', '0')))
@@ -1165,8 +1236,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
             "참조만 exact 가 되어 조용히 다른 결과가 나온다.")
     # [nested_ssm 2026-09-02] v2 커널(기본). NS_GDN_KERNEL=v1 로 이전 융합 커널.
     _kv = os.environ.get("NS_GDN_KERNEL", "v2")
-    if _kv == "v1" and _ls6_on and ls6_fs is None:
-        raise ValueError("legacy NS_GDN_KERNEL=v1 LS6 경로만 ls6_fs가 필요하다; v2에는 f_s가 없다")
+    if _kv == "v1" and _ls6_on:
+        raise ValueError("raw-write f_s LS6는 NS_GDN_KERNEL=v2에만 구현되어 있다")
     if _ls6_exact and _kv != "v2":
         raise ValueError("LS6 exact-flush는 NS_GDN_KERNEL=v2에만 구현되어 있다")
     if ls6_map is not None:
@@ -1177,7 +1248,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
         if ls6_map.shape[0] < initial_state.shape[0]:
             raise ValueError(f"ls6_map 길이 {ls6_map.shape[0]} < NX={initial_state.shape[0]}")
         for _nm, _t in (("ls6_ubar", ls6_ubar), ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak),
-                        ("ls6_zk", ls6_zk), ("ls6_xk", ls6_xk), ("ls6_beta", ls6_beta),
+                        ("ls6_zk", ls6_zk), ("ls6_fs", ls6_fs), ("ls6_beta", ls6_beta),
                         ("fz_u", fz_u), ("fz_z", fz_z),
                         ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar)):
             if _t is not None and _t.shape[0] != ls6_ubar.shape[0]:
@@ -1190,11 +1261,11 @@ def fused_recurrent_gated_delta_rule_replayssm(
         if _ls6_on and tuple(ls6_zk.shape) != (ls6_ubar.shape[0], H, max_cache_len, _ls6_g):
             raise ValueError(f"ls6_zk 형상 {tuple(ls6_zk.shape)} != (NX,H,W,G)="
                              f"{(ls6_ubar.shape[0], H, max_cache_len, _ls6_g)}")
-        if _ls6_on and ls6_xk is None:
-            raise ValueError("v2 LS6는 ls6_xk (NX,H,W,G) 계수 링이 필요하다")
-        if ls6_xk is not None and tuple(ls6_xk.shape) != (ls6_ubar.shape[0], H, max_cache_len, _ls6_g):
-            raise ValueError(f"ls6_xk 형상 {tuple(ls6_xk.shape)} != (NX,H,W,G)="
-                             f"{(ls6_ubar.shape[0], H, max_cache_len, _ls6_g)}")
+        if _ls6_on and tuple(ls6_fs.shape) != (ls6_ubar.shape[0], HV, max_cache_len, _ls6_g):
+            raise ValueError(f"ls6_fs 형상 {tuple(ls6_fs.shape)} != (NX,HV,W,G)="
+                             f"{(ls6_ubar.shape[0], HV, max_cache_len, _ls6_g)}")
+        if _ls6_on and (ls6_fs.dtype != torch.float32 or not ls6_fs.is_contiguous()):
+            raise TypeError("ls6_fs는 연속 float32여야 한다")
         if _ls6_exact:
             if not _fz_on:
                 raise ValueError("LS6 exact-flush는 head별 hot prefix(fz_nf)가 필요하다")
@@ -1237,7 +1308,9 @@ def fused_recurrent_gated_delta_rule_replayssm(
         _fl_default = "32,12,2" if _ls6_exact else "32,8,1"
         _flcfg = os.environ.get("NS_GDN_FLUSH_CFG", _fl_default)
         _fbv, _fps, _fnw = (int(x) for x in _flcfg.split(","))
-        _fbv = min(_fbv, V)
+        # tl.arange width must remain a power of two even for the deliberately
+        # odd small geometries used by the regression suite (for example V=5).
+        _fbv = min(_fbv, triton.next_power_of_2(V))
         _nsplit = triton.cdiv(V, _fbv)
         _np = _sm_count() * _fps
         _common = dict(
@@ -1245,8 +1318,6 @@ def fused_recurrent_gated_delta_rule_replayssm(
             stride_fzb_slot=(fz_qbar.stride(0) if _fz_v2 else 0),
             stride_ls6_zk_slot=(ls6_zk.stride(0) if _ls6_on else 0),
             ls6_zk=ls6_zk if _ls6_on else mixed_qkv,
-            stride_ls6_xk_slot=(ls6_xk.stride(0) if _ls6_on else 0),
-            ls6_xk=ls6_xk if _ls6_on else mixed_qkv,
             stride_ls6_u_slot=(ls6_ubar.stride(0) if _ls6_on else 0),
             stride_init_state_token=initial_state.stride(0),
             stride_state_h=initial_state.stride(1),
@@ -1274,7 +1345,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
                     fz_qbar if _fz_v2 else None, fz_kbar if _fz_v2 else None,
                     ls6_ubar if _ls6_on else None, ls6_z if _ls6_on else None, ls6_zbar if _ls6_on else None,
                     ls6_mh if _ls6_on else None, ls6_aq if _ls6_on else None, ls6_ak if _ls6_on else None,
-                    ls6_zk if _ls6_on else None, ls6_xk if _ls6_on else None,
+                    ls6_zk if _ls6_on else None, ls6_fs if _ls6_on else None,
                     H, HV, K, V, max_cache_len, _ls6_g, _ls6_r, use_qk_l2norm_in_kernel,
                     os.environ.get("NS_GDN_EVICT", "1") == "1", ls6_map=ls6_map)
             elif not _STEP_FALLBACK_WARNED.get(_why):
@@ -1294,11 +1365,13 @@ def fused_recurrent_gated_delta_rule_replayssm(
                 ls6_ubar=ls6_ubar if _ls6_on else mixed_qkv,
                 ls6_z=ls6_z if _ls6_on else mixed_qkv,
                 ls6_zbar=ls6_zbar if _ls6_on else mixed_qkv,
+                ls6_fs=ls6_fs if _ls6_on else mixed_qkv,
                 ls6_aq=ls6_aq if _ls6_on else mixed_qkv,
                 ls6_ak=ls6_ak if _ls6_on else mixed_qkv,
                 ls6_mh=ls6_mh if _ls6_on else write_pos,
                 ls6_map=ls6_map if ls6_map is not None else write_pos, LS6_MAP=ls6_map is not None,
                 stride_ls6_a_slot=(ls6_aq.stride(0) if _ls6_on else 0),
+                stride_ls6_fs_slot=(ls6_fs.stride(0) if _ls6_on else 0),
                 stride_mixed_qkv_tok=mixed_qkv.stride(0),
                 stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
                 BV=_sbv, NK=_nk2, BKT=BK // _nk2, SOFTPLUS_THRESHOLD=20.0,
@@ -1312,20 +1385,55 @@ def fused_recurrent_gated_delta_rule_replayssm(
                                          stride_indices_seq=ssm_state_indices.stride(0),
                                          MAX_CACHE_LEN=max_cache_len,
                                          BB=triton.next_power_of_2(B), num_warps=4)
-            if os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") == "cuda" and _ls6_g <= 64 and max_cache_len <= 16 \
-                    and initial_state.dtype == torch.float32 and d_cache.dtype == torch.float32:
+            _flush_cuda = False
+            if os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") == "cuda":
+                from .gdn_flush_cuda import gdn_flush_cuda, gdn_flush_supported
+                _flush_why = gdn_flush_supported(
+                    initial_state, d_cache, k_cache, g_cache,
+                    K, V, max_cache_len, _ls6_g,
+                )
+                if _flush_why is None:
+                    _flush_cuda = True
+                elif not _FLUSH_FALLBACK_WARNED.get(_flush_why):
+                    _FLUSH_FALLBACK_WARNED[_flush_why] = True
+                    print(
+                        f"[gdn v2] CUDA flush unsupported ({_flush_why}); "
+                        "falling back to Triton",
+                        flush=True,
+                    )
+            if _flush_cuda:
                 # CUDA flush(기본). Triton 판은 발행 바운드였다 — gdn_flush_cuda.py 머리말 참조.
-                from .gdn_flush_cuda import gdn_flush_cuda
+                # CUDA fold는 검증된 decay-plus-delta 구현을 그대로 쓴다. Latch
+                # heads의 raw u_s만 작은 GPU pre-kernel에서 exact d_s로 바꾼다.
+                if _ls6_exact:
+                    _gdn_v2_raw_to_delta_kernel[(triton.cdiv(V, _fbv), B * HV)](
+                        h0=initial_state, d_cache=d_cache, k_cache=k_cache,
+                        g_cache=g_cache, flush_list=_flist, n_ptr=_flist[B:],
+                        ls6_mh=ls6_mh, ls6_beta=ls6_beta,
+                        ls6_map=ls6_map if ls6_map is not None else write_pos,
+                        stride_init_state_token=initial_state.stride(0),
+                        stride_state_h=initial_state.stride(1),
+                        stride_state_v=initial_state.stride(2),
+                        stride_state_k=initial_state.stride(3),
+                        stride_d_slot=d_cache.stride(0),
+                        stride_k_slot=k_cache.stride(0),
+                        stride_g_slot=g_cache.stride(0),
+                        stride_ls6_beta_slot=ls6_beta.stride(0),
+                        H=H, HV=HV, K=K, V=V, BK=BK, BV=_fbv, BC=BC,
+                        MAX_CACHE_LEN=max_cache_len,
+                        LS6_MAP=ls6_map is not None,
+                        FDOT=int(os.environ.get("NS_GDN_FLUSH_DOT", "1")),
+                        num_warps=2, num_stages=1,
+                    )
                 _grid = int(os.environ.get("NS_GDN_FLUSH_GRID", "0")) or _sm_count() * 4
                 gdn_flush_cuda(
                     _grid, initial_state, d_cache, k_cache, g_cache, ssm_state_indices, _flist, B,
                     fz_nf if _fz_v2 else None, fz_u if _fz_v2 else None, fz_z if _fz_v2 else None,
                     fz_qbar if _fz_v2 else None, fz_kbar if _fz_v2 else None,
                     ls6_ubar if _ls6_on else None, ls6_zk if _ls6_on else None,
-                    ls6_xk if _ls6_on else None,
+                    None,
                     H, HV, K, V, max_cache_len, _ls6_g, ls6_map=ls6_map,
-                    ls6_mh=ls6_mh if _ls6_exact else None,
-                    ls6_beta=ls6_beta if _ls6_exact else None)
+                    ls6_mh=None, ls6_beta=None)
                 return out, initial_state
             _gdn_v2_flush_kernel[(_np,)](
                 h0=initial_state, d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,

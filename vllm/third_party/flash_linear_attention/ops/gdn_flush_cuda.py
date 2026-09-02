@@ -600,6 +600,26 @@ void gdn_flush(int grid,
 
 _EXT = None
 
+_SUPPORTED_KV = {(128, 128), (64, 128), (64, 64), (32, 32), (128, 64)}
+
+
+def gdn_flush_supported(h0, d_cache, k_cache, g_cache, K, V, W, G):
+    """Return None when the hand-written CUDA fold can consume this layout."""
+    if (K, V) not in _SUPPORTED_KV:
+        return f"(K,V)=({K},{V}) unsupported"
+    if W > 16:
+        return f"W={W}>16"
+    if G > 128:
+        return f"G={G}>128"
+    if K % 16 or V % 8:
+        return f"K%16={K % 16}, V%8={V % 8}"
+    if h0.dtype != torch.float32 or d_cache.dtype != torch.float32 \
+            or k_cache.dtype != torch.float32 or g_cache.dtype != torch.float32:
+        return "state/ring dtype is not fp32"
+    if h0.stride(3) != 1 or h0.stride(2) != K:
+        return f"state is not K-contiguous: {h0.stride()}"
+    return None
+
 
 def _ext():
     global _EXT

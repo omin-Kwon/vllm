@@ -23,7 +23,10 @@ v7→v8 이력(B=256, step-only, us; dense / G8 / floor): v7 144.7/40.5/22.8 →
   남은 격차(G8 33 vs DRAM 23us)는 트래픽이 아니라 발행(≈1450 명령/워프, 발행 효율 48%).
   상세: docs/latch/GDN_STEP_KERNEL_OPT_20260902.md
 
-Triton 판(`_gdn_v2_step_kernel`)과 **같은 의미·같은 버퍼 규약**이다. Qwen Flash-Next
+Latch heads store state-independent raw-WY writes ``u_s`` in d_cache and
+normalized projected factors ``F_s=f_s/gamma_s`` in ls6_fs.  Thus the online
+write never consumes an approximate checkpoint key-read.  Triton 판
+(`_gdn_v2_step_kernel`)과 **같은 의미·같은 버퍼 규약**이다. Qwen Flash-Next
 (K=V=128, HPG=3)는 G=128 특수화를 추가로 갖고, 나머지 지원 못 하는 형상은
 래퍼가 Triton 으로 되돌린다.
 """
@@ -164,11 +167,11 @@ gdn_step_kernel(
     const float* __restrict__ fz_qbar, const float* __restrict__ fz_kbar,
     const float* __restrict__ ls6_ubar, const float* __restrict__ ls6_z, const float* __restrict__ ls6_zbar,
     const int* __restrict__ ls6_mh, const float* __restrict__ ls6_aq, const float* __restrict__ ls6_ak,
-    float* __restrict__ ls6_zk, float* __restrict__ ls6_xk,
+    float* __restrict__ ls6_zk, float* __restrict__ ls6_fs,
     const int* __restrict__ ls6_map,
     long s_mix, long s_a, long s_b, long s_h0_slot, long s_h0_h, long s_ind,
     long s_d_slot, long s_k_slot, long s_g_slot, long s_fz_slot, long s_fzb_slot,
-    long s_u_slot, long s_a6_slot, long s_zk_slot, long s_xk_slot,
+    long s_u_slot, long s_a6_slot, long s_zk_slot, long s_fs_slot,
     int H, int HV, int W, int G, int R, int flags)
 {
     using SM = Smem<K, V, HPG>;
@@ -251,13 +254,15 @@ gdn_step_kernel(
     TIO* p_o = out + (long)(i_n * HV + i_hv) * V + lane * VL;
     if (sidx <= 0) { st4<TIO>(p_o, make_float4(0.f, 0.f, 0.f, 0.f)); return; }
     const bool is_flush = (wp == W - 1);
-    const bool l6 = LS6 && FZ && !is_flush;
+    const bool l6 = LS6 && FZ;
     const int mh = l6 ? mhs[warp] : 0;        // 래치 폭 (0 = 안 탄다)
     const bool latch = mh > 0;
     bool latch_any = false;
     #pragma unroll
     for (int j = 0; j < HPG; ++j) latch_any |= l6 && (mhs[j] > 0);
-    const int nf = is_flush ? K : nf_raw;
+    // Latch heads use the same raw-write/f_s path on the flush token.  Only a
+    // dense fallback head may turn the flush step into a full checkpoint read.
+    const int nf = (is_flush && !latch) ? K : nf_raw;
     const int nfc = (nf + 3) & ~3;             // 복사 열 수(16B 배수; 열 마스크는 nf)
 
     // ── 행 스트림: hot state → d 링 → Ū 청크 ─────────────────────────────────────────
@@ -575,12 +580,29 @@ gdn_step_kernel(
                 #pragma unroll
                 for (int w = 0; w < NW; ++w) sx += sX[w][2 * GT + e];
                 ls6_zk[cidx * s_zk_slot + ((i_h * W + wp) * G + e)] = sx;
-                if (!is_flush && latch_any) {
-                    float xk = ls6_ak[cidx * s_a6_slot + (hv0 * G + e)];
-                    #pragma unroll
-                    for (int w = 0; w < NW; ++w) xk += sX[w][GT + e];
-                    ls6_xk[cidx * s_xk_slot + ((i_h * W + wp) * G + e)] = xk;
+            }
+        }
+        __syncwarp();
+        // Normalized projected-WY recurrence (one warp owns one value head):
+        //   F_t = beta [Z^T k_t - sum_{s<t} F_s <k_s,k_t>]
+        //   x_q = Z^T q_t - sum_{s<=t} F_s <k_s,q_t>.
+        // Both are parallel reductions over frozen ring slots; no reverse scan.
+        if (latch) {
+            for (int e = lane; e < mh; e += 32) {
+                float* pf = ls6_fs + cidx * s_fs_slot + (long)i_hv * W * G + e;
+                float erq = 0.f, erk = 0.f;
+                #pragma unroll
+                for (int s = 0; s < WMAX; ++s) {
+                    if (s >= wp) break;
+                    const float fv = pf[(long)s * G];
+                    erq = fmaf(fv, sKq[s], erq);
+                    erk = fmaf(fv, sKk[s], erk);
                 }
+                const float baseq = sA[warp][e];
+                const float basek = sA[warp][GT + e];
+                const float fcur = beta * (basek - erk);
+                sA[warp][e] = baseq - erq - fcur * cur_kq;
+                pf[(long)wp * G] = fcur;
             }
         }
         __syncwarp();
@@ -595,10 +617,9 @@ gdn_step_kernel(
             #pragma unroll
             for (int g = 0; g < NR; ++g) {
                 if (r0 + g >= mh) break;
-                const float xq = px[g], xk = px[GT + g];
+                const float xq = px[g];
                 const float4 u = *((const float4*)(pb + g * V));
                 hq.x += u.x * xq; hq.y += u.y * xq; hq.z += u.z * xq; hq.w += u.w * xq;
-                hk.x += u.x * xk; hk.y += u.y * xk; hk.z += u.z * xk; hk.w += u.w * xk;
             }
             __syncwarp();
             if (c + 2 < NC) issue(c + 2, buf);
@@ -619,7 +640,10 @@ gdn_step_kernel(
         for (int c = 0; c < 4; ++c) {
             const float stq = alpha * (hqv[c] * tot + sqv[c]);
             const float stk = alpha * (hkv[c] * tot + skv[c]);
-            dc[c] = beta * (vvv[c] - stk);
+            // A latch head stores the state-independent transformed raw write
+            // u_t.  A dense fallback head retains the old exact delta ring.
+            dc[c] = latch ? beta * (vvv[c] - alpha * skv[c])
+                          : beta * (vvv[c] - stk);
             o[c] = stq + dc[c] * cur_kq;
         }
         st4<TIO>(p_o, make_float4(o[0], o[1], o[2], o[3]));
@@ -645,7 +669,7 @@ static void launch(cudaStream_t st, int B,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
     c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_z, c10::optional<torch::Tensor> ls6_zbar,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_aq, c10::optional<torch::Tensor> ls6_ak,
-    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_xk,
+    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_fs,
     c10::optional<torch::Tensor> ls6_map,
     int H, int HV, int W, int G, int R, int flags)
 {
@@ -669,13 +693,13 @@ static void launch(cudaStream_t st, int B,
         ls6 ? ls6_zbar->data_ptr<float>() : nullptr, ls6 ? ls6_mh->data_ptr<int>() : nullptr,
         ls6 ? ls6_aq->data_ptr<float>() : nullptr, ls6 ? ls6_ak->data_ptr<float>() : nullptr,
         ls6 ? ls6_zk->data_ptr<float>() : nullptr,
-        ls6 ? ls6_xk->data_ptr<float>() : nullptr,
+        ls6 ? ls6_fs->data_ptr<float>() : nullptr,
         ls6_map.has_value() ? ls6_map->data_ptr<int>() : nullptr,
         mixed_qkv.stride(0), a.stride(0), b.stride(0), h0.stride(0), h0.stride(1), ssm_state_indices.stride(0),
         d_cache.stride(0), k_cache.stride(0), g_cache.stride(0),
         fz ? fz_u->stride(0) : 0, fz2 ? fz_qbar->stride(0) : 0,
         ls6 ? ls6_ubar->stride(0) : 0, ls6 ? ls6_aq->stride(0) : 0,
-        ls6 ? ls6_zk->stride(0) : 0, ls6 ? ls6_xk->stride(0) : 0,
+        ls6 ? ls6_zk->stride(0) : 0, ls6 ? ls6_fs->stride(0) : 0,
         H, HV, W, G, R, flags);
 }
 
@@ -687,7 +711,7 @@ void gdn_step(int B,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
     c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_z, c10::optional<torch::Tensor> ls6_zbar,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_aq, c10::optional<torch::Tensor> ls6_ak,
-    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_xk,
+    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_fs,
     c10::optional<torch::Tensor> ls6_map,
     int H, int HV, int K, int V, int W, int G, int R, int flags)
 {
@@ -696,7 +720,7 @@ void gdn_step(int B,
     const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : (G <= 64 ? 64 : 128));
     const int io = dt_code(mixed_qkv);
     const int hpg = HV / H;
-#define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk, ls6_map, H, HV, W, G, R, flags
+#define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_fs, ls6_map, H, HV, W, G, R, flags
 #define CASE_T(KK, VV, GG, HH) \
     if (K == KK && V == VV && gt == GG && hpg == HH) { \
         if (io == 0) { launch<KK, VV, GG, HH, float>(ARGS); return; } \
@@ -727,7 +751,7 @@ void gdn_step(int B,
     c10::optional<torch::Tensor> fz_qbar, c10::optional<torch::Tensor> fz_kbar,
     c10::optional<torch::Tensor> ls6_ubar, c10::optional<torch::Tensor> ls6_z, c10::optional<torch::Tensor> ls6_zbar,
     c10::optional<torch::Tensor> ls6_mh, c10::optional<torch::Tensor> ls6_aq, c10::optional<torch::Tensor> ls6_ak,
-    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_xk,
+    c10::optional<torch::Tensor> ls6_zk, c10::optional<torch::Tensor> ls6_fs,
     c10::optional<torch::Tensor> ls6_map,
     int H, int HV, int K, int V, int W, int G, int R, int flags);
 """
@@ -744,7 +768,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_step_v8p", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_step_rawfs_v9", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_step"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
@@ -793,12 +817,12 @@ def gdn_step_supported(mixed_qkv, out, h0, d_cache, k_cache, g_cache, ssm_state_
 def gdn_step_cuda(B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache,
                   ssm_state_indices, write_pos, scale,
                   fz_nf, fz_u, fz_z, fz_qbar, fz_kbar,
-                  ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk,
+                  ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_fs,
                   H, HV, K, V, W, G, R, use_qk_l2norm, evict, ls6_map=None):
     for nm, tt in (("fz_u", fz_u), ("fz_z", fz_z), ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar),
                    ("ls6_ubar", ls6_ubar), ("ls6_z", ls6_z), ("ls6_zbar", ls6_zbar),
                    ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak), ("ls6_zk", ls6_zk),
-                   ("ls6_xk", ls6_xk)):
+                   ("ls6_fs", ls6_fs)):
         if tt is not None and tt.dtype != torch.float32:
             raise TypeError(f"gdn_step_cuda: {nm} 은 fp32 여야 한다 (받음 {tt.dtype})")
     if a.dtype != b.dtype or A_log.dtype != dt_bias.dtype:
@@ -816,5 +840,5 @@ def gdn_step_cuda(B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache,
     _ext().gdn_step(int(B), mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache,
                     ssm_state_indices, write_pos, float(scale),
                     fz_nf, fz_u, fz_z, fz_qbar, fz_kbar,
-                    ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_xk, ls6_map,
+                    ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_fs, ls6_map,
                     H, HV, K, V, W, G, R, flags)

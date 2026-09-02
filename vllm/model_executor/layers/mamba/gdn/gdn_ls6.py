@@ -18,7 +18,9 @@ gdn_flush_cuda}.py, v8e+map)은 이미 래치 산술을 다 갖고 있다. 여�
   ④ decode 부기  창 합 누적 → flush 행(write_pos==W-1)에서 q̄ ← (1-λ)q̄ + λ·mean,
           aq/ak 재계산. **커널 호출 앞**에서 한다(flush 가 다음 창의 u/z 를 새 앵커로 쓴다).
           전부 고정 형상 device 연산 — CUDA 그래프에 그대로 잡힌다.
-  ⑤ 혼합 웨이브(prefill+decode)의 decode 행도 링 커널로 보낸다 — dense 갱신으로 보내면
+  ⑤ decode에서는 상태 의존 delta가 아니라 raw-WY write u_s와 projected factor f_s를
+          저장한다. 따라서 checkpoint 근사는 output에만 쓰이고 write에는 들어가지 않는다.
+  ⑥ 혼합 웨이브(prefill+decode)의 decode 행도 링 커널로 보낸다 — dense 갱신으로 보내면
           write_pos 는 전진하는데 링은 비어 있어 다음 flush 가 틀린다.
 
 기저: 배분기의 Ω 열은 E-직교(유클리드 직교가 아니다). 커널은 Z̄ 를 k-head 당 하나만
@@ -29,7 +31,7 @@ bake_super_embed 와 같은 처리).
 켜기: NS_GDN_LS6=<q38fn_ls6_*_dn.pt>  (--use-replayssm, state fp32 필수)
   NS_GDN_LS6_NSLOT   compact 슬롯 수 (기본 max_num_seqs+8)
   NS_GDN_LS6_LAM     앵커 EMA λ (기본 0.45 — 캘리브와 같아야 한다)
-  NS_GDN_LS6_EXACT_FLUSH=0  예전 근사 flush 재현용(기본 exact)
+  boundary refresh는 항상 exact다. NS_GDN_LS6_EXACT_FLUSH=0은 지원하지 않는다.
 """
 import os
 import re
@@ -221,7 +223,8 @@ def _bufs(layer, ssm_state):
     b = dict(
         ubar=torch.zeros(NS, HV, G, V, **f32),
         aq=torch.zeros(NS, HV, G, **f32), ak=torch.zeros(NS, HV, G, **f32),
-        zk=torch.zeros(NS, HK, W, G, **f32), xk=torch.zeros(NS, HK, W, G, **f32),
+        zk=torch.zeros(NS, HK, W, G, **f32),
+        fs=torch.zeros(NS, HV, W, G, **f32),
         beta=torch.zeros(NS, HV, W, **f32),
         fz_u=torch.zeros(NS, HV, V, **f32), fz_z=torch.zeros(NS, HV, V, **f32),
         qbar=torch.zeros(NS, HK, K, **f32), kbar=torch.zeros(NS, HK, K, **f32),
@@ -310,7 +313,7 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
     b["fz_u"][c] = torch.einsum("nhvk,nhk->nhv", S, qbar.repeat_interleave(rep, 1) * cold)
     b["fz_z"][c] = torch.einsum("nhvk,nhk->nhv", S, kbar.repeat_interleave(rep, 1) * cold)
     b["zk"][c] = 0
-    b["xk"][c] = 0
+    b["fs"][c] = 0
     b["beta"][c] = 0
     del S
 
@@ -367,7 +370,7 @@ def kernel_kwargs(layer, ssm_state):
     b = _bufs(layer, ssm_state)
     return dict(
         ls6_ubar=b["ubar"], ls6_z=L6["Z"], ls6_zbar=L6["Zbar"], ls6_aq=b["aq"], ls6_ak=b["ak"],
-        ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_xk=b["xk"],
+        ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_fs=b["fs"],
         ls6_r=L6["r"], ls6_map=layer._ls6_sh.map,
         ls6_beta=b["beta"],
         fz_nf=L6["nf"], fz_u=b["fz_u"], fz_z=b["fz_z"], fz_qbar=b["qbar"], fz_kbar=b["kbar"],
