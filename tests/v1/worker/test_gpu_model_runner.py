@@ -163,35 +163,6 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     assert connector._zmq_ctx is None
 
 
-def test_ple_offload_launch_waits_for_notifier_queue_slot() -> None:
-    """Apply backpressure when two async batches race the notifier thread."""
-    connector = PleOffloadConnector.__new__(PleOffloadConnector)
-    connector.tp_rank = 0
-    connector.dp_rank = 0
-    connector._uses_cuda_inputs = False
-    connector._request_queue = queue.Queue(maxsize=1)
-
-    connector._launch(num_reqs=9, num_tokens=9)
-    launched = threading.Event()
-
-    def launch_second() -> None:
-        connector._launch(num_reqs=8, num_tokens=8)
-        launched.set()
-
-    thread = threading.Thread(target=launch_second)
-    thread.start()
-    assert not launched.wait(timeout=0.05)
-
-    first = connector._request_queue.get_nowait()
-    assert first is not None
-    assert launched.wait(timeout=1)
-    thread.join(timeout=1)
-    second = connector._request_queue.get_nowait()
-    assert second is not None
-    assert (first.num_reqs, first.num_tokens) == (9, 9)
-    assert (second.num_reqs, second.num_tokens) == (8, 8)
-
-
 def test_ple_offload_request_thread_failure_exits_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

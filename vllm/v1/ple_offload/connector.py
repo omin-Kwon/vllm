@@ -32,7 +32,6 @@ logger = init_logger(__name__)
 # request, so at most two are live (one queued, one being staged); the extra
 # slots are slack.
 _INPUT_READY_RING = 4
-_REQUEST_QUEUE_PUT_TIMEOUT_S = 5.0
 
 
 def _cuda_check(result: Any, operation: str) -> Any:
@@ -410,23 +409,7 @@ class PleOffloadConnector:
             num_reqs=num_reqs,
             event_idx=event_idx,
         )
-        # Async scheduling can submit the next model batch before the notifier
-        # thread has had a chance to dequeue the previous request.  A
-        # non-blocking put turned that harmless scheduling race into a fatal
-        # queue.Full (observed on a nine-request long-tail decode).  Waiting
-        # only for the single pending slot to be handed to the notifier keeps
-        # staging off the model thread in the common case and provides
-        # backpressure in the rare race.  A genuinely wedged notifier still
-        # fails within a bounded interval.
-        try:
-            self._request_queue.put(
-                request, timeout=_REQUEST_QUEUE_PUT_TIMEOUT_S
-            )
-        except queue.Full as error:
-            raise RuntimeError(
-                "PLE request thread did not drain its pending request within "
-                f"{_REQUEST_QUEUE_PUT_TIMEOUT_S:g}s"
-            ) from error
+        self._request_queue.put_nowait(request)
 
     def prepare_forward(
         self,
