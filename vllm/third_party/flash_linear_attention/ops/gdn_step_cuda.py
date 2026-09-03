@@ -190,6 +190,7 @@ gdn_step_kernel(
     static_assert(GT % 4 == 0 && HPG >= 2 && HPG <= 4, "GT/HPG");
     static_assert(VL == 4 && (NQ & (NQ - 1)) == 0 && V % NR == 0 && 32 % NR == 0, "layout");
     const bool FZ = flags & 1, LS6 = flags & 4, L2N = flags & 8;
+    const bool ZK_REFRESH = flags & 32;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     // 그리드 = (H, B): 연속 블록이 같은 행의 다른 h → 같은 SM 이 받는 블록들(148 간격)의 h 가 4 종류로 묶여
     //   Z/Z̄(h 당 8KB)가 L1 에 남는다. (B, H) 순서면 h 가 256 블록마다 바뀌어 L1 재사용이 없다.
@@ -254,7 +255,7 @@ gdn_step_kernel(
         }
     };
     float4 zbr0[RI][ZC4];
-    if (LS6) ld_zm(ls6_zbar, 0, zbr0);
+    if (LS6 && !ZK_REFRESH) ld_zm(ls6_zbar, 0, zbr0);
 
     TIO* p_o = out + (long)(i_n * HV + i_hv) * V + lane * VL;
     if (sidx <= 0) { st4<TIO>(p_o, make_float4(0.f, 0.f, 0.f, 0.f)); return; }
@@ -371,7 +372,7 @@ gdn_step_kernel(
         if (lane < ZC) sX[warp][m * GT + zc * ZC + lane] = r;
     };
     // ── zk = Z̄ᵀk̂ (자기 행들의 부분합; Z̄ 는 분기 앞에서 띄운 것) ─────────────────────────
-    if (LS6) {
+    if (LS6 && !ZK_REFRESH) {
         #pragma unroll
         for (int zc = 0; zc < NZC; ++zc) {
             if (zc * ZC < max_mh) {
@@ -600,7 +601,7 @@ gdn_step_kernel(
                 }
             }
         }
-        if (warp == 0) {
+        if (!ZK_REFRESH && warp == 0) {
             for (int e = lane; e < max_mh; e += 32) {
                 float sx = 0.f;
                 #pragma unroll
@@ -743,7 +744,8 @@ void gdn_step(int B,
 {
     TORCH_CHECK(W <= WMAX, "W<=16");
     auto st = at::cuda::getCurrentCUDAStream().stream();
-    const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : (G <= 32 ? 32 : (G <= 64 ? 64 : 128)));
+    const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : (G <= 32 ? 32 :
+                   (G <= 48 ? 48 : (G <= 64 ? 64 : (G <= 80 ? 80 : 128)))));
     const int io = dt_code(mixed_qkv);
     const int hpg = HV / H;
 #define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_fs, ls6_map, H, HV, W, G, R, flags
@@ -759,6 +761,8 @@ void gdn_step(int B,
     // Compile its G=32 and G=128 geometries without multiplying the complete
     // specialization matrix; other non-Qwen geometries still use old buckets.
     CASE_T(128, 128, 32, 3)
+    CASE_T(128, 128, 48, 3)
+    CASE_T(128, 128, 80, 3)
     CASE_T(128, 128, 128, 3)
 #undef CASE
 #undef CASE_G
@@ -795,7 +799,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_step_rawfs_mh_v11", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_step_rawfs_mh_v12", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_step"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
@@ -845,7 +849,8 @@ def gdn_step_cuda(B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache,
                   ssm_state_indices, write_pos, scale,
                   fz_nf, fz_u, fz_z, fz_qbar, fz_kbar,
                   ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_fs,
-                  H, HV, K, V, W, G, R, use_qk_l2norm, evict, ls6_map=None):
+                  H, HV, K, V, W, G, R, use_qk_l2norm, evict,
+                  ls6_map=None, zk_refresh=False):
     for nm, tt in (("fz_u", fz_u), ("fz_z", fz_z), ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar),
                    ("ls6_ubar", ls6_ubar), ("ls6_z", ls6_z), ("ls6_zbar", ls6_zbar),
                    ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak), ("ls6_zk", ls6_zk),
@@ -863,7 +868,8 @@ def gdn_step_cuda(B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache,
     if ls6_map is not None and (ls6_map.dtype != torch.int32 or not ls6_map.is_contiguous() or ls6_map.dim() != 1):
         raise TypeError(f"gdn_step_cuda: ls6_map 은 연속 int32 (NX,) 여야 한다 (받음 {ls6_map.dtype} {tuple(ls6_map.shape)})")
     flags = (1 if fz_u is not None else 0) | (2 if fz_qbar is not None else 0) | \
-            (4 if ls6_ubar is not None else 0) | (8 if use_qk_l2norm else 0) | (16 if evict else 0)
+            (4 if ls6_ubar is not None else 0) | (8 if use_qk_l2norm else 0) | \
+            (16 if evict else 0) | (32 if zk_refresh else 0)
     _ext().gdn_step(int(B), mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache,
                     ssm_state_indices, write_pos, float(scale),
                     fz_nf, fz_u, fz_z, fz_qbar, fz_kbar,

@@ -704,7 +704,7 @@ def _gdn_v2_raw_to_delta_kernel(
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr, LS6_MAP: tl.constexpr,
-    FDOT: tl.constexpr,
+    FDOT: tl.constexpr, ROW_OFFSET: tl.constexpr, ROW_LIMIT: tl.constexpr,
 ):
     """Convert state-independent raw-WY writes u_s to exact delta writes.
 
@@ -714,9 +714,10 @@ def _gdn_v2_raw_to_delta_kernel(
     """
     i_v = tl.program_id(0)
     work = tl.program_id(1)
-    r = work // HV
+    r_local = work // HV
     i_hv = work % HV
-    if r >= tl.load(n_ptr):
+    r = r_local + ROW_OFFSET
+    if r_local >= ROW_LIMIT or r >= tl.load(n_ptr):
         return
     if tl.load(ls6_mh + i_hv).to(tl.int32) <= 0:
         return
@@ -786,6 +787,129 @@ def _gdn_v2_raw_to_delta_kernel(
 
 
 @triton.jit
+def _gdn_v2_refresh_zk_kernel(
+    k_cache, ls6_zbar, ls6_zk, flush_list, n_ptr, ls6_mh, ls6_map,
+    stride_k_slot: tl.constexpr, stride_ls6_zk_slot: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
+    G: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
+    BG: tl.constexpr, MAX_CACHE_LEN: tl.constexpr,
+    LS6_MAP: tl.constexpr, FDOT: tl.constexpr,
+):
+    """Build Zbar^T k_s once per window instead of once per online step."""
+    i_g = tl.program_id(0)
+    work = tl.program_id(1)
+    r = work // H
+    i_h = work % H
+    if r >= tl.load(n_ptr):
+        return
+    hpg: tl.constexpr = HV // H
+    max_mh = 0
+    for jj in range(hpg):
+        max_mh = tl.maximum(
+            max_mh,
+            tl.load(ls6_mh + i_h * hpg + jj).to(tl.int32),
+        )
+    o_g = i_g * BG + tl.arange(0, BG)
+    if i_g * BG >= max_mh:
+        return
+    state_idx = tl.load(flush_list + r).to(tl.int64)
+    if LS6_MAP:
+        cidx = tl.load(ls6_map + state_idx).to(tl.int64)
+    else:
+        cidx = state_idx
+    o_c = tl.arange(0, BC)
+    o_k = tl.arange(0, BK)
+    m_c = o_c < MAX_CACHE_LEN
+    m_k = o_k < K
+    m_g = (o_g < G) & (o_g < max_mh)
+    keys = tl.load(
+        k_cache + state_idx * stride_k_slot
+        + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_k[None, :],
+        mask=m_c[:, None] & m_k[None, :], other=0.0,
+    ).to(tl.float32)
+    zbar = tl.load(
+        ls6_zbar + (i_h * K + o_k[:, None]) * G + o_g[None, :],
+        mask=m_k[:, None] & m_g[None, :], other=0.0,
+    ).to(tl.float32)
+    if FDOT == 2:
+        zk = tl.dot(keys, zbar, input_precision="ieee")
+    else:
+        zk = tl.dot(keys, zbar, input_precision="tf32x3")
+    tl.store(
+        ls6_zk + cidx * stride_ls6_zk_slot
+        + (i_h * MAX_CACHE_LEN + o_c[:, None]) * G + o_g[None, :],
+        zk, mask=m_c[:, None] & m_g[None, :],
+    )
+
+
+@triton.jit
+def _gdn_v2_ubar_fold_kernel(
+    d_cache, g_cache, ls6_zk, ls6_ubar, flush_list, n_ptr,
+    ls6_mh, ls6_map,
+    stride_d_slot: tl.constexpr, stride_g_slot: tl.constexpr,
+    stride_ls6_zk_slot: tl.constexpr, stride_ls6_u_slot: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, V: tl.constexpr,
+    G: tl.constexpr, BC: tl.constexpr, BV: tl.constexpr,
+    BG: tl.constexpr, MAX_CACHE_LEN: tl.constexpr,
+    LS6_MAP: tl.constexpr, FDOT: tl.constexpr,
+):
+    """Fold exact delta writes into Ubar with one W-wide tensor-core dot."""
+    i_v = tl.program_id(0)
+    work = tl.program_id(1)
+    i_g = tl.program_id(2)
+    r = work // HV
+    i_hv = work % HV
+    if r >= tl.load(n_ptr):
+        return
+    mh = tl.load(ls6_mh + i_hv).to(tl.int32)
+    if i_g * BG >= mh:
+        return
+    hpg: tl.constexpr = HV // H
+    i_h = i_hv // hpg
+    state_idx = tl.load(flush_list + r).to(tl.int64)
+    if LS6_MAP:
+        cidx = tl.load(ls6_map + state_idx).to(tl.int64)
+    else:
+        cidx = state_idx
+    o_c = tl.arange(0, BC)
+    o_v = i_v * BV + tl.arange(0, BV)
+    o_g = i_g * BG + tl.arange(0, BG)
+    m_c = o_c < MAX_CACHE_LEN
+    m_v = o_v < V
+    m_g = (o_g < G) & (o_g < mh)
+    gate = tl.load(
+        g_cache + state_idx * stride_g_slot
+        + i_hv * MAX_CACHE_LEN + o_c,
+        mask=m_c, other=0.0,
+    ).to(tl.float32)
+    prefix = tl.cumsum(gate, axis=0)
+    total = tl.sum(gate, axis=0)
+    replay = tl.exp(total - prefix)
+    delta = tl.load(
+        d_cache + state_idx * stride_d_slot
+        + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * V + o_v[None, :],
+        mask=m_c[:, None] & m_v[None, :], other=0.0,
+    ).to(tl.float32)
+    delta *= replay[:, None]
+    zk = tl.load(
+        ls6_zk + cidx * stride_ls6_zk_slot
+        + (i_h * MAX_CACHE_LEN + o_c[:, None]) * G + o_g[None, :],
+        mask=m_c[:, None] & m_g[None, :], other=0.0,
+    ).to(tl.float32)
+    if FDOT == 2:
+        update = tl.dot(tl.trans(delta), zk, input_precision="ieee")
+    else:
+        update = tl.dot(tl.trans(delta), zk, input_precision="tf32x3")
+    p_u = ls6_ubar + cidx * stride_ls6_u_slot \
+        + (i_hv * G + o_g[None, :]) * V + o_v[:, None]
+    old = tl.load(p_u, mask=m_v[:, None] & m_g[None, :], other=0.0).to(tl.float32)
+    tl.store(
+        p_u, old * tl.exp(total) + update,
+        mask=m_v[:, None] & m_g[None, :],
+    )
+
+
+@triton.jit
 def _gdn_v2_raw_to_delta_gqa_kernel(
     h0, d_cache, k_cache, g_cache, flush_list, n_ptr,
     ls6_mh, ls6_beta, ls6_map,
@@ -797,14 +921,15 @@ def _gdn_v2_raw_to_delta_gqa_kernel(
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr, LS6_MAP: tl.constexpr,
-    FDOT: tl.constexpr,
+    FDOT: tl.constexpr, ROW_OFFSET: tl.constexpr, ROW_LIMIT: tl.constexpr,
 ):
     """Exact raw-write correction sharing K and K K^T across a GQA group."""
     i_v = tl.program_id(0)
     work = tl.program_id(1)
-    r = work // H
+    r_local = work // H
     i_h = work % H
-    if r >= tl.load(n_ptr):
+    r = r_local + ROW_OFFSET
+    if r_local >= ROW_LIMIT or r >= tl.load(n_ptr):
         return
     hpg: tl.constexpr = HV // H
     n_active = 0
@@ -1291,6 +1416,9 @@ def fused_recurrent_gated_delta_rule_replayssm(
             "NS_GDN_LS6_EXACT_FLUSH=0은 더 이상 지원하지 않는다"
         )
     _ls6_exact = _ls6_on
+    _zk_refresh = (
+        _ls6_on and os.environ.get("NS_GDN_ZK_REFRESH", "1") == "1"
+    )
     if _ls6_exact and _n_corr != len(_corr_t):
         raise ValueError(
             "LS6 exact-flush를 켰으므로 "
@@ -1298,8 +1426,14 @@ def fused_recurrent_gated_delta_rule_replayssm(
         )
     # 링이 delta-rule 갱신을 담으면 소거는 이미 그 안에 있다 — 기본 끔.
     _ls6_erase = bool(int(os.environ.get('NS_GDN_LS6_ERASE', '0')))
-    if _ls6_on and (_ls6_g & (_ls6_g - 1)):
-        raise ValueError(f"LS6_G 는 tl.arange 용이라 2의 거듭제곱이어야 한다: {_ls6_g}")
+    _ls6_g_pow2 = not (_ls6_g & (_ls6_g - 1))
+    if _ls6_on and not _ls6_g_pow2 and (
+        os.environ.get("NS_GDN_STEP_IMPL", "cuda") != "cuda"
+        or os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") != "cuda"
+    ):
+        raise ValueError(
+            f"compact LS6_G={_ls6_g}는 CUDA step/flush가 필요하다"
+        )
     if _n_v2 not in (0, 2):
         raise ValueError("fz_qbar/fz_kbar 는 둘 다 주거나 하나도 주지 말 것 "
                          f"(받은 개수 {_n_v2}). 하나만 주면 조용히 v1 로 돈다.")
@@ -1454,8 +1588,13 @@ def fused_recurrent_gated_delta_rule_replayssm(
                     ls6_mh if _ls6_on else None, ls6_aq if _ls6_on else None, ls6_ak if _ls6_on else None,
                     ls6_zk if _ls6_on else None, ls6_fs if _ls6_on else None,
                     H, HV, K, V, max_cache_len, _ls6_g, _ls6_r, use_qk_l2norm_in_kernel,
-                    os.environ.get("NS_GDN_EVICT", "1") == "1", ls6_map=ls6_map)
+                    os.environ.get("NS_GDN_EVICT", "1") == "1",
+                    ls6_map=ls6_map, zk_refresh=_zk_refresh)
             elif not _STEP_FALLBACK_WARNED.get(_why):
+                if _ls6_on and not _ls6_g_pow2:
+                    raise RuntimeError(
+                        f"compact LS6_G={_ls6_g}인데 CUDA step이 지원되지 않는다: {_why}"
+                    )
                 _STEP_FALLBACK_WARNED[_why] = True
                 print(f"[gdn v2] CUDA 스텝 미지원({_why}) — Triton 스텝으로 되돌린다", flush=True)
         if _brs2 != "2" and not _step_cuda:
@@ -1494,7 +1633,10 @@ def fused_recurrent_gated_delta_rule_replayssm(
                                          BB=triton.next_power_of_2(B), num_warps=4)
             _flush_cuda = False
             if os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") == "cuda":
-                from .gdn_flush_cuda import gdn_flush_cuda, gdn_flush_supported
+                from .gdn_flush_cuda import (
+                    gdn_flush_cuda,
+                    gdn_flush_supported,
+                )
                 _flush_why = gdn_flush_supported(
                     initial_state, d_cache, k_cache, g_cache,
                     K, V, max_cache_len, _ls6_g,
@@ -1502,6 +1644,11 @@ def fused_recurrent_gated_delta_rule_replayssm(
                 if _flush_why is None:
                     _flush_cuda = True
                 elif not _FLUSH_FALLBACK_WARNED.get(_flush_why):
+                    if _ls6_on and not _ls6_g_pow2:
+                        raise RuntimeError(
+                            f"compact LS6_G={_ls6_g}인데 CUDA flush가 지원되지 않는다: "
+                            f"{_flush_why}"
+                        )
                     _FLUSH_FALLBACK_WARNED[_flush_why] = True
                     print(
                         f"[gdn v2] CUDA flush unsupported ({_flush_why}); "
@@ -1512,6 +1659,27 @@ def fused_recurrent_gated_delta_rule_replayssm(
                 # CUDA flush(기본). Triton 판은 발행 바운드였다 — gdn_flush_cuda.py 머리말 참조.
                 # CUDA fold는 검증된 decay-plus-delta 구현을 그대로 쓴다. Latch
                 # heads의 raw u_s만 작은 GPU pre-kernel에서 exact d_s로 바꾼다.
+                if _zk_refresh:
+                    _zk_bg = min(
+                        int(os.environ.get("NS_GDN_ZK_BG", "32")),
+                        _ls6_gp,
+                    )
+                    _gdn_v2_refresh_zk_kernel[
+                        (triton.cdiv(_ls6_g, _zk_bg), B * H)
+                    ](
+                        k_cache=k_cache, ls6_zbar=ls6_zbar,
+                        ls6_zk=ls6_zk, flush_list=_flist,
+                        n_ptr=_flist[B:], ls6_mh=ls6_mh,
+                        ls6_map=ls6_map if ls6_map is not None else write_pos,
+                        stride_k_slot=k_cache.stride(0),
+                        stride_ls6_zk_slot=ls6_zk.stride(0),
+                        H=H, HV=HV, K=K, G=_ls6_g, BK=BK, BC=BC,
+                        BG=_zk_bg, MAX_CACHE_LEN=max_cache_len,
+                        LS6_MAP=ls6_map is not None,
+                        FDOT=int(os.environ.get("NS_GDN_ZK_DOT", "1")),
+                        num_warps=int(os.environ.get("NS_GDN_ZK_NW", "4")),
+                        num_stages=int(os.environ.get("NS_GDN_ZK_NS", "2")),
+                    )
                 if _ls6_exact:
                     _raw_gqa = (
                         HV // H == 3
@@ -1522,35 +1690,121 @@ def fused_recurrent_gated_delta_rule_replayssm(
                         if _raw_gqa
                         else _gdn_v2_raw_to_delta_kernel
                     )
-                    _raw_work = B * H if _raw_gqa else B * HV
-                    _raw_kernel[(triton.cdiv(V, _fbv), _raw_work)](
-                        h0=initial_state, d_cache=d_cache, k_cache=k_cache,
-                        g_cache=g_cache, flush_list=_flist, n_ptr=_flist[B:],
-                        ls6_mh=ls6_mh, ls6_beta=ls6_beta,
-                        ls6_map=ls6_map if ls6_map is not None else write_pos,
-                        stride_init_state_token=initial_state.stride(0),
-                        stride_state_h=initial_state.stride(1),
-                        stride_state_v=initial_state.stride(2),
-                        stride_state_k=initial_state.stride(3),
-                        stride_d_slot=d_cache.stride(0),
-                        stride_k_slot=k_cache.stride(0),
-                        stride_g_slot=g_cache.stride(0),
-                        stride_ls6_beta_slot=ls6_beta.stride(0),
-                        H=H, HV=HV, K=K, V=V, BK=BK, BV=_fbv, BC=BC,
-                        MAX_CACHE_LEN=max_cache_len,
-                        LS6_MAP=ls6_map is not None,
-                        FDOT=int(os.environ.get("NS_GDN_FLUSH_DOT", "1")),
-                        num_warps=2, num_stages=1,
-                    )
+                _ubar_triton = (
+                    _ls6_on
+                    and os.environ.get("NS_GDN_UBAR_TRITON", "1") == "1"
+                )
                 _grid = int(os.environ.get("NS_GDN_FLUSH_GRID", "0")) or _sm_count() * 4
-                gdn_flush_cuda(
-                    _grid, initial_state, d_cache, k_cache, g_cache, ssm_state_indices, _flist, B,
-                    fz_nf if _fz_v2 else None, fz_u if _fz_v2 else None, fz_z if _fz_v2 else None,
-                    fz_qbar if _fz_v2 else None, fz_kbar if _fz_v2 else None,
-                    ls6_ubar if _ls6_on else None, ls6_zk if _ls6_on else None,
-                    None,
-                    H, HV, K, V, max_cache_len, _ls6_g, ls6_map=ls6_map,
-                    ls6_mh=ls6_mh if _ls6_on else None, ls6_beta=None)
+                _exact_in_fold = (
+                    _ls6_exact
+                    and os.environ.get("NS_GDN_EXACT_IN_FOLD", "1") == "1"
+                )
+                _refresh_chunk = (
+                    min(B, max(0, int(os.environ.get(
+                        "NS_GDN_REFRESH_CHUNK", "0"
+                    ))))
+                    if _ls6_exact and not _exact_in_fold else 0
+                )
+                _chunked_fold = _refresh_chunk > 0 and _refresh_chunk < B
+                _ranges = (
+                    [(r0, min(_refresh_chunk, B - r0))
+                     for r0 in range(0, B, _refresh_chunk)]
+                    if _chunked_fold else [(0, B)]
+                )
+                for _row_offset, _row_limit in _ranges:
+                    if _ls6_exact and not _exact_in_fold:
+                        _raw_heads = H if _raw_gqa else HV
+                        _raw_work = _row_limit * _raw_heads
+                        _raw_kernel[(triton.cdiv(V, _fbv), _raw_work)](
+                            h0=initial_state, d_cache=d_cache,
+                            k_cache=k_cache, g_cache=g_cache,
+                            flush_list=_flist, n_ptr=_flist[B:],
+                            ls6_mh=ls6_mh, ls6_beta=ls6_beta,
+                            ls6_map=(ls6_map if ls6_map is not None
+                                     else write_pos),
+                            stride_init_state_token=initial_state.stride(0),
+                            stride_state_h=initial_state.stride(1),
+                            stride_state_v=initial_state.stride(2),
+                            stride_state_k=initial_state.stride(3),
+                            stride_d_slot=d_cache.stride(0),
+                            stride_k_slot=k_cache.stride(0),
+                            stride_g_slot=g_cache.stride(0),
+                            stride_ls6_beta_slot=ls6_beta.stride(0),
+                            H=H, HV=HV, K=K, V=V, BK=BK,
+                            BV=_fbv, BC=BC, MAX_CACHE_LEN=max_cache_len,
+                            LS6_MAP=ls6_map is not None,
+                            FDOT=int(os.environ.get(
+                                "NS_GDN_FLUSH_DOT", "1"
+                            )),
+                            ROW_OFFSET=_row_offset,
+                            ROW_LIMIT=_row_limit,
+                            num_warps=2, num_stages=1,
+                        )
+                    if _chunked_fold:
+                        # Keep this chunk's checkpoint tiles resident in L2:
+                        # exact correction reads S0, then fold reuses that
+                        # data and writes S1 before advancing to the next rows.
+                        gdn_flush_cuda(
+                            _grid, initial_state, d_cache, k_cache, g_cache,
+                            ssm_state_indices, _flist, B,
+                            fz_nf if _fz_v2 else None,
+                            fz_u if _fz_v2 else None,
+                            fz_z if _fz_v2 else None,
+                            fz_qbar if _fz_v2 else None,
+                            fz_kbar if _fz_v2 else None,
+                            (ls6_ubar if _ls6_on and not _ubar_triton
+                             else None),
+                            (ls6_zk if _ls6_on and not _ubar_triton
+                             else None),
+                            None, H, HV, K, V, max_cache_len, _ls6_g,
+                            ls6_map=ls6_map,
+                            ls6_mh=ls6_mh if _ls6_on else None,
+                            ls6_beta=None, row_offset=_row_offset,
+                            row_limit=_row_limit,
+                        )
+                if not _chunked_fold:
+                    gdn_flush_cuda(
+                        _grid, initial_state, d_cache, k_cache, g_cache,
+                        ssm_state_indices, _flist, B,
+                        fz_nf if _fz_v2 else None,
+                        fz_u if _fz_v2 else None,
+                        fz_z if _fz_v2 else None,
+                        fz_qbar if _fz_v2 else None,
+                        fz_kbar if _fz_v2 else None,
+                        ls6_ubar if _ls6_on and not _ubar_triton else None,
+                        ls6_zk if _ls6_on and not _ubar_triton else None,
+                        None, H, HV, K, V, max_cache_len, _ls6_g,
+                        ls6_map=ls6_map,
+                        ls6_mh=ls6_mh if _ls6_on else None,
+                        ls6_beta=ls6_beta if _exact_in_fold else None,
+                    )
+                # Ubar depends on corrected d but not on S0, so run it only
+                # after the latency-critical correction/fold locality pair.
+                if _ubar_triton:
+                    _ubv = int(os.environ.get("NS_GDN_UBAR_BV", "128"))
+                    _ubg = int(os.environ.get("NS_GDN_UBAR_BG", "16"))
+                    _gdn_v2_ubar_fold_kernel[
+                        (triton.cdiv(V, _ubv), B * HV,
+                         triton.cdiv(_ls6_g, _ubg))
+                    ](
+                        d_cache=d_cache, g_cache=g_cache,
+                        ls6_zk=ls6_zk, ls6_ubar=ls6_ubar,
+                        flush_list=_flist, n_ptr=_flist[B:],
+                        ls6_mh=ls6_mh,
+                        ls6_map=ls6_map if ls6_map is not None else write_pos,
+                        stride_d_slot=d_cache.stride(0),
+                        stride_g_slot=g_cache.stride(0),
+                        stride_ls6_zk_slot=ls6_zk.stride(0),
+                        stride_ls6_u_slot=ls6_ubar.stride(0),
+                        H=H, HV=HV, V=V, G=_ls6_g, BC=BC,
+                        BV=_ubv, BG=_ubg, MAX_CACHE_LEN=max_cache_len,
+                        LS6_MAP=ls6_map is not None,
+                        FDOT=int(os.environ.get("NS_GDN_UBAR_DOT", "1")),
+                        num_warps=int(os.environ.get(
+                            "NS_GDN_UBAR_NW", "2"
+                        )),
+                        num_stages=1,
+                    )
                 return out, initial_state
             _gdn_v2_flush_kernel[(_np,)](
                 h0=initial_state, d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,

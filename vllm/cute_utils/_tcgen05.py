@@ -30,13 +30,14 @@ def _make_tmem_llvm_ptr(addr, *, loc=None, ip=None):
 def alloc(
     taddr: cute.Pointer,
     cta_group: int = 1,
+    ncols: int = 512,
     *,
     loc=None,
     ip=None,
 ) -> None:
     nvvm.tcgen05_alloc(
         taddr.to_llvm_ptr(loc=loc, ip=ip),
-        Uint32(512).ir_value(loc=loc, ip=ip),
+        Uint32(ncols).ir_value(loc=loc, ip=ip),
         group=NVVM_CTA_GROUP_MAP[cta_group],
         loc=loc,
         ip=ip,
@@ -44,14 +45,42 @@ def alloc(
 
 
 @dsl_user_op
-def dealloc(cta_group: int = 1, *, loc=None, ip=None) -> None:
+def dealloc(
+    tmem_base=0,
+    cta_group: int = 1,
+    ncols: int = 512,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
     nvvm.tcgen05_dealloc(
-        _make_tmem_llvm_ptr(0, loc=loc, ip=ip),
-        Int32(512).ir_value(loc=loc, ip=ip),
+        _make_tmem_llvm_ptr(tmem_base, loc=loc, ip=ip),
+        Int32(ncols).ir_value(loc=loc, ip=ip),
         group=NVVM_CTA_GROUP_MAP[cta_group],
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def cp_128x256b(
+    taddr,
+    smem_desc,
+    cta_group: int = 1,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Copy a 128-row by eight-fp32-column SMEM tile into TMEM."""
+    with cute.arch.elect_one():
+        nvvm.tcgen05_cp(
+            nvvm.Tcgen05CpShape.SHAPE_128x256b,
+            _make_tmem_llvm_ptr(taddr, loc=loc, ip=ip),
+            Uint64(smem_desc).ir_value(loc=loc, ip=ip),
+            group=NVVM_CTA_GROUP_MAP[cta_group],
+            loc=loc,
+            ip=ip,
+        )
 
 
 def make_bf16_idesc(
@@ -65,6 +94,32 @@ def make_bf16_idesc(
 ):
     idesc = Uint32(
         (1 << 4) | (1 << 7) | (1 << 10) | ((MMA_N >> 3) << 17) | ((MMA_M >> 4) << 24)
+    )
+    idesc |= Uint32(negate_A) << 13
+    idesc |= Uint32(negate_B) << 14
+    idesc |= Uint32(transpose_A) << 15
+    idesc |= Uint32(transpose_B) << 16
+    return idesc
+
+
+def make_tf32_idesc(
+    MMA_M: int,
+    MMA_N: int,
+    *,
+    negate_A: bool = False,
+    negate_B: bool = False,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+):
+    """Build the SM100 instruction descriptor for TF32 -> FP32 MMA."""
+    # c_format=F32(1), a_format=b_format=TF32(2).  See
+    # cute/arch/mma_sm100_desc.hpp::InstrDescriptor.
+    idesc = Uint32(
+        (1 << 4)
+        | (2 << 7)
+        | (2 << 10)
+        | ((MMA_N >> 3) << 17)
+        | ((MMA_M >> 4) << 24)
     )
     idesc |= Uint32(negate_A) << 13
     idesc |= Uint32(negate_B) << 14
@@ -93,6 +148,32 @@ def mma_f16(
     with cute.arch.elect_one():
         nvvm.tcgen05_mma(
             nvvm.Tcgen05MMAKind.F16,
+            NVVM_CTA_GROUP_MAP[cta_group],
+            _make_tmem_llvm_ptr(d_tmem, loc=loc, ip=ip),
+            Uint64(a_desc).ir_value(loc=loc, ip=ip),
+            Uint64(b_desc).ir_value(loc=loc, ip=ip),
+            Int32(idesc).ir_value(loc=loc, ip=ip),
+            Boolean(enable_input_d).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+
+@dsl_user_op
+def mma_tf32(
+    d_tmem,
+    a_desc,
+    b_desc,
+    idesc,
+    enable_input_d,
+    cta_group: int = 1,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    with cute.arch.elect_one():
+        nvvm.tcgen05_mma(
+            nvvm.Tcgen05MMAKind.TF32,
             NVVM_CTA_GROUP_MAP[cta_group],
             _make_tmem_llvm_ptr(d_tmem, loc=loc, ip=ip),
             Uint64(a_desc).ir_value(loc=loc, ip=ip),

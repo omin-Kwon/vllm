@@ -140,7 +140,14 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         layer._ls6_active = False
         logger.info("[ls6] %s: 층 전체 dense — 훅 없음", prefix)
         return
-    G = max(4, 1 << (int(mt.max()) - 1).bit_length())
+    max_m = int(mt.max())
+    if os.environ.get("NS_GDN_COMPACT_G", "1") == "1":
+        # CUDA kernels index with the physical G stride and only require a
+        # multiple of four.  Eight-column padding avoids the old 65..77 -> 128
+        # jump in Qwen allocations while retaining vectorized loads.
+        G = max(4, ((max_m + 7) // 8) * 8)
+    else:
+        G = max(4, 1 << (max_m - 1).bit_length())
     if G > 128:
         raise ValueError(f"층 {li}: m 최대 {int(mt.max())} → G={G} > 128")
     if G > 64 and os.environ.get("NS_GDN_STEP_IMPL", "cuda") == "cuda" \
@@ -179,7 +186,7 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         _LEADER[0] = prefix
     layer._ls6_leader = _LEADER[0] == prefix
     logger.info("[ls6] %s: ckpt 층 %d  래치 head %d/%d  m max %d  G %d  r %d  W %d%s",
-                prefix, li, int((mt > 0).sum()), HV, int(mt.max()), G, r, W, "  (leader)" if layer._ls6_leader else "")
+                prefix, li, int((mt > 0).sum()), HV, max_m, G, r, W, "  (leader)" if layer._ls6_leader else "")
 
 
 # ─────────────────────────── ① 회전 ───────────────────────────
