@@ -26,6 +26,10 @@ class PleOffloadRegistration:
     input_ids_buf: torch.Tensor
     query_start_loc_buf: torch.Tensor
     ngram_context_buf: torch.Tensor | None
+    # CPU shared-memory sequence acknowledged after the offload worker has
+    # snapshotted a request's inputs.  The connector must not overwrite the
+    # buffers above until this reaches the preceding request id.
+    input_ack_buf: torch.Tensor
 
 
 @dataclass
@@ -35,6 +39,8 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Monotonic per-DP sequence used to protect the single shared input slot.
+    request_id: int = 0
     # Index into the connector's input-readiness event ring. Local to the
     # requesting worker; the CPU offload process ignores it.
     event_idx: int = 0

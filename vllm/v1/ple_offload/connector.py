@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
@@ -32,6 +33,8 @@ logger = init_logger(__name__)
 # request, so at most two are live (one queued, one being staged); the extra
 # slots are slack.
 _INPUT_READY_RING = 4
+_REQUEST_QUEUE_PUT_TIMEOUT_S = 60.0
+_INPUT_ACK_TIMEOUT_S = 60.0
 
 
 def _cuda_check(result: Any, operation: str) -> Any:
@@ -87,6 +90,9 @@ class PleOffloadConnector:
                 dtype=torch.int32,
                 device="cpu",
             ).share_memory_()
+        self._input_ack_buf = torch.full(
+            (1,), -1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
 
         # Runner input allocations are address-stable, so bind them once and
         # pass only batch sizes through the per-forward request queue.
@@ -104,6 +110,7 @@ class PleOffloadConnector:
         )
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
+        self._request_thread_stop = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
         self._d2h_stream: torch.cuda.Stream | None = None
@@ -114,7 +121,7 @@ class PleOffloadConnector:
         # request its own event. The queue holds one pending request, so a
         # short ring is enough.
         self._input_ready_events: list[torch.cuda.Event] = []
-        self._launch_counter = 0
+        self._next_request_id = 0
         self._d2h_done_event: torch.cuda.Event | None = None
 
         try:
@@ -230,6 +237,7 @@ class PleOffloadConnector:
             input_ids_buf=self._input_ids_buf,
             query_start_loc_buf=self._query_start_loc_buf,
             ngram_context_buf=self._ngram_context_buf,
+            input_ack_buf=self._input_ack_buf,
         )
 
         # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
@@ -290,6 +298,8 @@ class PleOffloadConnector:
 
     def _process_request(self, request: PleOffloadRequest, socket: zmq.Socket) -> None:
         """Stage one batch from fixed sources and publish its request."""
+        if not self._wait_for_previous_input_ack(request.request_id):
+            return
         if self._uses_cuda_inputs:
             self._copy_cuda_inputs(request)
         else:
@@ -297,6 +307,22 @@ class PleOffloadConnector:
 
         with torch.cuda.nvtx.range("ple_offload.send_request"):
             socket.send(msgspec.msgpack.encode(request))
+
+    def _wait_for_previous_input_ack(self, request_id: int) -> bool:
+        """Wait until the worker has snapshotted the preceding shared input."""
+        preceding = request_id - 1
+        if preceding < 0:
+            return True
+        deadline = time.monotonic() + _INPUT_ACK_TIMEOUT_S
+        while int(self._input_ack_buf[0].item()) < preceding:
+            if self._request_thread_stop.wait(timeout=0.001):
+                return False
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "PLE offload worker did not acknowledge input request "
+                    f"{preceding} within {_INPUT_ACK_TIMEOUT_S:g}s"
+                )
+        return True
 
     def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
         """Stage MRV1's existing CPU mirrors in the notifier thread."""
@@ -393,11 +419,12 @@ class PleOffloadConnector:
         if self.tp_rank != 0:
             return
 
+        request_id = self._next_request_id
+        self._next_request_id += 1
         event_idx = 0
         if self._uses_cuda_inputs:
             assert self._input_ready_events
-            event_idx = self._launch_counter % len(self._input_ready_events)
-            self._launch_counter += 1
+            event_idx = request_id % len(self._input_ready_events)
             # The background copy stream waits for runner input production
             # without making the model stream wait for D2H completion.
             self._input_ready_events[event_idx].record(
@@ -407,9 +434,16 @@ class PleOffloadConnector:
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            request_id=request_id,
             event_idx=event_idx,
         )
-        self._request_queue.put_nowait(request)
+        try:
+            self._request_queue.put(request, timeout=_REQUEST_QUEUE_PUT_TIMEOUT_S)
+        except queue.Full as error:
+            raise RuntimeError(
+                "PLE request thread did not drain its pending request within "
+                f"{_REQUEST_QUEUE_PUT_TIMEOUT_S:g}s"
+            ) from error
 
     def prepare_forward(
         self,
@@ -442,6 +476,7 @@ class PleOffloadConnector:
 
     def close(self) -> None:
         """Stop request transport and release host registrations."""
+        self._request_thread_stop.set()
         request_thread = self._request_thread
         if request_thread is not None and request_thread.is_alive():
             try:

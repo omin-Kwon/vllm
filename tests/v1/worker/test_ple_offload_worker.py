@@ -281,6 +281,7 @@ def test_ple_offload_request_msgpack_round_trip() -> None:
         dp_rank=2,
         num_tokens=17,
         num_reqs=3,
+        request_id=41,
     )
 
     decoded = ple_offload_worker._PLE_OFFLOAD_REQUEST_DECODER.decode(
@@ -519,6 +520,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
                     input_ids_buf=torch.full((8,), dp_rank, dtype=torch.int32),
                     query_start_loc_buf=torch.zeros(4, dtype=torch.int32),
                     ngram_context_buf=None,
+                    input_ack_buf=torch.full((1,), -1, dtype=torch.int64),
                 )
             )
 
@@ -575,6 +577,10 @@ def test_ple_offload_runner_routes_requests_layer_first(
             events.append((self.name, int(input_ids[0].item())))
             result = input_ids.unsqueeze(-1).expand(-1, 2)
             output_buffer[: result.shape[0]].copy_(result)
+            if self.name == "ple0" and int(input_ids[0].item()) == 0:
+                # Ack permits the connector to reuse shared input immediately;
+                # later layers must continue reading the private snapshot.
+                runner._input_bufs[0].input_ids_buf.fill_(99)
             return output_buffer[: result.shape[0]]
 
     class FakeStream:
@@ -610,11 +616,13 @@ def test_ple_offload_runner_routes_requests_layer_first(
             input_ids_buf=torch.tensor([-1, 11], dtype=torch.int32),
             query_start_loc_buf=torch.tensor([0, 2], dtype=torch.int32),
             ngram_context_buf=None,
+            input_ack_buf=torch.full((1,), -1, dtype=torch.int64),
         ),
         1: ple_offload_worker.PleOffloadInputBuffers(
             input_ids_buf=torch.tensor([20], dtype=torch.int32),
             query_start_loc_buf=torch.tensor([0, 1], dtype=torch.int32),
             ngram_context_buf=None,
+            input_ack_buf=torch.full((1,), -1, dtype=torch.int64),
         ),
     }
     runner._pinned_bufs = {
@@ -651,6 +659,8 @@ def test_ple_offload_runner_routes_requests_layer_first(
         ("ple1", 0),
         ("ple1", 20),
     ]
+    assert runner._input_bufs[0].input_ack_buf.item() == 0
+    assert runner._input_bufs[1].input_ack_buf.item() == 0
     torch.testing.assert_close(
         runner._worker_targets[0]["ple1"][0].gpu_output_buffer[:2],
         torch.tensor([[0, 0], [11, 11]], dtype=torch.int32),
@@ -659,6 +669,14 @@ def test_ple_offload_runner_routes_requests_layer_first(
         runner._worker_targets[1]["ple1"][0].gpu_output_buffer[:1],
         torch.tensor([[20, 20]], dtype=torch.int32),
     )
+
+    with pytest.raises(RuntimeError, match="more than one request"):
+        runner._handle_requests(
+            [
+                ple_offload_worker.PleOffloadRequest(0, 2, 1, request_id=1),
+                ple_offload_worker.PleOffloadRequest(0, 2, 1, request_id=2),
+            ]
+        )
 
 
 def test_wait_for_ready_closes_pipe() -> None:

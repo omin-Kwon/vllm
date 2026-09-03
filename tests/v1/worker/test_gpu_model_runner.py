@@ -99,10 +99,13 @@ def test_ple_offload_h2h_uses_bound_input_buffers() -> None:
     connector._input_ids_buf = torch.full((4,), -99, dtype=torch.int32)
     connector._query_start_loc_buf = torch.full((3,), -99, dtype=torch.int32)
     connector._ngram_context_buf = None
+    connector._input_ack_buf = torch.full((1,), -1, dtype=torch.int64)
     connector._input_ids_source = source_input_ids
     connector._query_start_loc_source = source_query_start_loc
     connector._ngram_context_source = None
     connector._uses_cuda_inputs = False
+    connector._next_request_id = 0
+    connector._request_thread_stop = threading.Event()
     connector._validate_input_sources()
     connector._request_queue = queue.Queue(maxsize=1)
 
@@ -128,6 +131,7 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     connector._input_ids_buf = torch.empty(4, dtype=torch.int32)
     connector._query_start_loc_buf = torch.empty(3, dtype=torch.int32)
     connector._ngram_context_buf = None
+    connector._input_ack_buf = torch.full((1,), -1, dtype=torch.int64)
     connector._input_ids_source = torch.tensor([7, 8, 9, 10], dtype=torch.int32)
     connector._query_start_loc_source = torch.tensor([0, 2, 4], dtype=torch.int32)
     connector._ngram_context_source = None
@@ -135,11 +139,12 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     connector._pinned_input_buffers = []
     connector._d2h_stream = None
     connector._input_ready_events = []
-    connector._launch_counter = 0
+    connector._next_request_id = 0
     connector._d2h_done_event = None
     connector._request_queue = queue.Queue(maxsize=1)
     connector._request_thread = None
     connector._request_thread_ready = threading.Event()
+    connector._request_thread_stop = threading.Event()
     connector._zmq_ctx = zmq.Context()
     connector._registration_socket = None
 
@@ -199,6 +204,9 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
         connector._ngram_context_buf = torch.full(
             (2, 3), -99, dtype=torch.int32
         ).share_memory_()
+        connector._input_ack_buf = torch.full(
+            (1,), -1, dtype=torch.int64
+        ).share_memory_()
         input_buffers = (
             connector._input_ids_buf,
             connector._query_start_loc_buf,
@@ -240,7 +248,8 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
         )
         connector._d2h_stream = torch.cuda.Stream(device=connector.device)
         connector._input_ready_events = [torch.cuda.Event()]
-        connector._launch_counter = 0
+        connector._next_request_id = 0
+        connector._request_thread_stop = threading.Event()
         connector._d2h_done_event = torch.cuda.Event()
         try:
             connector._launch(num_reqs=2, num_tokens=4)
@@ -261,6 +270,39 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
         finally:
             torch.accelerator.synchronize(connector.device)
             connector._unpin_input_buffers()
+
+
+def test_ple_offload_waits_for_worker_input_ack() -> None:
+    """Do not overwrite the shared input slot before the worker snapshots it."""
+    socket = Mock()
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector._input_ack_buf = torch.full((1,), -1, dtype=torch.int64)
+    connector._request_thread_stop = threading.Event()
+    connector._uses_cuda_inputs = False
+    connector._input_ids_buf = torch.full((2,), -99, dtype=torch.int32)
+    connector._query_start_loc_buf = torch.full((2,), -99, dtype=torch.int32)
+    connector._ngram_context_buf = None
+    connector._input_ids_source = torch.tensor([7, 8], dtype=torch.int32)
+    connector._query_start_loc_source = torch.tensor([0, 2], dtype=torch.int32)
+    connector._ngram_context_source = None
+    request = ple_offload_connector_module.PleOffloadRequest(
+        dp_rank=0,
+        num_tokens=2,
+        num_reqs=1,
+        request_id=1,
+    )
+
+    thread = threading.Thread(target=connector._process_request, args=(request, socket))
+    thread.start()
+    thread.join(timeout=0.05)
+    assert thread.is_alive()
+    assert not socket.send.called
+    connector._input_ack_buf.fill_(0)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    socket.send.assert_called_once()
+    assert connector._input_ids_buf.tolist() == [7, 8]
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

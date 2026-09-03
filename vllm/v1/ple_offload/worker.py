@@ -83,6 +83,16 @@ class PleOffloadInputBuffers:
     input_ids_buf: torch.Tensor  # int32 (max_num_tokens,)
     query_start_loc_buf: torch.Tensor  # int32 (max_num_reqs + 1,)
     ngram_context_buf: torch.Tensor | None  # int32 (max_num_reqs, ngram_context_len)
+    input_ack_buf: torch.Tensor  # int64 (1,), last snapshotted request id
+
+
+@dataclass
+class PleOffloadInputSnapshot:
+    """Private CPU copy that remains stable after the connector reuses IPC input."""
+
+    input_ids: torch.Tensor
+    query_start_loc: torch.Tensor
+    ngram_context: torch.Tensor | None
 
 
 @dataclass
@@ -545,6 +555,7 @@ class PleOffloadRunner:
                     input_ids_buf=registration.input_ids_buf,
                     query_start_loc_buf=registration.query_start_loc_buf,
                     ngram_context_buf=registration.ngram_context_buf,
+                    input_ack_buf=registration.input_ack_buf,
                 )
 
         if set(self._input_bufs) != set(range(dp_size)):
@@ -622,20 +633,40 @@ class PleOffloadRunner:
                 )
                 continue
             if request.dp_rank in requests_by_dp:
-                logger.warning(
-                    "Duplicate PLE request for dp_rank=%d; skipping duplicate.",
-                    request.dp_rank,
+                raise RuntimeError(
+                    "PLE input flow control admitted more than one request for "
+                    f"dp_rank={request.dp_rank} in the same worker batch"
                 )
-                continue
             requests_by_dp[request.dp_rank] = request
 
-        # Speculative placeholders are not vocabulary IDs. Normalize each DP
-        # input once before all PLE layers consume the shared buffer.
-        if self._clamp_input_ids:
-            for dp_rank, request in requests_by_dp.items():
-                self._input_bufs[dp_rank].input_ids_buf[
-                    : request.num_tokens
-                ].clamp_min_(0)
+        # Snapshot before acknowledging so the connector may safely reuse its
+        # single shared input slot while CPU lookup and H2D run.  This ack also
+        # limits ZMQ to one pending request per DP under async scheduling.
+        snapshots: dict[int, PleOffloadInputSnapshot] = {}
+        for dp_rank, request in requests_by_dp.items():
+            input_bufs = self._input_bufs[dp_rank]
+            expected = int(input_bufs.input_ack_buf[0].item()) + 1
+            if request.request_id != expected:
+                raise RuntimeError(
+                    f"PLE request sequence mismatch for dp_rank={dp_rank}: "
+                    f"expected={expected}, got={request.request_id}"
+                )
+            input_ids = input_bufs.input_ids_buf[: request.num_tokens].clone()
+            if self._clamp_input_ids:
+                # Speculative placeholders are not vocabulary IDs.
+                input_ids.clamp_min_(0)
+            snapshots[dp_rank] = PleOffloadInputSnapshot(
+                input_ids=input_ids,
+                query_start_loc=input_bufs.query_start_loc_buf[
+                    : request.num_reqs + 1
+                ].clone(),
+                ngram_context=(
+                    input_bufs.ngram_context_buf[: request.num_reqs].clone()
+                    if input_bufs.ngram_context_buf is not None
+                    else None
+                ),
+            )
+            input_bufs.input_ack_buf.fill_(request.request_id)
 
         for layer_name, layer in self._layers.items():
             for dp_rank, request in requests_by_dp.items():
@@ -648,17 +679,12 @@ class PleOffloadRunner:
                     target.copy_stream.synchronize()
                     target.sem.wait_reset(target.copy_stream)
 
-                input_bufs = self._input_bufs[dp_rank]
-                ngram_context = (
-                    input_bufs.ngram_context_buf[: request.num_reqs]
-                    if input_bufs.ngram_context_buf is not None
-                    else None
-                )
+                inputs = snapshots[dp_rank]
                 result = layer.forward_impl(
-                    input_bufs.input_ids_buf[: request.num_tokens],
-                    input_bufs.input_ids_buf[: request.num_tokens],
-                    input_bufs.query_start_loc_buf[: request.num_reqs + 1],
-                    ngram_context,
+                    inputs.input_ids,
+                    inputs.input_ids,
+                    inputs.query_start_loc,
+                    inputs.ngram_context,
                     output_buffer=self._pinned_bufs[dp_rank][layer_name],
                 )
 
