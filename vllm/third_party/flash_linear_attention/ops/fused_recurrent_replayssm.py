@@ -786,6 +786,113 @@ def _gdn_v2_raw_to_delta_kernel(
 
 
 @triton.jit
+def _gdn_v2_raw_to_delta_gqa_kernel(
+    h0, d_cache, k_cache, g_cache, flush_list, n_ptr,
+    ls6_mh, ls6_beta, ls6_map,
+    stride_init_state_token: tl.constexpr,
+    stride_state_h: tl.constexpr, stride_state_v: tl.constexpr,
+    stride_state_k: tl.constexpr, stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr, stride_g_slot: tl.constexpr,
+    stride_ls6_beta_slot: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BK: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr, LS6_MAP: tl.constexpr,
+    FDOT: tl.constexpr,
+):
+    """Exact raw-write correction sharing K and K K^T across a GQA group."""
+    i_v = tl.program_id(0)
+    work = tl.program_id(1)
+    r = work // H
+    i_h = work % H
+    if r >= tl.load(n_ptr):
+        return
+    hpg: tl.constexpr = HV // H
+    n_active = 0
+    for jj in range(hpg):
+        n_active += (
+            tl.load(ls6_mh + i_h * hpg + jj).to(tl.int32) > 0
+        ).to(tl.int32)
+    if n_active == 0:
+        return
+
+    state_idx = tl.load(flush_list + r).to(tl.int64)
+    if LS6_MAP:
+        cidx = tl.load(ls6_map + state_idx).to(tl.int64)
+    else:
+        cidx = state_idx
+    o_c = tl.arange(0, BC)
+    m_c = o_c < MAX_CACHE_LEN
+    o_k = tl.arange(0, BK)
+    m_k = o_k < K
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+    keys = tl.load(
+        k_cache + state_idx * stride_k_slot
+        + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_k[None, :],
+        mask=m_c[:, None] & m_k[None, :], other=0.0,
+    ).to(tl.float32)
+    if FDOT == 2:
+        gram = tl.dot(keys, tl.trans(keys), input_precision="ieee")
+    else:
+        gram = tl.dot(keys, tl.trans(keys), input_precision="tf32x3")
+
+    for jj in range(hpg):
+        i_hv = i_h * hpg + jj
+        if tl.load(ls6_mh + i_hv).to(tl.int32) > 0:
+            g = tl.load(
+                g_cache + state_idx * stride_g_slot
+                + i_hv * MAX_CACHE_LEN + o_c,
+                mask=m_c, other=0.0,
+            ).to(tl.float32)
+            prefix = tl.cumsum(g, axis=0)
+            beta = tl.load(
+                ls6_beta + cidx * stride_ls6_beta_slot
+                + i_hv * MAX_CACHE_LEN + o_c,
+                mask=m_c, other=0.0,
+            ).to(tl.float32)
+            S0 = tl.load(
+                h0 + state_idx * stride_init_state_token
+                + i_hv * stride_state_h
+                + o_v[:, None] * stride_state_v
+                + o_k[None, :] * stride_state_k,
+                mask=m_v[:, None] & m_k[None, :], other=0.0,
+            ).to(tl.float32)
+            if FDOT == 2:
+                s0k = tl.dot(S0, tl.trans(keys), input_precision="ieee")
+            else:
+                s0k = tl.dot(S0, tl.trans(keys), input_precision="tf32x3")
+
+            hproj = tl.zeros([BV, BC], dtype=tl.float32)
+            for ss in range(MAX_CACHE_LEN):
+                ps = tl.sum(tl.where(o_c == ss, prefix, 0.0), axis=0)
+                bs = tl.sum(tl.where(o_c == ss, beta, 0.0), axis=0)
+                s0ks = tl.sum(
+                    tl.where(o_c[None, :] == ss, s0k, 0.0), axis=1
+                )
+                grams = tl.sum(
+                    tl.where(o_c[None, :] == ss, gram, 0.0), axis=1
+                )
+                arow = tl.where(
+                    (o_c < ss) & m_c,
+                    bs * grams * tl.exp(ps - prefix),
+                    0.0,
+                )
+                hs = bs * tl.exp(ps) * s0ks \
+                    - tl.sum(hproj * arow[None, :], axis=1)
+                hproj = tl.where(o_c[None, :] == ss, hs[:, None], hproj)
+
+            p_u = d_cache + state_idx * stride_d_slot \
+                + (i_hv * MAX_CACHE_LEN + o_c[None, :]) * V \
+                + o_v[:, None]
+            u = tl.load(
+                p_u, mask=m_v[:, None] & m_c[None, :], other=0.0
+            ).to(tl.float32)
+            tl.store(
+                p_u, u - hproj, mask=m_v[:, None] & m_c[None, :]
+            )
+
+
+@triton.jit
 def _gdn_v2_flush_kernel(
     h0, d_cache, k_cache, g_cache, ssm_state_indices, flush_list, n_ptr,
     fz_nf, fz_u, fz_z, stride_fz_slot: tl.constexpr,
@@ -1305,7 +1412,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
         _ls6_rp = max(16, triton.next_power_of_2(max(1, _ls6_r))) if _ls6_on else 16
         _ls6_gp = max(16, triton.next_power_of_2(_ls6_g)) if _ls6_on else 16
         # exact 보정은 dot 누산기가 많아 2 warp가 B300에서 낫다.
-        _fl_default = "32,12,2" if _ls6_exact else "32,8,1"
+        _fl_default = "64,12,2" if _ls6_exact else "32,8,1"
         _flcfg = os.environ.get("NS_GDN_FLUSH_CFG", _fl_default)
         _fbv, _fps, _fnw = (int(x) for x in _flcfg.split(","))
         # tl.arange width must remain a power of two even for the deliberately
@@ -1406,7 +1513,17 @@ def fused_recurrent_gated_delta_rule_replayssm(
                 # CUDA fold는 검증된 decay-plus-delta 구현을 그대로 쓴다. Latch
                 # heads의 raw u_s만 작은 GPU pre-kernel에서 exact d_s로 바꾼다.
                 if _ls6_exact:
-                    _gdn_v2_raw_to_delta_kernel[(triton.cdiv(V, _fbv), B * HV)](
+                    _raw_gqa = (
+                        HV // H == 3
+                        and os.environ.get("NS_GDN_RAW_GQA", "1") == "1"
+                    )
+                    _raw_kernel = (
+                        _gdn_v2_raw_to_delta_gqa_kernel
+                        if _raw_gqa
+                        else _gdn_v2_raw_to_delta_kernel
+                    )
+                    _raw_work = B * H if _raw_gqa else B * HV
+                    _raw_kernel[(triton.cdiv(V, _fbv), _raw_work)](
                         h0=initial_state, d_cache=d_cache, k_cache=k_cache,
                         g_cache=g_cache, flush_list=_flist, n_ptr=_flist[B:],
                         ls6_mh=ls6_mh, ls6_beta=ls6_beta,
@@ -1433,7 +1550,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
                     ls6_ubar if _ls6_on else None, ls6_zk if _ls6_on else None,
                     None,
                     H, HV, K, V, max_cache_len, _ls6_g, ls6_map=ls6_map,
-                    ls6_mh=None, ls6_beta=None)
+                    ls6_mh=ls6_mh if _ls6_on else None, ls6_beta=None)
                 return out, initial_state
             _gdn_v2_flush_kernel[(_np,)](
                 h0=initial_state, d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,

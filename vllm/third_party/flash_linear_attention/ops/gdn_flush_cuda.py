@@ -311,7 +311,8 @@ gdn_flush_kernel(
     const int* __restrict__ flush_list, const int* __restrict__ n_ptr,
     const int* __restrict__ fz_nf, float* __restrict__ fz_u, float* __restrict__ fz_z,
     const float* __restrict__ fz_qbar, const float* __restrict__ fz_kbar,
-    float* __restrict__ ls6_ubar, const float* __restrict__ ls6_zk, const int* __restrict__ ls6_map,
+    float* __restrict__ ls6_ubar, const float* __restrict__ ls6_zk,
+    const int* __restrict__ ls6_map, const int* __restrict__ ls6_mh,
     long s_h0_slot, long s_h0_h, long s_ind, long s_d_slot, long s_k_slot, long s_g_slot,
     long s_fz_slot, long s_fzb_slot, long s_u_slot, long s_zk_slot,
     int H, int HV, int W, int G, int dbg)
@@ -476,7 +477,8 @@ gdn_flush_kernel(
         // ── LS6: Ū[g,v] = tot'·Ū[g,v] + Σ_s zk[s,g] d̃_s[v]   (idx=(g,v) 를 스레드에 펼치고 u_old 는 묶어 읽는다) ──
         if (ls6) {
             float* pu = ls6_ubar + cidx * s_u_slot + (long)i_hv * G * V;
-            const int n_gv = G * V;
+            const int mh = ls6_mh ? ls6_mh[i_hv] : G;
+            const int n_gv = mh * V;
             for (int base = 0; base < n_gv; base += NT * 4) {
                 float uo[4]; int gi[4], vi[4];
                 #pragma unroll
@@ -559,6 +561,7 @@ static void launch(int grid, cudaStream_t st,
         fz ? fz_qbar->data_ptr<float>() : nullptr, fz ? fz_kbar->data_ptr<float>() : nullptr,
         ls6 ? ls6_ubar->data_ptr<float>() : nullptr, ls6 ? ls6_zk->data_ptr<float>() : nullptr,
         ls6_map.has_value() ? ls6_map->data_ptr<int>() : nullptr,
+        ls6_mh.has_value() ? ls6_mh->data_ptr<int>() : nullptr,
         h0.stride(0), h0.stride(1), ssm_state_indices.stride(0), d_cache.stride(0), k_cache.stride(0), g_cache.stride(0),
         fz ? fz_u->stride(0) : 0, fz ? fz_qbar->stride(0) : 0, ls6 ? ls6_ubar->stride(0) : 0, ls6 ? ls6_zk->stride(0) : 0,
         H, HV, W, G, dbg);
@@ -629,7 +632,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_flush_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_flush_v6k", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_flush_mh_v7", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_flush"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
@@ -649,18 +652,14 @@ def gdn_flush_cuda(grid, h0, d_cache, k_cache, g_cache, ssm_state_indices, flush
         raise ValueError(f"gdn_flush_cuda: state 는 (…,V,K) K-연속이어야 한다: strides {h0.stride()}")
     if K % 16 or V % 8:
         raise ValueError(f"gdn_flush_cuda: K%16==0, V%8==0 필요 (K={K}, V={V})")
-    # 블록 = tv×16 스레드, 스레드당 V/tv 행. tv=32(512 스레드, acc 32 reg)가 기본 — 블록당
-    # 레지스터가 작아야 SM 에 워프가 많이 올라 종속 로드 사슬이 겹친다.
-    tv = min(int(os.environ.get("NS_GDN_FLUSH_TV", "32")), max(8, V // 4))
+    # 블록 = tv×16 스레드, 스레드당 V/tv 행. B300에서는 tv=16(256 스레드)이
+    # exact 보정 뒤의 fold와 dense fallback 모두 가장 안정적으로 빨랐다.
+    tv = min(int(os.environ.get("NS_GDN_FLUSH_TV", "16")), max(8, V // 4))
     if ls6_map is not None and (ls6_map.dtype != torch.int32 or not ls6_map.is_contiguous() or ls6_map.dim() != 1):
         raise TypeError(f"gdn_flush_cuda: ls6_map 은 연속 int32 (NX,) 여야 한다 (받음 {ls6_map.dtype} {tuple(ls6_map.shape)})")
-    corr = (ls6_mh, ls6_beta)
-    n_corr = sum(t is not None for t in corr)
-    if n_corr not in (0, len(corr)):
-        raise ValueError(
-            f"gdn_flush_cuda: exact 인자는 모두 주거나 빼야 한다 ({n_corr}/2)"
-        )
-    if n_corr and ls6_xk is None:
+    if ls6_beta is not None and ls6_mh is None:
+        raise ValueError("gdn_flush_cuda: exact beta에는 ls6_mh가 필요하다")
+    if ls6_beta is not None and ls6_xk is None:
         raise ValueError("gdn_flush_cuda: exact-flush에는 ls6_xk 계수 링이 필요하다")
     if ls6_mh is not None and ls6_mh.dtype != torch.int32:
         raise TypeError(

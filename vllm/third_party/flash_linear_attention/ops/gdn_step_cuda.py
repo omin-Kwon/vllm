@@ -27,7 +27,7 @@ Latch heads store state-independent raw-WY writes ``u_s`` in d_cache and
 normalized projected factors ``F_s=f_s/gamma_s`` in ls6_fs.  Thus the online
 write never consumes an approximate checkpoint key-read.  Triton 판
 (`_gdn_v2_step_kernel`)과 **같은 의미·같은 버퍼 규약**이다. Qwen Flash-Next
-(K=V=128, HPG=3)는 G=128 특수화를 추가로 갖고, 나머지 지원 못 하는 형상은
+(K=V=128, HPG=3)는 G=32,128 특수화를 추가로 갖고, 나머지 지원 못 하는 형상은
 래퍼가 Triton 으로 되돌린다.
 """
 import os
@@ -212,6 +212,10 @@ gdn_step_kernel(
     int mhs[HPG];
     #pragma unroll
     for (int j = 0; j < HPG; ++j) mhs[j] = (LS6 && FZ) ? ls6_mh[hv0 + j] : 0;
+    int max_mh = 0;
+    #pragma unroll
+    for (int j = 0; j < HPG; ++j)
+        max_mh = mhs[j] > max_mh ? mhs[j] : max_mh;
     const int nf_raw = FZ ? fz_nf[i_hv] : K;
     float qc[CK], kc[CK];
     {
@@ -244,7 +248,8 @@ gdn_step_kernel(
             for (int g4 = 0; g4 < ZC4; ++g4) {
                 const int g0 = zc * ZC + 4 * g4;
                 zr[i][g4] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (ok && g0 < G) zr[i][g4] = __ldg((const float4*)(base + (i_h * K + tt) * G + g0));
+                if (ok && g0 < G && g0 < max_mh)
+                    zr[i][g4] = __ldg((const float4*)(base + (i_h * K + tt) * G + g0));
             }
         }
     };
@@ -257,9 +262,7 @@ gdn_step_kernel(
     const bool l6 = LS6 && FZ;
     const int mh = l6 ? mhs[warp] : 0;        // 래치 폭 (0 = 안 탄다)
     const bool latch = mh > 0;
-    bool latch_any = false;
-    #pragma unroll
-    for (int j = 0; j < HPG; ++j) latch_any |= l6 && (mhs[j] > 0);
+    const bool latch_any = l6 && max_mh > 0;
     // Latch heads use the same raw-write/f_s path on the flush token.  Only a
     // dense fallback head may turn the flush step into a full checkpoint read.
     const int nf = (is_flush && !latch) ? K : nf_raw;
@@ -371,28 +374,36 @@ gdn_step_kernel(
     if (LS6) {
         #pragma unroll
         for (int zc = 0; zc < NZC; ++zc) {
-            float4 zbr[RI][ZC4];
-            if (zc == 0) {
+            if (zc * ZC < max_mh) {
+                float4 zbr[RI][ZC4];
+                if (zc == 0) {
+                    #pragma unroll
+                    for (int i = 0; i < RI; ++i) {
+                        #pragma unroll
+                        for (int g4 = 0; g4 < ZC4; ++g4)
+                            zbr[i][g4] = zbr0[i][g4];
+                    }
+                } else {
+                    ld_zm(ls6_zbar, zc, zbr);
+                }
+                float acc[ZC];
+                #pragma unroll
+                for (int g = 0; g < ZC; ++g) acc[g] = 0.f;
                 #pragma unroll
                 for (int i = 0; i < RI; ++i) {
+                    const int tt = warp * RW + lane + 32 * i;
+                    const float kh = sQK[1][(tt < K) ? tt : 0];
                     #pragma unroll
-                    for (int g4 = 0; g4 < ZC4; ++g4) zbr[i][g4] = zbr0[i][g4];
+                    for (int g4 = 0; g4 < ZC4; ++g4) {
+                        const float4 zb = zbr[i][g4];
+                        acc[4 * g4] += zb.x * kh;
+                        acc[4 * g4 + 1] += zb.y * kh;
+                        acc[4 * g4 + 2] += zb.z * kh;
+                        acc[4 * g4 + 3] += zb.w * kh;
+                    }
                 }
-            } else ld_zm(ls6_zbar, zc, zbr);
-            float acc[ZC];
-            #pragma unroll
-            for (int g = 0; g < ZC; ++g) acc[g] = 0.f;
-            #pragma unroll
-            for (int i = 0; i < RI; ++i) {
-                const int tt = warp * RW + lane + 32 * i;
-                const float kh = sQK[1][(tt < K) ? tt : 0];
-                #pragma unroll
-                for (int g4 = 0; g4 < ZC4; ++g4) {
-                    const float4 zb = zbr[i][g4];
-                    acc[4 * g4] += zb.x * kh; acc[4 * g4 + 1] += zb.y * kh; acc[4 * g4 + 2] += zb.z * kh; acc[4 * g4 + 3] += zb.w * kh;
-                }
+                put_x(2, zc, acc);
             }
-            put_x(2, zc, acc);
         }
     }
     // Z 첫 청크는 Z̄ 가 죽은 지금 띄운다(레지스터 80 예산: Z̄·kr·Z 를 동시에 들면 spill). zd 는 κ·sync A·d 접기 뒤라 왕복이 가려진다.
@@ -443,33 +454,47 @@ gdn_step_kernel(
         if (latch_any) {
             #pragma unroll
             for (int zc = 0; zc < NZC; ++zc) {
-                float4 zr[RI][ZC4];
-                if (zc == 0) {
+                if (zc * ZC < max_mh) {
+                    float4 zr[RI][ZC4];
+                    if (zc == 0) {
+                        #pragma unroll
+                        for (int i = 0; i < RI; ++i) {
+                            #pragma unroll
+                            for (int g4 = 0; g4 < ZC4; ++g4)
+                                zr[i][g4] = zr0[i][g4];
+                        }
+                    } else {
+                        ld_zm(ls6_z, zc, zr);
+                    }
+                    float accq[ZC], acck[ZC];
+                    #pragma unroll
+                    for (int g = 0; g < ZC; ++g) {
+                        accq[g] = 0.f;
+                        acck[g] = 0.f;
+                    }
                     #pragma unroll
                     for (int i = 0; i < RI; ++i) {
+                        const int tt = warp * RW + lane + 32 * i;
+                        const int tq = (tt < K) ? tt : 0;
+                        const bool okd = (lane + 32 * i) < RW && tt < R;
+                        const float dq = okd ? sQK[0][tq] - qb[i] : 0.f;
+                        const float dk = okd ? sQK[1][tq] - kb[i] : 0.f;
                         #pragma unroll
-                        for (int g4 = 0; g4 < ZC4; ++g4) zr[i][g4] = zr0[i][g4];
+                        for (int g4 = 0; g4 < ZC4; ++g4) {
+                            const float4 z = zr[i][g4];
+                            accq[4 * g4] += z.x * dq;
+                            accq[4 * g4 + 1] += z.y * dq;
+                            accq[4 * g4 + 2] += z.z * dq;
+                            accq[4 * g4 + 3] += z.w * dq;
+                            acck[4 * g4] += z.x * dk;
+                            acck[4 * g4 + 1] += z.y * dk;
+                            acck[4 * g4 + 2] += z.z * dk;
+                            acck[4 * g4 + 3] += z.w * dk;
+                        }
                     }
-                } else ld_zm(ls6_z, zc, zr);
-                float accq[ZC], acck[ZC];
-                #pragma unroll
-                for (int g = 0; g < ZC; ++g) { accq[g] = 0.f; acck[g] = 0.f; }
-                #pragma unroll
-                for (int i = 0; i < RI; ++i) {
-                    const int tt = warp * RW + lane + 32 * i;
-                    const int tq = (tt < K) ? tt : 0;
-                    const bool okd = (lane + 32 * i) < RW && tt < R;
-                    const float dq = okd ? sQK[0][tq] - qb[i] : 0.f;
-                    const float dk = okd ? sQK[1][tq] - kb[i] : 0.f;
-                    #pragma unroll
-                    for (int g4 = 0; g4 < ZC4; ++g4) {
-                        const float4 z = zr[i][g4];
-                        accq[4 * g4] += z.x * dq; accq[4 * g4 + 1] += z.y * dq; accq[4 * g4 + 2] += z.z * dq; accq[4 * g4 + 3] += z.w * dq;
-                        acck[4 * g4] += z.x * dk; acck[4 * g4 + 1] += z.y * dk; acck[4 * g4 + 2] += z.z * dk; acck[4 * g4 + 3] += z.w * dk;
-                    }
+                    put_x(0, zc, accq);
+                    put_x(1, zc, acck);
                 }
-                put_x(0, zc, accq);
-                put_x(1, zc, acck);
             }
         }
     };
@@ -566,7 +591,8 @@ gdn_step_kernel(
             #pragma unroll
             for (int i = 0; i < NA; ++i) {
                 const int e = lane + 32 * i;
-                if (e < 2 * GT) {
+                const int eg = (e < GT) ? e : e - GT;
+                if (e < 2 * GT && eg < mh) {
                     float sx = anc[i];
                     #pragma unroll
                     for (int w = 0; w < NW; ++w) sx += sX[w][e];
@@ -575,7 +601,7 @@ gdn_step_kernel(
             }
         }
         if (warp == 0) {
-            for (int e = lane; e < G; e += 32) {
+            for (int e = lane; e < max_mh; e += 32) {
                 float sx = 0.f;
                 #pragma unroll
                 for (int w = 0; w < NW; ++w) sx += sX[w][2 * GT + e];
@@ -717,7 +743,7 @@ void gdn_step(int B,
 {
     TORCH_CHECK(W <= WMAX, "W<=16");
     auto st = at::cuda::getCurrentCUDAStream().stream();
-    const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : (G <= 64 ? 64 : 128));
+    const int gt = G <= 8 ? 8 : (G <= 16 ? 16 : (G <= 32 ? 32 : (G <= 64 ? 64 : 128)));
     const int io = dt_code(mixed_qkv);
     const int hpg = HV / H;
 #define ARGS st, B, mixed_qkv, a, b, A_log, dt_bias, out, h0, d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale, fz_nf, fz_u, fz_z, fz_qbar, fz_kbar, ls6_ubar, ls6_z, ls6_zbar, ls6_mh, ls6_aq, ls6_ak, ls6_zk, ls6_fs, ls6_map, H, HV, W, G, R, flags
@@ -730,8 +756,9 @@ void gdn_step(int B,
 #define CASE(KK, VV) CASE_G(KK, VV, 2) CASE_G(KK, VV, 3) CASE_G(KK, VV, 4)
     CASE(128, 128) CASE(64, 128) CASE(32, 128)
     // Qwen3.8 Flash-Next: K=V=128, three value heads per key head.
-    // Compile only this G=128 geometry instead of multiplying the complete
-    // specialization matrix; other geometries still fall back to Triton.
+    // Compile its G=32 and G=128 geometries without multiplying the complete
+    // specialization matrix; other non-Qwen geometries still use old buckets.
+    CASE_T(128, 128, 32, 3)
     CASE_T(128, 128, 128, 3)
 #undef CASE
 #undef CASE_G
@@ -768,7 +795,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_step_rawfs_v9", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_step_rawfs_mh_v11", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_step"], build_directory=bd,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], verbose=False)
     return _EXT
