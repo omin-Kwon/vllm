@@ -126,11 +126,12 @@ def embed_rotation(R, Z, tau=0.5):
     assert Rp.shape == (K, K), Rp.shape
     # ckpt R 는 fp32 직교(~1e-7) — 가장 가까운 직교 행렬(극분해)로 박아 state 공변성
     # (S' = S R′ᵀ)을 fp64 수준으로 되살린다.
-    err0 = float((Rp @ Rp.T - torch.eye(K, dtype=Rp.dtype)).abs().max())
+    eye = torch.eye(K, dtype=Rp.dtype, device=Rp.device)
+    err0 = float((Rp @ Rp.T - eye).abs().max())
     assert err0 < 1e-5, err0
     U_, _, Vh = torch.linalg.svd(Rp)
     Rp = U_ @ Vh
-    err = float((Rp @ Rp.T - torch.eye(K, dtype=Rp.dtype)).abs().max())
+    err = float((Rp @ Rp.T - eye).abs().max())
     assert err < 1e-9, err
     return Rp
 
