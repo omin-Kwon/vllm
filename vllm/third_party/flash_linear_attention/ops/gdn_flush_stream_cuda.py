@@ -184,7 +184,7 @@ gdn_flush_stream_kernel(
     __half* sQh = sT2l + 16 * LDT2;
     __half* sQl = sQh + 2 * LDK;
     __shared__ float sPre[SW], sRep[SW], sBeta[SW], s_red[2 * NTS / 32], s_tot;
-    __shared__ int s_kT;
+    __shared__ int s_kT, s_kQ;
 
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, c = lane & 3;
     const int n_work = n_ptr[0] * HV;
@@ -205,11 +205,6 @@ gdn_flush_stream_kernel(
     int m_reg = (ls6_beta != nullptr && !dense_only) ? ls6_mh[i_hv] : 0;
     long cidx = ls6_map ? (long)ls6_map[sidx] : sidx;
     float beta_reg = (m_reg > 0 && t < SW) ? ls6_beta[cidx * s_beta_slot + (long)i_hv * SW + t] : 0.f;
-    float4 qv = make_float4(0.f, 0.f, 0.f, 0.f), kv = qv;
-    if (m_reg > 0) {
-        qv = *(const float4*)(fz_qbar + cidx * s_fzb_slot + (long)(i_hv / hpg) * SK + 4 * lane);
-        kv = *(const float4*)(fz_kbar + cidx * s_fzb_slot + (long)(i_hv / hpg) * SK + 4 * lane);
-    }
     // ldmatrix lane addressing: rows (lane&7) + 8*hi(lane), columns 8*lo(lane)
     const int l07 = lane & 7, l3 = (lane >> 3) & 1, l4 = lane >> 4;
 
@@ -242,19 +237,10 @@ gdn_flush_stream_kernel(
             if (t < SW) { sPre[t] = pre; sRep[t] = expf(gt - pre); sBeta[t] = beta_reg; }
             if (t == 0) s_tot = expf(gt);
         }
-        const int kQ = scale_exp(warp_max(fmaxf(amax4(qv), amax4(kv))));
         cp_wait<0>();
         __syncthreads();                                            // S1: state + rings landed
         const float tot = s_tot;
-        load_state(acc, sS, warp, g, c);
-        __syncthreads();                                            // S1b: sS, sD[buf^1] free
-        if (has_next) {
-            issue_ring(sD0 + (buf ^ 1) * SW * LDD, LDD, d_cache + sidx_n * s_d_slot + (long)hv_n * SW * SV, t);
-            cp_commit();
-            issue_state(sS, h0 + sidx_n * s_h0_slot + (long)hv_n * s_h0_h, t);
-            cp_commit();
-        }
-        // ── K_r exponent + split; qbar/kbar split ──
+        // ── K_r exponent + split; qbar/kbar split (warp 0) ──
         float mk = 0.f;
         #pragma unroll
         for (int q = 0; q < 2; ++q) {
@@ -274,18 +260,18 @@ gdn_flush_stream_kernel(
             *(uint2*)(sKl + s * LDK + c4) = make_uint2(l0_, l1_);
         }
         if (exact && warp == 0) {
+            const float4 qv = *(const float4*)(fz_qbar + cidx * s_fzb_slot + (long)i_h * SK + 4 * lane);
+            const float4 kv = *(const float4*)(fz_kbar + cidx * s_fzb_slot + (long)i_h * SK + 4 * lane);
+            const int kQ = scale_exp(warp_max(fmaxf(amax4(qv), amax4(kv))));
             const float scQ = ldexpf(1.f, kQ);
             unsigned h0_, l0_, h1_, l1_;
             split_u(qv.x, qv.y, scQ, h0_, l0_); split_u(qv.z, qv.w, scQ, h1_, l1_);
             *(uint2*)(sQh + 4 * lane) = make_uint2(h0_, h1_); *(uint2*)(sQl + 4 * lane) = make_uint2(l0_, l1_);
             split_u(kv.x, kv.y, scQ, h0_, l0_); split_u(kv.z, kv.w, scQ, h1_, l1_);
             *(uint2*)(sQh + LDK + 4 * lane) = make_uint2(h0_, h1_); *(uint2*)(sQl + LDK + 4 * lane) = make_uint2(l0_, l1_);
+            if (lane == 0) s_kQ = kQ;
         }
         __syncthreads();                                            // S3: splits; sKf free
-        if (has_next) {
-            issue_ring(sKf, LDKF, k_cache + sidx_n * s_k_slot + (long)(hv_n / hpg) * SW * SK, t);
-            cp_commit();
-        }
         if (exact) {
             // ── Gamma~[j][s] = beta_s <k_j,k_s> exp(pre_s - pre_j), j < s (warps 0/1: s-tile) ──
             if (warp < 2) {
@@ -341,15 +327,19 @@ gdn_flush_stream_kernel(
             }
             __syncthreads();                                        // S5: T''
         }
+        load_state(acc, sS, warp, g, c);
+        __syncthreads();                                            // S6a: sS, sD[buf^1] free
+        if (has_next) {
+            issue_ring(sKf, LDKF, k_cache + sidx_n * s_k_slot + (long)(hv_n / hpg) * SW * SK, t);
+            issue_ring(sD0 + (buf ^ 1) * SW * LDD, LDD, d_cache + sidx_n * s_d_slot + (long)hv_n * SW * SV, t);
+            cp_commit();
+            issue_state(sS, h0 + sidx_n * s_h0_slot + (long)hv_n * s_h0_h, t);
+            cp_commit();
+            g_reg = (t < SW) ? g_cache[sidx_n * s_g_slot + (long)hv_n * SW + t] : 0.f;
+            beta_reg = (m_n > 0 && t < SW) ? ls6_beta[cidx_n * s_beta_slot + (long)hv_n * SW + t] : 0.f;
+        }
         // ── per warp: P, Y, X (exact) or X = diag(rep) d (dense); fold S_W = tot S_0 + X K_r ──
         float X[2][4];
-        #pragma unroll
-        for (int nt2 = 0; nt2 < 2; ++nt2)
-            #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int s = 8 * nt2 + 2 * c + (e & 1);
-                X[nt2][e] = sD[s * LDD + ROW_OF(e >> 1)] * sRep[s];
-            }
         if (exact) {
             const int kT = s_kT;
             float ms = 0.f;
@@ -386,8 +376,19 @@ gdn_flush_stream_kernel(
                 mma3(Y, ph_, pl_, *(const unsigned*)th, *(const unsigned*)(th + 8),
                      *(const unsigned*)tl, *(const unsigned*)(tl + 8));
                 #pragma unroll
-                for (int e = 0; e < 4; ++e) X[nt2][e] -= Y[e] * fY;
+                for (int e = 0; e < 4; ++e) {
+                    const int s = 8 * nt2 + 2 * c + (e & 1);
+                    X[nt2][e] = sD[s * LDD + ROW_OF(e >> 1)] * sRep[s] - Y[e] * fY;
+                }
             }
+        } else {
+            #pragma unroll
+            for (int nt2 = 0; nt2 < 2; ++nt2)
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int s = 8 * nt2 + 2 * c + (e & 1);
+                    X[nt2][e] = sD[s * LDD + ROW_OF(e >> 1)] * sRep[s];
+                }
         }
         {
             float mx = 0.f;
@@ -427,28 +428,11 @@ gdn_flush_stream_kernel(
             mw = warp_max(mw); ss = warp_sum(ss);
             if (lane == 0) { s_red[warp] = mw; s_red[NTS / 32 + warp] = ss; }
             __syncthreads();                                        // S6: fold done; sD, sGam free
-            float mwb = s_red[0], ssb = s_red[NTS / 32];
+            float mwb = s_red[0];
             #pragma unroll
-            for (int i = 1; i < NTS / 32; ++i) { mwb = fmaxf(mwb, s_red[i]); ssb += s_red[NTS / 32 + i]; }
+            for (int i = 1; i < NTS / 32; ++i) mwb = fmaxf(mwb, s_red[i]);
             const int kW = scale_exp(mwb);
-            const float eta = ridge * ssb / (float)SK;
-            const float scW = ldexpf(1.f, kW), fH = ldexpf(1.f, -(kW + kQ)), scA = ldexpf(1.f, kW - 4);
-            float* pu = ls6_ubar + cidx * s_u_slot + (long)i_hv * G * SV;
-            float* sc = scratch + ((long)r * HV + i_hv) * (R * G + 2 * G);
-            const bool phi_smem = R * m <= SPHI_MAX;
-            float* sPhi = phi_smem ? sD : sc;                      // [R][m] partial sums
-            float* sA = phi_smem ? sGam : sc + R * G;               // [2][R] anchor partials
-            if (do_phi) {
-                if (phi_smem) {
-                    for (int o = t; o < R * m; o += NTS) sPhi[o] = 0.f;
-                    if (t < 2 * R) sA[t] = 0.f;
-                }
-                for (int o = t; o < R * G; o += NTS)
-                    if (!phi_smem || (o % G) >= m) sc[o] = 0.f;
-                if (!phi_smem && t < 2 * G) sc[R * G + t] = 0.f;
-            } else {
-                for (int o = t; o < R * G + 2 * G; o += NTS) sc[o] = 0.f;
-            }
+            const float scW = ldexpf(1.f, kW), fH = ldexpf(1.f, -(kW + s_kQ)), scA = ldexpf(1.f, kW - 4);
             // ── hq/hk = S_W [qbar kbar] → transposed anchor B fragment; Ubar ──
             unsigned bAh[2], bAl[2];
             {
@@ -473,6 +457,7 @@ gdn_flush_stream_kernel(
                     if (c != 0) { h_ = 0u; l_ = 0u; }
                     bAh[hh] = movtrans(h_); bAl[hh] = movtrans(l_);
                 }
+                float* pu = ls6_ubar + cidx * s_u_slot + (long)i_hv * G * SV;
                 #pragma unroll
                 for (int nt = 0; nt < NTMAX8; ++nt)
                     #pragma unroll
@@ -480,57 +465,93 @@ gdn_flush_stream_kernel(
                         const int L = 8 * nt + 2 * c + (e & 1);
                         if (L < m) pu[(long)L * SV + ROW_OF(e >> 1)] = acc[nt][e];
                     }
+                for (int o = m * SV + t; o < G * SV; o += NTS) pu[o] = 0.f;
             }
-            for (int o = m * SV + t; o < G * SV; o += NTS) pu[o] = 0.f;
             store_state(acc, ph, warp, g, c);
+            float ssb = s_red[NTS / 32];
+            #pragma unroll
+            for (int i = 1; i < NTS / 32; ++i) ssb += s_red[NTS / 32 + i];
+            const float eta = ridge * ssb / (float)SK;
+            float* sc = scratch + ((long)r * HV + i_hv) * (R * G + 2 * G);
+            const bool phi_smem = R * m <= SPHI_MAX;
+            float* sPhi = phi_smem ? sD : sc;                      // [R][m] partial sums
+            float* sA = phi_smem ? sGam : sc + R * G;               // [2][R] anchor partials
+            if (do_phi) {
+                if (phi_smem) {
+                    for (int o = t; o < R * m; o += NTS) sPhi[o] = 0.f;
+                    if (t < 2 * R) sA[t] = 0.f;
+                }
+                for (int o = t; o < R * G; o += NTS)
+                    if (!phi_smem || (o % G) >= m) sc[o] = 0.f;
+                if (!phi_smem && t < 2 * G) sc[R * G + t] = 0.f;
+            } else {
+                for (int o = t; o < R * G + 2 * G; o += NTS) sc[o] = 0.f;
+            }
             if (do_phi) {
                 __syncthreads();                                    // S7: partial buffers zeroed
                 // Phi_r += S_W^T [S_W[:, :m] | hq hk] over this warp's 16 rows: transposed
                 // fragments of S_W n-tiles serve as the A (row tile rb) and B (col tile nt) operands.
-                const int NTm8 = (m + 7) >> 3, NR8 = R >> 3;
+                const int NTm8 = (m + 7) >> 3;
                 const float fW = ldexpf(1.f, -2 * kW), fA = ldexpf(1.f, -(2 * kW - 4));
-                unsigned tH[16][2], tL[16][2];
+                const int ldp = phi_smem ? m : G, lda = phi_smem ? R : G;
+                // transposed hi/lo fragments of n-tiles 0..7: B operand and A rows < 64; rows >= 64 (R = 128)
+                // transpose on demand from acc
+                unsigned tH[8][2], tL[8][2];
                 #pragma unroll
-                for (int nt = 0; nt < 16; ++nt)
+                for (int nt = 0; nt < 8; ++nt)
                     #pragma unroll
                     for (int hh = 0; hh < 2; ++hh) {
-                        unsigned h_ = 0u, l_ = 0u;
-                        if (nt < NR8) {
-                            split_u(acc[nt][2 * hh], acc[nt][2 * hh + 1], scW, h_, l_);
-                            h_ = movtrans(h_); l_ = movtrans(l_);
-                        }
-                        tH[nt][hh] = h_; tL[nt][hh] = l_;
+                        unsigned h_, l_;
+                        split_u(acc[nt][2 * hh], acc[nt][2 * hh + 1], scW, h_, l_);
+                        tH[nt][hh] = movtrans(h_); tL[nt][hh] = movtrans(l_);
                     }
                 #pragma unroll
                 for (int rb = 0; rb < 8; ++rb) {
                     if (rb >= R / 16) break;
-                    const unsigned ah[4] = {tH[2 * rb][0], tH[2 * rb + 1][0], tH[2 * rb][1], tH[2 * rb + 1][1]};
-                    const unsigned al[4] = {tL[2 * rb][0], tL[2 * rb + 1][0], tL[2 * rb][1], tL[2 * rb + 1][1]};
-                    float pacc[NTMAX8 + 1][4];
-                    #pragma unroll
-                    for (int nt = 0; nt <= NTMAX8; ++nt)
+                    const int q0 = 2 * (rb & 3);
+                    unsigned ah[4], al[4];
+                    if (rb < 4) {
+                        ah[0] = tH[q0][0]; ah[1] = tH[q0 + 1][0]; ah[2] = tH[q0][1]; ah[3] = tH[q0 + 1][1];
+                        al[0] = tL[q0][0]; al[1] = tL[q0 + 1][0]; al[2] = tL[q0][1]; al[3] = tL[q0 + 1][1];
+                    } else {
                         #pragma unroll
-                        for (int e = 0; e < 4; ++e) pacc[nt][e] = 0.f;
+                        for (int hh = 0; hh < 2; ++hh)
+                            #pragma unroll
+                            for (int q = 0; q < 2; ++q) {
+                                unsigned h_, l_;
+                                split_u(acc[8 + q0 + q][2 * hh], acc[8 + q0 + q][2 * hh + 1], scW, h_, l_);
+                                ah[q + 2 * hh] = movtrans(h_); al[q + 2 * hh] = movtrans(l_);
+                            }
+                    }
                     #pragma unroll
-                    for (int nt = 0; nt < NTMAX8; ++nt)
-                        if (nt < NTm8) mma3(pacc[nt], ah, al, tH[nt][0], tH[nt][1], tL[nt][0], tL[nt][1]);
-                    mma3(pacc[NTMAX8], ah, al, bAh[0], bAh[1], bAl[0], bAl[1]);
-                    const int ldp = phi_smem ? m : G;
-                    #pragma unroll
-                    for (int nt = 0; nt < NTMAX8; ++nt)
+                    for (int half = 0; half < 2; ++half) {
+                        if (4 * half >= NTm8) break;
+                        float pacc[5][4];
                         #pragma unroll
-                        for (int e = 0; e < 4; ++e) {
-                            const int tt = 16 * rb + g + 8 * (e >> 1), gc = 8 * nt + 2 * c + (e & 1);
-                            if (gc < m) atomicAdd(sPhi + tt * ldp + gc, pacc[nt][e] * fW);
+                        for (int nt = 0; nt < 5; ++nt)
+                            #pragma unroll
+                            for (int e = 0; e < 4; ++e) pacc[nt][e] = 0.f;
+                        #pragma unroll
+                        for (int nt = 0; nt < 4; ++nt) {
+                            const int ntg = 4 * half + nt;
+                            if (ntg < NTm8) mma3(pacc[nt], ah, al, tH[ntg][0], tH[ntg][1], tL[ntg][0], tL[ntg][1]);
                         }
-                    if (c == 0) {
-                        const int lda = phi_smem ? R : G;
+                        if (half == 0) mma3(pacc[4], ah, al, bAh[0], bAh[1], bAl[0], bAl[1]);
                         #pragma unroll
-                        for (int hh = 0; hh < 2; ++hh) {
-                            const int tt = 16 * rb + g + 8 * hh;
-                            if (tt < m) {
-                                atomicAdd(sA + tt, pacc[NTMAX8][2 * hh] * fA);
-                                atomicAdd(sA + lda + tt, pacc[NTMAX8][2 * hh + 1] * fA);
+                        for (int nt = 0; nt < 4; ++nt)
+                            #pragma unroll
+                            for (int e = 0; e < 4; ++e) {
+                                const int tt = 16 * rb + g + 8 * (e >> 1), gc = 8 * (4 * half + nt) + 2 * c + (e & 1);
+                                if (gc < m) atomicAdd(sPhi + tt * ldp + gc, pacc[nt][e] * fW);
+                            }
+                        if (half == 0 && c == 0) {
+                            #pragma unroll
+                            for (int hh = 0; hh < 2; ++hh) {
+                                const int tt = 16 * rb + g + 8 * hh;
+                                if (tt < m) {
+                                    atomicAdd(sA + tt, pacc[4][2 * hh] * fA);
+                                    atomicAdd(sA + lda + tt, pacc[4][2 * hh + 1] * fA);
+                                }
                             }
                         }
                     }
@@ -557,15 +578,6 @@ gdn_flush_stream_kernel(
             }
         } else {
             store_state(acc, ph, warp, g, c);
-        }
-        if (has_next) {
-            g_reg = (t < SW) ? g_cache[sidx_n * s_g_slot + (long)hv_n * SW + t] : 0.f;
-            beta_reg = (m_n > 0 && t < SW) ? ls6_beta[cidx_n * s_beta_slot + (long)hv_n * SW + t] : 0.f;
-            qv = make_float4(0.f, 0.f, 0.f, 0.f); kv = qv;
-            if (m_n > 0) {
-                qv = *(const float4*)(fz_qbar + cidx_n * s_fzb_slot + (long)(hv_n / hpg) * SK + 4 * lane);
-                kv = *(const float4*)(fz_kbar + cidx_n * s_fzb_slot + (long)(hv_n / hpg) * SK + 4 * lane);
-            }
         }
         sidx = sidx_n; cidx = cidx_n; m_reg = m_n; buf ^= 1;
     }
@@ -626,7 +638,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_flush_stream_v5", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_flush_stream_v5c", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_flush_stream"], build_directory=bd,
             extra_cuda_cflags=["-O3", "-lineinfo", "-gencode=arch=compute_100f,code=sm_100f"], verbose=False)
     return _EXT
