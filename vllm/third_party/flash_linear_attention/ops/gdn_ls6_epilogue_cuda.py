@@ -50,8 +50,9 @@ __device__ __forceinline__ float xpose32(float (&v)[32], int lane) {
 
 _GRAM_SRC = r"""
 // ───────────── kernel A: block = 256 threads = one (row, hv); parallel part ─────────────
-// dynamic smem: sSr[V][RS] (RS = R+4) | sPhi[R][G] | hq[V] | hk[V] | qb[K] | kb[K]
-// writes scratch: Phi_r[R][G] (+eta on the diagonal, columns >= m zero) and raw anchors [2][G]; U copy.
+// dynamic smem: sSr[V][DS] | sPhi[D][G] | hq[V] | hk[V] | qb[K] | kb[K], D=max(R,G).
+// The first m rows of sPhi are the full M even when m>R; rows [:R] are Phi_r.
+// writes scratch: Phi_D[D][G] (+eta on the diagonal, columns >= m zero) and raw anchors [2][G]; U copy.
 #define NT 256
 template <int K, int V>
 __global__ void __launch_bounds__(NT, 4)
@@ -71,11 +72,11 @@ gdn_ls6_gram_kernel(
     const long cidx = ls6_map ? ls6_map[sidx] : sidx;
     const int h = hv / (HV / H);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    const int RS = R + 4;
+    const int D = max(R, G), RS = D + 4;
     extern __shared__ __align__(16) float dsm[];
     float* sSr = dsm;                          // [V][RS]
-    float* sPhi = sSr + V * RS;                // [R][G]
-    float* hq = sPhi + R * G;                  // [V]
+    float* sPhi = sSr + V * RS;                // [D][G]
+    float* hq = sPhi + D * G;                  // [V]
     float* hk = hq + V;                        // [V]
     float* qb = hk + V;                        // [K]
     float* kb = qb + K;                        // [K]
@@ -108,7 +109,7 @@ gdn_ls6_gram_kernel(
                 sumsq += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
                 part[ii] = x.x * q0 + x.y * q1 + x.z * q2 + x.w * q3;
                 part[NV + ii] = x.x * k0 + x.y * k1 + x.z * k2 + x.w * k3;
-                if (c < R) *((float4*)(sSr + v * RS + c)) = x;
+                if (c < D) *((float4*)(sSr + v * RS + c)) = x;
             }
         }
     }
@@ -125,9 +126,9 @@ gdn_ls6_gram_kernel(
     const float eta = s_eta;
     if (stage == 1) return;
     // ── Phi_r[tt][g] = sum_v S[v][tt] S[v][g] + eta [tt==g]: 4x4 register tiles, symmetric block mirrored ──
-    const int ntile = (R / 4) * (G / 4);
+    const int ntile = (D / 4) * (G / 4);
     for (int o = t; o < ntile; o += NT) {
-        const int tt0 = (o % (R / 4)) * 4, g0 = (o / (R / 4)) * 4;
+        const int tt0 = (o % (D / 4)) * 4, g0 = (o / (D / 4)) * 4;
         const bool mirror = tt0 < G;                     // tile lies in the symmetric M block
         if (g0 >= m) {
             #pragma unroll
@@ -162,14 +163,14 @@ gdn_ls6_gram_kernel(
     __syncthreads();                                     // sPhi complete
     if (stage == 2) return;
     // ── raw anchors: U^T (S qbar) + eta qbar[:m] ──
-    float* sc = scratch + ((long)r_i * HV + hv) * (R * G + 2 * G);
+    float* sc = scratch + ((long)r_i * HV + hv) * (D * G + 2 * G);
     if (t < G) {
         float aq0 = 0.f, ak0 = 0.f;
         if (t < m) {
             for (int v = 0; v < V; ++v) { const float sv = sSr[v * RS + t]; aq0 = fmaf(sv, hq[v], aq0); ak0 = fmaf(sv, hk[v], ak0); }
             aq0 += eta * qb[t]; ak0 += eta * kb[t];
         }
-        sc[R * G + t] = aq0; sc[R * G + G + t] = ak0;
+        sc[D * G + t] = aq0; sc[D * G + G + t] = ak0;
     }
     // ── U copy out: lane -> v (coalesced stores), float4 over g (conflict-free with RS = R+4) ──
     float* pu = ls6_ubar + cidx * s_u_slot + (long)hv * G * V;
@@ -181,7 +182,7 @@ gdn_ls6_gram_kernel(
         pu[(long)(g0 + 2) * V + v] = (g0 + 2 < m) ? x.z : 0.f;
         pu[(long)(g0 + 3) * V + v] = (g0 + 3 < m) ? x.w : 0.f;
     }
-    for (int o = t; o < R * G / 4; o += NT) ((float4*)sc)[o] = ((const float4*)sPhi)[o];
+    for (int o = t; o < D * G / 4; o += NT) ((float4*)sc)[o] = ((const float4*)sPhi)[o];
 }
 
 """
@@ -258,12 +259,13 @@ gdn_ls6_solve_kernel(
     const long cidx = ls6_map ? ls6_map[sidx] : sidx;
     const int h = hv / (HV / H);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    const int GS = G + 1, ncol = (R - m) + 2, NCS = ncol | 1;
+    const int D = max(R, G), tail = max(R - m, 0);
+    const int GS = G + 1, ncol = tail + 2, NCS = ncol | 1;
     extern __shared__ __align__(16) float dsm[];
     float* sM = dsm;                           // [G][GS]
     float* sX = sM + G * GS;                   // [m][NCS]
     __shared__ float s_rd[128];                // 1 / Cholesky diagonal
-    const float* sc = scratch + ((long)r_i * HV + hv) * (R * G + 2 * G);
+    const float* sc = scratch + ((long)r_i * HV + hv) * (D * G + 2 * G);
     const int m4 = (m + 3) & ~3;                     // padded with identity rows/cols: static 4-wide panels
     for (int o = t; o < m4 * m4; o += NTB) {
         const int i = o / m4, j = o % m4;
@@ -271,7 +273,7 @@ gdn_ls6_solve_kernel(
     }
     for (int o = t; o < m * ncol; o += NTB) {
         const int i = o / ncol, c = o % ncol;
-        sX[i * NCS + c] = (c < R - m) ? sc[(m + c) * G + i] : sc[R * G + (c - (R - m)) * G + i];
+        sX[i * NCS + c] = (c < tail) ? sc[(m + c) * G + i] : sc[D * G + (c - tail) * G + i];
     }
     __syncthreads();
     if (stage == 4) { if (t == 0) ls6_aq[cidx * s_a_slot + hv * G] = sX[0]; return; }
@@ -348,7 +350,8 @@ gdn_ls6_solve_kernel(
         if (t < m) {
             const float* pq = fz_qbar + cidx * s_fzb_slot + h * K;
             const float* pk = fz_kbar + cidx * s_fzb_slot + h * K;
-            aq = sX[t * NCS + (R - m)] - pq[t]; ak = sX[t * NCS + (R - m) + 1] - pk[t];       // identity block: - qbar[t]
+            aq = sX[t * NCS + tail] - ((t < R) ? pq[t] : 0.f);
+            ak = sX[t * NCS + tail + 1] - ((t < R) ? pk[t] : 0.f);  // truncated identity block
             #pragma unroll 4
             for (int tt = m; tt < R; ++tt) { const float pv = sX[t * NCS + (tt - m)]; aq = fmaf(-pv, pq[tt], aq); ak = fmaf(-pv, pk[tt], ak); }
         }
@@ -365,11 +368,12 @@ void gdn_ls6_epilogue(torch::Tensor h0, torch::Tensor rows, torch::Tensor n_ptr,
     torch::Tensor ls6_aq, torch::Tensor ls6_ak, torch::Tensor scratch, int max_rows, int H, int HV, int K, int V, int G, int R, double ridge, int stage)
 {
     TORCH_CHECK(K == 128 && V == 128, "epilogue: K=V=128 only");
-    TORCH_CHECK(G >= 4 && G <= 128 && R >= G && R <= K && R % 4 == 0, "epilogue: G/R");
-    TORCH_CHECK(scratch.numel() >= (long)max_rows * HV * (R * G + 2 * G), "epilogue: scratch too small");
-    const size_t smemA = (size_t)(V * (R + 4) + R * G + 2 * V + 2 * K) * 4;
+    TORCH_CHECK(G >= 4 && G <= 128 && R >= 4 && R <= K && R % 4 == 0, "epilogue: G/R");
+    const int D = std::max(R, G);
+    TORCH_CHECK(scratch.numel() >= (long)max_rows * HV * (D * G + 2 * G), "epilogue: scratch too small");
+    const size_t smemA = (size_t)(V * (D + 4) + D * G + 2 * V + 2 * K) * 4;
     int maxX = 0;
-    for (int m = 1; m <= G; ++m) maxX = std::max(maxX, m * (((R - m) + 2) | 1));
+    for (int m = 1; m <= G; ++m) maxX = std::max(maxX, m * ((std::max(R - m, 0) + 2) | 1));
     const size_t smemB = (size_t)(G * (G + 1) + maxX) * 4;
     auto st = at::cuda::getCurrentCUDAStream().stream();
     static size_t attrA = 0, attrB = 0;
@@ -411,7 +415,7 @@ def _ext():
                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gdn_step_build"))
         os.makedirs(bd, exist_ok=True)
         _EXT = load_inline(
-            name="ns_gdn_ls6_epilogue_v12", cpp_sources=_CPP, cuda_sources=_SRC,
+            name="ns_gdn_ls6_epilogue_v13", cpp_sources=_CPP, cuda_sources=_SRC,
             functions=["gdn_ls6_epilogue"], build_directory=bd,
             extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
     return _EXT
@@ -458,7 +462,8 @@ def gdn_ls6_epilogue(h0, rows, n_ptr, ls6_map, fz_qbar, fz_kbar, ls6_mh, ls6_uba
         raise TypeError("gdn_ls6_epilogue: rows/n_ptr/ls6_mh must be int32")
     if tuple(ls6_phi.shape[1:]) != (HV, G, R):
         raise ValueError(f"ls6_phi shape {tuple(ls6_phi.shape)} != (NS,{HV},{G},{R})")
-    scratch = torch.empty(int(max_rows) * HV * (R * G + 2 * G), dtype=torch.float32, device=h0.device)
+    D = max(R, G)
+    scratch = torch.empty(int(max_rows) * HV * (D * G + 2 * G), dtype=torch.float32, device=h0.device)
     _ext().gdn_ls6_epilogue(h0, rows, n_ptr, ls6_map, fz_qbar, fz_kbar, ls6_mh, ls6_ubar, ls6_phi,
                             ls6_aq, ls6_ak, scratch, int(max_rows), H, HV, K, V, G, R,
                             ls6_ridge() if ridge is None else float(ridge),
