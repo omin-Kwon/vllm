@@ -13,20 +13,23 @@ gdn_flush_cuda}.py, v8e+map)은 이미 래치 산술을 다 갖고 있다. 여�
           나누고 그룹마다 블록표가 달라 같은 요청이 층마다 다른 블록 번호를 받는다. 전역
           배정표 하나를 leader 블록 번호로 채우면 다른 그룹 층은 미배정(행 0)을 읽는다 —
           2026-09-02 e2e 에서 완전 기저가 plain 과 안 맞던 원인.
-  ③ prefill 시딩  Ū = S Z̄, q̄/k̄ = 마지막 ≤W 토큰 평균(창끝 규약), aq/ak = Zᵀq̄/Zᵀk̄,
-          fz_u/z = S q̄_cold. prefill 청크마다 정확한 state 에서 다시 시딩한다.
-  ④ decode 부기  창 합 누적 → flush 행(write_pos==W-1)에서 q̄ ← (1-λ)q̄ + λ·mean,
-          aq/ak 재계산. **커널 호출 앞**에서 한다(flush 가 다음 창의 u/z 를 새 앵커로 쓴다).
+  ③ prefill 시딩  q̄/k̄ = 마지막 ≤W 토큰 평균(창끝 규약), 그 다음 Φ̄ 에필로그 커널
+          (gdn_ls6_epilogue_cuda)이 정확한 state 에서 Ū = S[:, :G]ᵀ, Φ̄ = Φ_η M_η⁻¹,
+          꼬리 앵커 a_q/a_k 를 만든다. fz_u/z = S q̄_cold 는 여기서. prefill 청크마다 다시.
+  ④ decode 부기  창 합 누적 → flush 행(write_pos==W-1)에서 q̄ ← (1-λ)q̄ + λ·mean.
+          **커널 호출 앞**에서 한다(flush 뒤 에필로그가 이 q̄ 로 다음 창 앵커를 만든다).
           전부 고정 형상 device 연산 — CUDA 그래프에 그대로 잡힌다.
   ⑤ decode에서는 상태 의존 delta가 아니라 raw-WY write u_s와 projected factor f_s를
           저장한다. 따라서 checkpoint 근사는 output에만 쓰이고 write에는 들어가지 않는다.
   ⑥ 혼합 웨이브(prefill+decode)의 decode 행도 링 커널로 보낸다 — dense 갱신으로 보내면
           write_pos 는 전진하는데 링은 비어 있어 다음 flush 가 틀린다.
 
-기저: 배분기의 Ω 열은 E-직교(유클리드 직교가 아니다). 커널은 Z̄ 를 k-head 당 하나만
-받고 같은 그룹의 v-head 들이 각자 m_h 만큼 앞 열을 쓰므로, Z = QR(Ω[:, :m_g]) 의 Q 로
-바꿔 싣는다 — 접두 span 이 보존되고 직교라 Z̄ = Z 가 모든 m_h 에서 맞는다(Super 의
-bake_super_embed 와 같은 처리).
+기저: 배분기의 Ω 열은 E-직교(유클리드 직교가 아니다). Z = QR(Ω[:, :m_g]) 의 Q 로
+접두 span 을 보존한 직교 기저를 만들고, 그것을 회전에 **박는다**:
+R′ = [Zᵀ R ; GS(나머지 R 행, 중요도 순)]. 그러면 R′ 좌표에서 Ω = I[:, :G] 라 커널은
+기저 행렬 없이 앞 G 좌표만 읽는다 (ls6_z/zbar/zk 없음). 같은 그룹 v-head 의 m_h ≤ m_g
+는 앞 m_h 좌표를 쓴다. Φ̄ (K×G, 앞 r 행만 저장) 은 metric-ridge 계수 사상이며 fp32
+Cholesky 로 flush 에필로그에서 만든다 (ridge NS_GDN_LS6_RIDGE, 기본 0.1·tr(E₀)/K).
 
 켜기: NS_GDN_LS6=<q38fn_ls6_*_dn.pt>  (--use-replayssm, state fp32 필수)
   NS_GDN_LS6_NSLOT   compact 슬롯 수 (기본 max_num_seqs+8)
@@ -95,6 +98,41 @@ class _Shared:
 
 
 _LEADER = [None]          # 로그·진단 카운터용 첫 활성 층
+
+
+def embed_rotation(R, Z, tau=0.5):
+    """R′ = [Zᵀ R ; GS(나머지 R 행)] (fp64, CPU).
+
+    Ω 가 이미 거의 담은 행(잔차 노름 < tau)은 뒤로 미룬다 — 잡음 방향이 앞(고중요도)
+    r 행에 끼지 않게. R (K,K) 행=방향 중요도 순, Z (K,m) 직교, R 좌표.
+    """
+    K, m = Z.shape
+    top = Z.T @ R                                       # (m,K)
+    res = R - (R @ Z) @ Z.T
+    rn = res.norm(dim=1)
+    order = [i for i in range(K) if rn[i] >= tau] + [i for i in range(K) if rn[i] < tau]
+    rows = [top[g] for g in range(m)]
+    for i in order:
+        if len(rows) == K:
+            break
+        v = R[i].clone()
+        for _ in range(2):                              # MGS 두 번: 잔차가 작아도 직교 유지
+            for u in rows:
+                v = v - (u @ v) * u
+        n = v.norm()
+        if n > 1e-6:
+            rows.append(v / n)
+    Rp = torch.stack(rows)
+    assert Rp.shape == (K, K), Rp.shape
+    # ckpt R 는 fp32 직교(~1e-7) — 가장 가까운 직교 행렬(극분해)로 박아 state 공변성
+    # (S' = S R′ᵀ)을 fp64 수준으로 되살린다.
+    err0 = float((Rp @ Rp.T - torch.eye(K, dtype=Rp.dtype)).abs().max())
+    assert err0 < 1e-5, err0
+    U_, _, Vh = torch.linalg.svd(Rp)
+    Rp = U_ @ Vh
+    err = float((Rp @ Rp.T - torch.eye(K, dtype=Rp.dtype)).abs().max())
+    assert err < 1e-9, err
+    return Rp
 
 
 def configure_layer(layer, prefix: str, vllm_config=None):
@@ -167,12 +205,20 @@ def configure_layer(layer, prefix: str, vllm_config=None):
         Q = Q * torch.sign(torch.diagonal(Rq)).clamp(min=0).mul(2).sub(1)[None, :]
         Z[h, :, :m_g] = Q
     dev = torch.device("cuda")
-    R = d[li].float()                                   # (HK,K,K) 행=방향
+    R0 = d[li].double()                                 # (HK,K,K) 행=방향
+    R = torch.empty_like(R0)
+    ovl = []
+    for h in range(HK):
+        m_g = int(mg[h])
+        R[h] = embed_rotation(R0[h], Z[h, :, :m_g]) if m_g > 0 else R0[h]
+        if m_g > 0:
+            ovl.append(float((Z[h, :r, :m_g] ** 2).sum() / m_g))
+    bad = ((mt == 0) & (nf != K)) | ((mt > 0) & (nf != 0))
+    if bool(bad.any()):
+        raise ValueError(f"층 {li}: Φ̄ 경로는 nf ∈ {{0(래치), K(dense)}} 만 — nf={nf.tolist()} m={mt.tolist()}")
     layer._ls6 = dict(
         li=li, K=K, V=V, W=W, r=r, rep=rep, HK=HK, HV=HV, G=G,
-        R=R.to(dev),
-        Z=Z.float().to(dev).contiguous(), Zbar=Z.float().to(dev).contiguous(),
-        Zrep=Z.float().repeat_interleave(rep, 0).to(dev).contiguous(),        # (HV,K,G)
+        R=R.float().to(dev).contiguous(),
         mh=mt.to(torch.int32).to(dev).contiguous(), nf=nf.to(torch.int32).to(dev).contiguous(),
         cold=(torch.arange(K, device="cpu")[None, :] >= nf[:, None]).float().to(dev),         # (HV,K)
         ns_env=int(os.environ.get("NS_GDN_LS6_NSLOT", "0")),
@@ -185,8 +231,9 @@ def configure_layer(layer, prefix: str, vllm_config=None):
     if _LEADER[0] is None:
         _LEADER[0] = prefix
     layer._ls6_leader = _LEADER[0] == prefix
-    logger.info("[ls6] %s: ckpt 층 %d  래치 head %d/%d  m max %d  G %d  r %d  W %d%s",
-                prefix, li, int((mt > 0).sum()), HV, max_m, G, r, W, "  (leader)" if layer._ls6_leader else "")
+    logger.info("[ls6] %s: ckpt 층 %d  래치 head %d/%d  m max %d  G %d  r %d  W %d  Ω∩R[:r] %.2f..%.2f%s",
+                prefix, li, int((mt > 0).sum()), HV, max_m, G, r, W, min(ovl), max(ovl),
+                "  (leader)" if layer._ls6_leader else "")
 
 
 # ─────────────────────────── ① 회전 ───────────────────────────
@@ -229,8 +276,8 @@ def _bufs(layer, ssm_state):
     f32 = dict(dtype=torch.float32, device=dev)
     b = dict(
         ubar=torch.zeros(NS, HV, G, V, **f32),
+        phi=torch.zeros(NS, HV, G, L6["r"], **f32),
         aq=torch.zeros(NS, HV, G, **f32), ak=torch.zeros(NS, HV, G, **f32),
-        zk=torch.zeros(NS, HK, W, G, **f32),
         fs=torch.zeros(NS, HV, W, G, **f32),
         beta=torch.zeros(NS, HV, W, **f32),
         fz_u=torch.zeros(NS, HV, V, **f32), fz_z=torch.zeros(NS, HV, V, **f32),
@@ -311,15 +358,19 @@ def seed_prefill(layer, ssm_state, pf_idx, has_init, mixed_pf, cu_seqlens, scale
     b["qacc"][c] = 0
     b["kacc"][c] = 0
     b["cnt"][c] = 0
-    Z = L6["Z"]
-    b["aq"][c] = torch.einsum("hkg,nhk->nhg", Z, qbar).repeat_interleave(rep, 1)
-    b["ak"][c] = torch.einsum("hkg,nhk->nhg", Z, kbar).repeat_interleave(rep, 1)
+    from vllm.third_party.flash_linear_attention.ops.gdn_ls6_epilogue_cuda import (
+        gdn_ls6_epilogue)
+
+    n = int(x.shape[0])
+    gdn_ls6_epilogue(
+        ssm_state, pf_idx.to(torch.int32).contiguous(),
+        torch.tensor([n], dtype=torch.int32, device=x.device), sh.map,
+        b["qbar"], b["kbar"], L6["mh"], b["ubar"], b["phi"], b["aq"], b["ak"],
+        n, HK, L6["HV"], K, L6["V"], L6["G"], L6["r"])
     S = ssm_state[x].float()                                                 # (n,HV,V,K)
-    b["ubar"][c] = torch.einsum("nhvk,hkg->nhgv", S, L6["Zrep"])
     cold = L6["cold"]
     b["fz_u"][c] = torch.einsum("nhvk,nhk->nhv", S, qbar.repeat_interleave(rep, 1) * cold)
     b["fz_z"][c] = torch.einsum("nhvk,nhk->nhv", S, kbar.repeat_interleave(rep, 1) * cold)
-    b["zk"][c] = 0
     b["fs"][c] = 0
     b["beta"][c] = 0
     del S
@@ -363,9 +414,6 @@ def decode_bookkeep(
     b["qacc"][c] = torch.where(f3, torch.zeros_like(qb), b["qacc"][c])
     b["kacc"][c] = torch.where(f3, torch.zeros_like(kb), b["kacc"][c])
     b["cnt"][c] = torch.where(fl, torch.zeros_like(cnt[:, 0, 0]), b["cnt"][c])
-    Z = L6["Z"]
-    b["aq"][c] = torch.einsum("hkg,thk->thg", Z, qb).repeat_interleave(rep, 1)
-    b["ak"][c] = torch.einsum("hkg,thk->thg", Z, kb).repeat_interleave(rep, 1)
     return kernel_kwargs(layer, ssm_state)
 
 
@@ -376,8 +424,8 @@ def kernel_kwargs(layer, ssm_state):
     L6 = layer._ls6
     b = _bufs(layer, ssm_state)
     return dict(
-        ls6_ubar=b["ubar"], ls6_z=L6["Z"], ls6_zbar=L6["Zbar"], ls6_aq=b["aq"], ls6_ak=b["ak"],
-        ls6_mh=L6["mh"], ls6_zk=b["zk"], ls6_fs=b["fs"],
+        ls6_ubar=b["ubar"], ls6_phi=b["phi"], ls6_aq=b["aq"], ls6_ak=b["ak"],
+        ls6_mh=L6["mh"], ls6_fs=b["fs"],
         ls6_r=L6["r"], ls6_map=layer._ls6_sh.map,
         ls6_beta=b["beta"],
         fz_nf=L6["nf"], fz_u=b["fz_u"], fz_z=b["fz_z"], fz_qbar=b["qbar"], fz_kbar=b["kbar"],
@@ -386,7 +434,7 @@ def kernel_kwargs(layer, ssm_state):
 
 # ─────────────────────────── 진단: 층별 dense 대조 ───────────────────────────
 # NS_GDN_LS6_CHECK=1 이면 decode 스텝마다 같은 입력을 **LS6 없이**(dense, 행 복사본) 한 번 더
-# 돌려 층별 |Δ| 를 로그한다. 완전 기저(m=K, r=K, Z=I) 면 0 에 가까워야 한다. eager 전용.
+# 돌려 층별 |Δ| 를 로그한다. 완전 기저(m=G=r=K) 면 0 에 가까워야 한다. eager 전용.
 CHECK = bool(os.environ.get("NS_GDN_LS6_CHECK", ""))
 _CHK_STEPS = int(os.environ.get("NS_GDN_LS6_CHECK_STEPS", "40"))
 _chk_n = [0]
@@ -418,11 +466,13 @@ def check_begin(layer, ssm_state, d_cache, k_cache, g_cache, mixed, a, b, idx, w
     _gdn(mixed_qkv=mixed, a=a, b=b, A_log=layer.A_log, dt_bias=layer.dt_bias, scale=scale, initial_state=S,
          d_cache=D, k_cache=Kc, g_cache=G, out=out, ssm_state_indices=ridx, write_pos=write_pos,
          use_qk_l2norm_in_kernel=True)
-    # 버퍼 일관성: Ū 는 flush 사이에 S·Z̄ 여야 한다 (state 는 flush 에서만 바뀐다)
+    # 버퍼 일관성: Ū 는 flush 사이에 S[:, :G]ᵀ 여야 한다 (state 는 flush 에서만 바뀐다)
     L6 = layer._ls6
     b_ = _bufs(layer, ssm_state)
     c = layer._ls6_sh.map[xc].long()
-    ue = torch.einsum("nhvk,hkg->nhgv", S[1:], L6["Zrep"])
+    G = L6["G"]
+    ue = S[1:, :, :, :G].transpose(-1, -2) * (
+        torch.arange(G, device=S.device)[None, :] < L6["mh"][:, None])[None, :, :, None]
     du = ((b_["ubar"][c] - ue).flatten(1).abs().max(1).values / ue.flatten(1).abs().max(1).values.clamp(min=1e-6))
     return dict(S=S, out=out, x=x, valid=valid, wp=write_pos, step=_chk_n[0], du=du[valid].tolist(), c=c.tolist())
 

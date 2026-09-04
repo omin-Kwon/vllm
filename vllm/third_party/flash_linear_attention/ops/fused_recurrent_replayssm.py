@@ -1251,6 +1251,10 @@ def fused_recurrent_gated_delta_rule_replayssm(
     ls6_mh: torch.Tensor | None = None,
     # v2 전용: zk 링 (NX,H,W,G) = Z̄ᵀk̂_s. 스텝이 쓰고 flush 의 Ū 재귀가 읽는다.
     ls6_zk: torch.Tensor | None = None,
+    # [nested_ssm 2026-09-04] Φ̄ 경로(논문 LS 계수). ls6_phi (NS,HV,G,r) = Φ̄[:r]ᵀ 를 주면
+    #   ls6_z/zbar/zk 는 없어야 하고, 스텝은 gdn_step_phi_cuda, flush 뒤 gdn_ls6_epilogue 가
+    #   Ū·Φ̄·앵커를 다시 만든다. CUDA 전용(Triton 되돌림 없음).
+    ls6_phi: torch.Tensor | None = None,
     # v2 exact-flush: delta-rule beta ring used to turn raw writes into exact
     # checkpoint deltas immediately before the ordinary decay-plus-delta fold.
     ls6_beta: torch.Tensor | None = None,
@@ -1389,13 +1393,25 @@ def fused_recurrent_gated_delta_rule_replayssm(
             "일부만 주면 프리즈가 조용히 빠진 채 돈다.")
     _fz_on = _n_fz == 3
     _n_v2 = sum(t is not None for t in (fz_qbar, fz_kbar))
-    _ls6_t = (ls6_ubar, ls6_z, ls6_zbar, ls6_aq, ls6_ak, ls6_fs, ls6_mh)
+    _ls6_phi = ls6_phi is not None
+    if _ls6_phi:
+        if any(t is not None for t in (ls6_z, ls6_zbar, ls6_zk)):
+            raise ValueError("ls6_phi(Φ̄ 경로)와 ls6_z/zbar/zk(Z 경로)는 같이 줄 수 없다")
+        _ls6_t = (ls6_ubar, ls6_phi, ls6_aq, ls6_ak, ls6_fs, ls6_mh)
+    else:
+        _ls6_t = (ls6_ubar, ls6_z, ls6_zbar, ls6_aq, ls6_ak, ls6_fs, ls6_mh)
     _n_ls6 = sum(t is not None for t in _ls6_t)
     if _n_ls6 not in (0, len(_ls6_t)):
         raise ValueError(
-            "LS6 인자는 일곱을 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
+            "LS6 인자는 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
             f"조용히 틀린 값이 나온다 (지금 {_n_ls6}/{len(_ls6_t)})")
     _ls6_on = _n_ls6 == len(_ls6_t)
+    if _ls6_phi and (
+        os.environ.get("NS_GDN_STEP_IMPL", "cuda") != "cuda"
+        or os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") != "cuda"
+        or os.environ.get("NS_GDN_KERNEL", "v2") != "v2"
+    ):
+        raise ValueError("Φ̄ 경로(ls6_phi)는 v2 CUDA step/flush 전용이다")
     _ls6_g = int(ls6_ubar.shape[-2]) if _ls6_on else 1
     _ls6_r = int(ls6_r) if _ls6_on else 0
     _corr_t = (ls6_beta,)
@@ -1417,7 +1433,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
         )
     _ls6_exact = _ls6_on
     _zk_refresh = (
-        _ls6_on and os.environ.get("NS_GDN_ZK_REFRESH", "1") == "1"
+        _ls6_on and not _ls6_phi
+        and os.environ.get("NS_GDN_ZK_REFRESH", "1") == "1"
     )
     if _ls6_exact and _n_corr != len(_corr_t):
         raise ValueError(
@@ -1489,7 +1506,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
         if ls6_map.shape[0] < initial_state.shape[0]:
             raise ValueError(f"ls6_map 길이 {ls6_map.shape[0]} < NX={initial_state.shape[0]}")
         for _nm, _t in (("ls6_ubar", ls6_ubar), ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak),
-                        ("ls6_zk", ls6_zk), ("ls6_fs", ls6_fs), ("ls6_beta", ls6_beta),
+                        ("ls6_zk", ls6_zk), ("ls6_phi", ls6_phi), ("ls6_fs", ls6_fs), ("ls6_beta", ls6_beta),
                         ("fz_u", fz_u), ("fz_z", fz_z),
                         ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar)):
             if _t is not None and _t.shape[0] != ls6_ubar.shape[0]:
@@ -1497,11 +1514,15 @@ def fused_recurrent_gated_delta_rule_replayssm(
     if _kv == "v2":
         if _ls6_erase:
             raise ValueError("LS6_ERASE 는 v2 에 없다 — NS_GDN_KERNEL=v1 로 돌릴 것")
-        if _ls6_on and ls6_zk is None:
+        if _ls6_on and not _ls6_phi and ls6_zk is None:
             raise ValueError("v2 LS6 는 ls6_zk (NX,H,W,G) 링이 필요하다 — 없으면 Ū 가 조용히 틀린다")
-        if _ls6_on and tuple(ls6_zk.shape) != (ls6_ubar.shape[0], H, max_cache_len, _ls6_g):
+        if _ls6_on and not _ls6_phi and tuple(ls6_zk.shape) != (ls6_ubar.shape[0], H, max_cache_len, _ls6_g):
             raise ValueError(f"ls6_zk 형상 {tuple(ls6_zk.shape)} != (NX,H,W,G)="
                              f"{(ls6_ubar.shape[0], H, max_cache_len, _ls6_g)}")
+        if _ls6_phi and (tuple(ls6_phi.shape) != (ls6_ubar.shape[0], HV, _ls6_g, _ls6_r)
+                         or not ls6_phi.is_contiguous() or ls6_phi.dtype != torch.float32):
+            raise ValueError(f"ls6_phi 형상 {tuple(ls6_phi.shape)} != (NS,HV,G,r)="
+                             f"{(ls6_ubar.shape[0], HV, _ls6_g, _ls6_r)} 또는 비연속/비fp32")
         if _ls6_on and tuple(ls6_fs.shape) != (ls6_ubar.shape[0], HV, max_cache_len, _ls6_g):
             raise ValueError(f"ls6_fs 형상 {tuple(ls6_fs.shape)} != (NX,HV,W,G)="
                              f"{(ls6_ubar.shape[0], HV, max_cache_len, _ls6_g)}")
@@ -1557,8 +1578,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
         _common = dict(
             stride_fz_slot=(fz_u.stride(0) if _fz_on else 0),
             stride_fzb_slot=(fz_qbar.stride(0) if _fz_v2 else 0),
-            stride_ls6_zk_slot=(ls6_zk.stride(0) if _ls6_on else 0),
-            ls6_zk=ls6_zk if _ls6_on else mixed_qkv,
+            stride_ls6_zk_slot=(ls6_zk.stride(0) if _ls6_on and not _ls6_phi else 0),
+            ls6_zk=ls6_zk if _ls6_on and not _ls6_phi else mixed_qkv,
             stride_ls6_u_slot=(ls6_ubar.stride(0) if _ls6_on else 0),
             stride_init_state_token=initial_state.stride(0),
             stride_state_h=initial_state.stride(1),
@@ -1572,7 +1593,23 @@ def fused_recurrent_gated_delta_rule_replayssm(
             FZ_V2=_fz_v2, LS6_ON=_ls6_on, LS6_G=_ls6_g)
         _brs2 = os.environ.get("NS_GDN_BR", "")
         _step_cuda = False
-        if _brs2 != "2" and os.environ.get("NS_GDN_STEP_IMPL", "cuda") == "cuda":
+        if _brs2 != "2" and _ls6_phi:
+            # Φ̄ 경로 스텝(CUDA 전용) — gdn_step_phi_cuda.py 머리말.
+            from .gdn_step_phi_cuda import gdn_step_cuda as _step_phi
+            from .gdn_step_phi_cuda import gdn_step_supported as _step_phi_ok
+            _why = _step_phi_ok(mixed_qkv, out, initial_state, d_cache, k_cache, g_cache,
+                                ssm_state_indices, write_pos, H, HV, K, V, max_cache_len, _ls6_g, True, _ls6_r)
+            if _why is not None:
+                raise RuntimeError(f"Φ̄ 경로인데 CUDA step이 지원되지 않는다: {_why}")
+            _step_cuda = True
+            _step_phi(
+                B, mixed_qkv, a, b, A_log, dt_bias, out, initial_state, d_cache, k_cache, g_cache,
+                ssm_state_indices, write_pos, scale,
+                fz_nf if _fz_on else None, fz_u if _fz_on else None, fz_z if _fz_on else None,
+                ls6_ubar, ls6_phi, ls6_mh, ls6_aq, ls6_ak, ls6_fs,
+                H, HV, K, V, max_cache_len, _ls6_g, _ls6_r, use_qk_l2norm_in_kernel,
+                os.environ.get("NS_GDN_EVICT", "1") == "1", ls6_map=ls6_map)
+        elif _brs2 != "2" and os.environ.get("NS_GDN_STEP_IMPL", "cuda") == "cuda":
             # CUDA 스텝(기본). Triton 판은 226~253 reg 로 점유 12.5% 지연 바운드였다 — gdn_step_cuda.py 머리말.
             from .gdn_step_cuda import gdn_step_cuda, gdn_step_supported
             _why = gdn_step_supported(mixed_qkv, out, initial_state, d_cache, k_cache, g_cache,
@@ -1643,6 +1680,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
                 )
                 if _flush_why is None:
                     _flush_cuda = True
+                elif _ls6_phi:
+                    raise RuntimeError(f"Φ̄ 경로인데 CUDA flush가 지원되지 않는다: {_flush_why}")
                 elif not _FLUSH_FALLBACK_WARNED.get(_flush_why):
                     if _ls6_on and not _ls6_g_pow2:
                         raise RuntimeError(
@@ -1691,7 +1730,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
                         else _gdn_v2_raw_to_delta_kernel
                     )
                 _ubar_triton = (
-                    _ls6_on
+                    _ls6_on and not _ls6_phi
                     and os.environ.get("NS_GDN_UBAR_TRITON", "1") == "1"
                 )
                 _grid = int(os.environ.get("NS_GDN_FLUSH_GRID", "0")) or _sm_count() * 4
@@ -1771,13 +1810,20 @@ def fused_recurrent_gated_delta_rule_replayssm(
                         fz_z if _fz_v2 else None,
                         fz_qbar if _fz_v2 else None,
                         fz_kbar if _fz_v2 else None,
-                        ls6_ubar if _ls6_on and not _ubar_triton else None,
-                        ls6_zk if _ls6_on and not _ubar_triton else None,
+                        ls6_ubar if _ls6_on and not _ubar_triton and not _ls6_phi else None,
+                        ls6_zk if _ls6_on and not _ubar_triton and not _ls6_phi else None,
                         None, H, HV, K, V, max_cache_len, _ls6_g,
                         ls6_map=ls6_map,
                         ls6_mh=ls6_mh if _ls6_on else None,
                         ls6_beta=ls6_beta if _exact_in_fold else None,
                     )
+                if _ls6_phi:
+                    # 새 S_W 에서 Ū 사본·Φ̄[:r]ᵀ·꼬리 앵커를 다시 만든다(래치 head 만).
+                    from .gdn_ls6_epilogue_cuda import gdn_ls6_epilogue
+                    gdn_ls6_epilogue(
+                        initial_state, _flist, _flist[B:], ls6_map, fz_qbar, fz_kbar,
+                        ls6_mh, ls6_ubar, ls6_phi, ls6_aq, ls6_ak, B,
+                        H, HV, K, V, _ls6_g, _ls6_r)
                 # Ubar depends on corrected d but not on S0, so run it only
                 # after the latency-critical correction/fold locality pair.
                 if _ubar_triton:
