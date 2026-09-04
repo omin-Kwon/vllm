@@ -432,7 +432,25 @@ def gdn_ls6_epilogue(h0, rows, n_ptr, ls6_map, fz_qbar, fz_kbar, ls6_mh, ls6_uba
         fz_qbar/fz_kbar: (NS,H,K) window means (rotated); ls6_mh: (HV,) latch widths.
         ls6_ubar (NS,HV,G,V), ls6_phi (NS,HV,G,R), ls6_aq/ak (NS,HV,G): outputs.
     """
-    for nm, tt in (("h0", h0), ("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar), ("ls6_ubar", ls6_ubar),
+    # vLLM packs every layer state into a larger cache page.  The (HV,V,K)
+    # payload is dense, but consecutive sequence rows have the page stride,
+    # so the layer view is intentionally not globally contiguous.  The CUDA
+    # kernel accepts that layout through s_h0_slot/s_h0_h.
+    h0_dense_tail = (
+        h0.dtype == torch.float32
+        and h0.dim() == 4
+        and tuple(h0.shape[1:]) == (HV, V, K)
+        and h0.stride(3) == 1
+        and h0.stride(2) == K
+        and h0.stride(1) == V * K
+        and h0.stride(0) % 4 == 0
+    )
+    if not h0_dense_tail:
+        raise TypeError(
+            "gdn_ls6_epilogue: h0 must be fp32 with a dense (HV,V,K) "
+            f"tail; shape={tuple(h0.shape)} stride={h0.stride()} dtype={h0.dtype}"
+        )
+    for nm, tt in (("fz_qbar", fz_qbar), ("fz_kbar", fz_kbar), ("ls6_ubar", ls6_ubar),
                    ("ls6_phi", ls6_phi), ("ls6_aq", ls6_aq), ("ls6_ak", ls6_ak)):
         if tt.dtype != torch.float32 or not tt.is_contiguous():
             raise TypeError(f"gdn_ls6_epilogue: {nm} must be contiguous fp32 ({tt.dtype})")
