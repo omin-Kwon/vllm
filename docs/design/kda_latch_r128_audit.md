@@ -3,6 +3,10 @@
 Date: 2026-09-05. Paper snapshot: `latchssm_paper@1f461a9`.
 Engine base: `glm53-baseline@e3aedf6003`. Work branch: `kda-latch-r128`.
 
+This document records the first standalone implementation. The subsequent
+[experimental GLM engine adapter](kda_latch_glm_engine.md) documents the resumed
+serving integration and its additional validation and limitations.
+
 ## Scope and acceptance
 
 The accuracy baseline is the existing dense KDA model with ReplaySSM OFF.

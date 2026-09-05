@@ -238,6 +238,141 @@ class TestKDALatch(unittest.TestCase):
             poisoned.step(q[t], k[t], v[t], g[t], b[t], a, bias)
         self.assertTrue(torch.equal(clean.state, poisoned.state))
 
+    def test_partial_flush_handoff_uses_raw_ring_and_is_idempotent(self):
+        state, om = self.case(8, slots=2)
+        mask = torch.tensor([True, False], device="cuda")
+        latch = KDALatchState(state, om, latch_heads=mask)
+        oracle = PaperOracle(state, om, latch_heads=mask)
+        q, k, v, g, b, a, bias = inputs(batch=2, steps=7)
+        for t in range(7):
+            latch.step(q[t], k[t], v[t], g[t], b[t], a, bias)
+            qn, kn, decay, beta = normalize(q[t], k[t], g[t], b[t], a, bias)
+            oracle.step(qn, kn, v[t], decay, beta)
+        untouched = latch.state[0].clone()
+        for tensor in (latch.f, latch.u, latch.latch, latch.phi):
+            tensor.fill_(float("nan"))
+        slots = torch.tensor([1], device="cuda")
+        latch.flush_pending(slots)
+        self.assert_error(latch.state[1], oracle.state[1], atol=3e-5, rtol=2e-4)
+        self.assertTrue(torch.equal(latch.state[0], untouched))
+        self.assertEqual(latch.pos.tolist(), [7, 0])
+        saved = latch.state.clone()
+        latch.flush_pending(slots)
+        self.assertTrue(torch.equal(latch.state, saved))
+        fresh = KDALatchState(saved[1:2], om, latch_heads=mask)
+        got = latch.step(
+            q[0, 1:],
+            k[0, 1:],
+            v[0, 1:],
+            g[0, 1:],
+            b[0, 1:],
+            a,
+            bias,
+            slots=slots,
+        )
+        expected = fresh.step(
+            q[0, 1:],
+            k[0, 1:],
+            v[0, 1:],
+            g[0, 1:],
+            b[0, 1:],
+            a,
+            bias,
+        )
+        self.assertTrue(torch.equal(got, expected))
+
+    def test_engine_slot_handoff_reorder_and_reuse(self):
+        from vllm.models.glm5next.nvidia.kda_latch import KDALatchCache
+
+        state, om = self.case(8, slots=2)
+        persistent = torch.cat([torch.zeros_like(state[:1]), state.clone()])
+        adapter = KDALatchCache(om)
+        oracle = PaperOracle(state, om)
+        q, k, v, g, b, a, bias = inputs(batch=2, steps=19)
+        for t in range(19):
+            order = [1, 0] if t % 2 else [0, 1]
+            ids = torch.tensor([i + 1 for i in order], device="cuda")
+            got = adapter.step(
+                persistent,
+                ids,
+                q[t, order],
+                k[t, order],
+                v[t, order],
+                g[t, order],
+                b[t, order],
+                a,
+                bias,
+                -5.0,
+            )
+            qn, kn, decay, beta = normalize(
+                q[t, order], k[t, order], g[t, order], b[t, order], a, bias
+            )
+            expected = oracle.step(qn, kn, v[t, order], decay, beta, order)
+            self.assert_error(got, expected)
+            if t == 15:
+                self.assert_error(persistent[1:], oracle.state, atol=3e-5, rtol=2e-4)
+        abandoned = persistent[1].clone()
+        for tensor in (adapter.slots[2].f, adapter.slots[2].u):
+            tensor.fill_(float("nan"))
+        ids = torch.tensor([2, 1], device="cuda")
+        adapter.before_prefill(
+            persistent, ids, torch.tensor([True, False], device="cuda")
+        )
+        self.assert_error(persistent[2], oracle.state[1], atol=3e-5, rtol=2e-4)
+        self.assertTrue(torch.equal(persistent[1], abandoned))
+        self.assertEqual(adapter.slots, {})
+        self.assertEqual(adapter.decode_rows, 38)
+        persistent[1] = state[0]
+        fresh = KDALatchState(persistent[ids], om)
+        got = adapter.step(persistent, ids, q[0], k[0], v[0], g[0], b[0], a, bias, -5.0)
+        expected = fresh.step(q[0], k[0], v[0], g[0], b[0], a, bias)
+        self.assertTrue(torch.equal(got, expected))
+        self.assertTrue(torch.equal(persistent[0], torch.zeros_like(persistent[0])))
+
+    def test_compact_pool_eviction_materializes_exact_state_before_reuse(self):
+        from vllm.models.glm5next.nvidia.kda_latch import BatchedKDALatchCache
+
+        state, om = self.case(8, slots=3)
+        persistent = torch.cat([torch.zeros_like(state[:1]), state.clone()])
+        cache = BatchedKDALatchCache(
+            om, torch.tensor([8, 8], device="cuda"), capacity=1
+        )
+        dense = state.double().clone()
+        q, k, v, g, b, a, bias = inputs(batch=1, steps=6)
+        previous = None
+        for t in range(6):
+            slot = t % 3
+            oracle = PaperOracle(dense[slot : slot + 1], om)
+            qn, kn, decay, beta = normalize(q[t], k[t], g[t], b[t], a, bias)
+            expected = oracle.step(qn, kn, v[t], decay, beta)
+            got = cache.step(
+                persistent,
+                torch.tensor([slot + 1], device="cuda"),
+                q[t],
+                k[t],
+                v[t],
+                g[t],
+                b[t],
+                a,
+                bias,
+                -5.0,
+            )
+            self.assert_error(got, expected)
+            if previous is not None:
+                self.assert_error(persistent[previous + 1], dense[previous])
+            dense[slot] = oracle.state[0]
+            previous = slot
+            self.assertEqual(cache.live, {slot + 1})
+            self.assertEqual(len(cache.pool.state), 1)
+        assert previous is not None
+        cache.before_prefill(
+            persistent,
+            torch.tensor([previous + 1], device="cuda"),
+            torch.tensor([True], device="cuda"),
+        )
+        self.assert_error(persistent[1:], dense, atol=3e-5, rtol=2e-4)
+        self.assertTrue((persistent[0] == 0).all())
+
     def test_asynchronous_slots_reset_and_reorder(self):
         state, om = self.case(8, slots=3)
         latch = KDALatchState(state, om)
@@ -298,6 +433,260 @@ class TestKDALatch(unittest.TestCase):
             ref = oracle.step(qn, kn, v[t], decay, beta)
             got = latch.step(q[t], k[t], v[t], g[t], b[t], a, bias, safe_gate=False)
             self.assert_error(got, ref)
+
+
+class TestCalibrationStatistics(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_heterogeneous_batched_allocation_matches_separate_heads(self):
+        from vllm.models.glm5next.nvidia.kda_latch import BatchedKDALatchCache
+
+        torch.manual_seed(812)
+        state = torch.randn(3, 3, 128, 128, device="cuda") * 0.01
+        state[0].zero_()
+        omega = torch.linalg.qr(torch.randn(3, 128, 8, device="cuda")).Q
+        ranks = torch.tensor([2, 8, 0], device="cuda")
+        cache = BatchedKDALatchCache(omega, ranks)
+        controls = [
+            KDALatchState(
+                state[1:, h : h + 1],
+                omega[h : h + 1, :, : max(1, int(rank))],
+                latch_heads=torch.tensor([bool(rank)], device="cuda"),
+            )
+            for h, rank in enumerate(ranks)
+        ]
+        q, k, v, g, b, a, bias = inputs(batch=2, heads=3, steps=19)
+        for t in range(19):
+            order = [1, 0] if t % 2 else [0, 1]
+            slots = torch.tensor(order, device="cuda")
+            got = cache.step(
+                state,
+                slots + 1,
+                q[t, order],
+                k[t, order],
+                v[t, order],
+                g[t, order],
+                b[t, order],
+                a,
+                bias,
+                -5.0,
+            )
+            expected = torch.cat(
+                [
+                    control.step(
+                        q[t, order, h : h + 1],
+                        k[t, order, h : h + 1],
+                        v[t, order, h : h + 1],
+                        g[t, order, h : h + 1],
+                        b[t, order, h : h + 1],
+                        a[h : h + 1],
+                        bias[h : h + 1],
+                        slots=slots,
+                    )
+                    for h, control in enumerate(controls)
+                ],
+                1,
+            )
+            torch.testing.assert_close(got, expected, atol=2e-5, rtol=2e-4)
+        cache.pool.phi.fill_(float("nan"))
+        cache.pool.f.fill_(float("nan"))
+        cache.before_prefill(
+            state,
+            torch.tensor([2, 1], device="cuda"),
+            torch.tensor([True, False], device="cuda"),
+        )
+        for h, control in enumerate(controls):
+            control.flush_pending(torch.tensor([1], device="cuda"))
+            torch.testing.assert_close(
+                state[2, h], control.state[1, 0], atol=2e-5, rtol=2e-4
+            )
+        self.assertEqual(cache.live, set())
+        self.assertTrue((state[0] == 0).all())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_graph_replay_preserves_reordering_eviction_padding_and_handoff(self):
+        from vllm.models.glm5next.nvidia.kda_latch import BatchedKDALatchCache
+        from vllm.third_party.flash_linear_attention.ops import kda_latch_graph
+
+        torch.manual_seed(394)
+        storage = torch.full((5, 3, 128, 132), float("nan"), device="cuda")
+        state = storage[..., :128]
+        state.copy_(torch.randn_like(state) * 0.03)
+        state[0].zero_()
+        omega = torch.linalg.qr(torch.randn(3, 128, 32, device="cuda")).Q
+        ranks = torch.tensor([2, 32, 0], device="cuda")
+        ref = BatchedKDALatchCache(omega, ranks, capacity=2)
+        cache = kda_latch_graph.KDALatchGraphCache(omega, ranks, capacity=2)
+        reference_state = state.clone()
+        data = inputs(batch=2, heads=3, steps=40)
+        a, bias = data[5:]
+        ids = torch.tensor([1, 2], device="cuda")
+        packed = torch.empty(2, 4, 3, 128, device="cuda", dtype=torch.bfloat16)
+        packed_beta = torch.empty(2, 6, device="cuda", dtype=torch.bfloat16)
+        args = [packed[:, index] for index in range(4)] + [packed_beta[:, :3]]
+        for destination, source in zip(args, data[:5]):
+            destination.copy_(source[0])
+        for _ in range(3):
+            cache.step(state, ids, *args, a, bias)
+            ref.step(reference_state, ids, *args, a, bias, -5.0)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = cache.step(state, ids, *args, a, bias)
+        for t in range(40):
+            physical = [1, 2] if t < 20 else [3, 1]
+            if t % 2:
+                physical.reverse()
+            if t == 30:
+                physical[1] = 0
+            ids.copy_(torch.tensor(physical, device="cuda"))
+            for destination, source in zip(args, data[:5]):
+                destination.copy_(source[t])
+            graph.replay()
+            valid = torch.tensor(
+                [i for i, slot in enumerate(physical) if slot > 0], device="cuda"
+            )
+            expected = ref.step(
+                reference_state,
+                ids[valid],
+                *(x[valid] for x in args),
+                a,
+                bias,
+                -5.0,
+            )
+            torch.testing.assert_close(out[valid], expected, atol=1e-4, rtol=0.005)
+            if t == 25:
+                flags = torch.tensor([True, False], device="cuda")
+                cache.before_prefill(state, ids, flags)
+                ref.before_prefill(reference_state, ids, flags)
+                torch.testing.assert_close(state, reference_state, atol=1e-5, rtol=2e-4)
+        flags = torch.ones(2, device="cuda", dtype=torch.bool)
+        cache.before_prefill(state, ids, flags)
+        ref.before_prefill(reference_state, ids, flags)
+        torch.testing.assert_close(state, reference_state, atol=1e-5, rtol=2e-4)
+        self.assertTrue((state[0] == 0).all())
+        self.assertTrue(torch.isnan(storage[..., 128:]).all())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_graph_refresh_preserves_metric_ridge_for_ill_conditioned_state(self):
+        from vllm.third_party.flash_linear_attention.ops import kda_latch_graph
+
+        torch.manual_seed(492)
+        for rank in (1, 8, 32, 52):
+            with self.subTest(rank=rank):
+                state = torch.randn(2, 2, 128, 128, device="cuda")
+                state *= torch.logspace(-5, 0, 128, device="cuda")
+                omega = torch.linalg.qr(
+                    torch.randn(2, 128, rank, device="cuda")
+                ).Q * torch.linspace(0.6, 1.8, rank, device="cuda")
+                ranks = torch.tensor([rank, max(1, rank // 2)], device="cuda")
+                ref = KDALatchState(state, omega, head_ranks=ranks)
+                cache = kda_latch_graph.KDALatchGraphCache(omega, ranks, capacity=2)
+                cache.pool.state.copy_(state)
+                cache.refresh(torch.arange(2, device="cuda", dtype=torch.int32))
+                query = torch.randn(2, 2, 128, 8, device="cuda")
+                expected = ref.latch @ (ref.phi.transpose(-1, -2) @ query)
+                actual = cache.pool.latch @ (cache.pool.phi.transpose(-1, -2) @ query)
+                torch.testing.assert_close(actual, expected, atol=2e-4, rtol=0.003)
+
+    def test_paired_prefix_curves_match_explicit_residuals(self):
+        from benchmarks.kernels.glm_kda_calibration_stats import (
+            paired_curves,
+            prefix_qr,
+        )
+
+        torch.manual_seed(918)
+        u = torch.randn(2, 3, 7, 4, dtype=torch.float64)
+        u[..., 2] = u[..., 0]
+        q, rejected = prefix_qr(u)
+        self.assertTrue(rejected[..., 2].all())
+        output = torch.randn(2, 5, 3, 7, dtype=torch.float64)
+        grad = torch.randn_like(output)
+        got = paired_curves(grad, output, q)
+        for rank in range(5):
+            residual = output - torch.einsum(
+                "uhvm,uwhm->uwhv",
+                q[..., :rank],
+                torch.einsum("uhvm,uwhv->uwhm", q[..., :rank], output),
+            )
+            torch.testing.assert_close(
+                got["output_error_sum"][:, rank], residual.square().sum((0, 1, 3))
+            )
+            torch.testing.assert_close(
+                got["joint_dot_sq_sum"][:, rank],
+                (grad * residual).sum(-1).square().sum((0, 1)),
+            )
+
+    @unittest.skipUnless(torch.accelerator.device_count() >= 2, "Two GPUs required")
+    def test_calibration_features_launch_on_input_device(self):
+        from benchmarks.kernels.glm_kda_calibration_stats import features
+
+        q, k, v, g, b, a, bias = inputs(batch=1, heads=2, steps=16)
+        _, _, decay, beta = normalize(q[:, 0], k[:, 0], g[:, 0], b[:, 0], a, bias)
+        args = (
+            q[:, 0][None],
+            k[:, 0][None],
+            v[:, 0][None],
+            decay.log().float()[None],
+            beta.float()[None],
+        )
+        reference = features(*args)
+        other = (
+            torch.accelerator.current_device_index() + 1
+        ) % torch.accelerator.device_count()
+        actual = features(*(x.to(f"cuda:{other}") for x in args))
+        for got, expected in zip(actual, reference):
+            if isinstance(got, torch.Tensor):
+                torch.testing.assert_close(got.to(expected.device), expected)
+            else:
+                self.assertAlmostEqual(got, expected, places=6)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_calibration_features_match_dense_matrix_transition(self):
+        from benchmarks.kernels.glm_kda_calibration_stats import features
+
+        q, k, v, g, b, a, bias = inputs(batch=1, heads=2, steps=32)
+        qn, kn, decay, beta = normalize(q[:, 0], k[:, 0], g[:, 0], b[:, 0], a, bias)
+        starts, x, boundary, output, _ = features(
+            q[:, 0][None],
+            k[:, 0][None],
+            v[:, 0][None],
+            decay.log().float()[None],
+            beta.float()[None],
+        )
+        state = torch.zeros(2, 128, 128, device="cuda", dtype=torch.float64)
+        eye = torch.eye(128, device="cuda", dtype=torch.float64)
+        for t in range(32):
+            if t % 16 == 0:
+                origin, product = state.clone(), eye.expand(2, -1, -1).clone()
+                torch.testing.assert_close(
+                    starts[t // 16].double(), state, atol=2e-5, rtol=2e-4
+                )
+            transition = (
+                eye - beta[t, :, None, None] * kn[t, :, :, None] * kn[t, :, None, :]
+            ) * decay[t, :, None, :]
+            state = (
+                state @ transition.transpose(-1, -2)
+                + beta[t, :, None, None]
+                * v[t, 0].double()[..., None]
+                * kn[t, :, None, :]
+            )
+            product = transition @ product
+            effective = (product.transpose(-1, -2) @ qn[t, :, :, None])[..., 0]
+            torch.testing.assert_close(
+                x[t // 16, t % 16].double(), effective, atol=2e-6, rtol=2e-4
+            )
+            torch.testing.assert_close(
+                output[t].double(),
+                (state @ qn[t, :, :, None])[..., 0],
+                atol=2e-5,
+                rtol=2e-4,
+            )
+            torch.testing.assert_close(
+                boundary[t // 16, t % 16].double(),
+                (origin @ effective[..., None])[..., 0],
+                atol=2e-5,
+                rtol=2e-4,
+            )
 
 
 if __name__ == "__main__":

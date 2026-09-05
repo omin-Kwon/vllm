@@ -68,98 +68,101 @@ def _step(
     row = tl.program_id(0)
     head = tl.program_id(1)
     slot = tl.load(Slots + row)
-    pos = tl.load(Pos + slot)
-    kh = tl.arange(0, K)
-    vv = tl.arange(0, V)
-    gg = tl.arange(0, WG)
-    tt = tl.arange(0, W)
-    q = tl.load(Q + (row * H + head) * K + kh).to(tl.float32)
-    k = tl.load(KIn + (row * H + head) * K + kh).to(tl.float32)
-    v = tl.load(VIn + (row * H + head) * V + vv).to(tl.float32)
-    if NORMALIZE:
-        q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
-        k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-    q = q * SCALE
-    raw_g = tl.load(Gate + (row * H + head) * K + kh).to(tl.float32)
-    raw_g += tl.load(Bias + head * K + kh)
-    amplitude = tl.exp(tl.load(A + head))
-    if SAFE:
-        log_a = LOWER / (1.0 + tl.exp(-amplitude * raw_g))
-    else:
-        log_a = -amplitude * tl.where(raw_g > 20.0, raw_g, tl.log(1.0 + tl.exp(raw_g)))
-    beta = tl.sigmoid(tl.load(Beta + row * H + head).to(tl.float32))
-    base = (slot * H + head) * W
-    prev = tl.load(PrefixR + (base + pos - 1) * K + kh, mask=pos > 0, other=0.0)
-    prefix = prev + log_a
-    tl.store(KR + (base + pos) * K + kh, k)
-    tl.store(VR + (base + pos) * V + vv, v)
-    tl.store(GR + (base + pos) * K + kh, log_a)
-    tl.store(BR + base + pos, beta)
-    tl.store(PrefixR + (base + pos) * K + kh, prefix)
-    is_latch = tl.load(LatchHeads + head)
-    if is_latch:
-        past_k = tl.load(
-            KR + (base + tt[:, None]) * K + kh[None, :],
-            mask=tt[:, None] < pos,
-            other=0.0,
-        )
-        past_prefix = tl.load(
-            PrefixR + (base + tt[:, None]) * K + kh[None, :],
-            mask=tt[:, None] < pos,
-            other=0.0,
-        )
-        # exp(prefix_t - prefix_s) avoids forming 1/d_s (overflow at W=16).
-        ell = past_k * tl.exp(prefix[None, :] - past_prefix)
-        kk = tl.sum(ell * k[None, :], axis=1)
-        kq = tl.sum(ell * q[None, :], axis=1)
-        phi = tl.load(
-            Phi + (slot * H + head) * K * G + kh[:, None] * G + gg[None, :],
-            mask=gg[None, :] < G,
-            other=0.0,
-        )
-        dk = tl.exp(prefix) * k
-        dq = tl.exp(prefix) * q
-        fs = tl.load(
-            FR + (base + tt[:, None]) * G + gg[None, :],
-            mask=(tt[:, None] < pos) & (gg[None, :] < G),
-            other=0.0,
-        )
-        f = beta * (
-            tl.sum(phi * dk[:, None], axis=0) - tl.sum(fs * kk[:, None], axis=0)
-        )
-        cur_kq = tl.sum(k * q)
-        c = (
-            tl.sum(phi * dq[:, None], axis=0)
-            - tl.sum(fs * kq[:, None], axis=0)
-            - f * cur_kq
-        )
-        us = tl.load(
-            UR + (base + tt[:, None]) * V + vv[None, :],
-            mask=tt[:, None] < pos,
-            other=0.0,
-        )
-        u = beta * (v - tl.sum(us * kk[:, None], axis=0))
-        latch = tl.load(
-            U + (slot * H + head) * V * G + vv[:, None] * G + gg[None, :],
-            mask=gg[None, :] < G,
-            other=0.0,
-        )
-        out = (
-            tl.sum(latch * c[None, :], axis=1)
-            + tl.sum(us * kq[:, None], axis=0)
-            + u * cur_kq
-        )
-        tl.store(FR + (base + pos) * G + gg, f, mask=gg < G)
-        tl.store(UR + (base + pos) * V + vv, u)
-    else:
-        # Existing dense recurrence; this head updates state on every step.
-        sp = State + (slot * H + head) * V * K + vv[:, None] * K + kh[None, :]
-        state = tl.load(sp) * tl.exp(log_a[None, :])
-        delta = beta * (v - tl.sum(state * k[None, :], axis=1))
-        state += delta[:, None] * k[None, :]
-        out = tl.sum(state * q[None, :], axis=1)
-        tl.store(sp, state)
-    tl.store(Out + (row * H + head) * V + vv, out)
+    if slot >= 0:
+        pos = tl.load(Pos + slot)
+        kh = tl.arange(0, K)
+        vv = tl.arange(0, V)
+        gg = tl.arange(0, WG)
+        tt = tl.arange(0, W)
+        q = tl.load(Q + (row * H + head) * K + kh).to(tl.float32)
+        k = tl.load(KIn + (row * H + head) * K + kh).to(tl.float32)
+        v = tl.load(VIn + (row * H + head) * V + vv).to(tl.float32)
+        if NORMALIZE:
+            q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
+            k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+        q = q * SCALE
+        raw_g = tl.load(Gate + (row * H + head) * K + kh).to(tl.float32)
+        raw_g += tl.load(Bias + head * K + kh)
+        amplitude = tl.exp(tl.load(A + head))
+        if SAFE:
+            log_a = LOWER / (1.0 + tl.exp(-amplitude * raw_g))
+        else:
+            log_a = -amplitude * tl.where(
+                raw_g > 20.0, raw_g, tl.log(1.0 + tl.exp(raw_g))
+            )
+        beta = tl.sigmoid(tl.load(Beta + row * H + head).to(tl.float32))
+        base = (slot * H + head) * W
+        prev = tl.load(PrefixR + (base + pos - 1) * K + kh, mask=pos > 0, other=0.0)
+        prefix = prev + log_a
+        tl.store(KR + (base + pos) * K + kh, k)
+        tl.store(VR + (base + pos) * V + vv, v)
+        tl.store(GR + (base + pos) * K + kh, log_a)
+        tl.store(BR + base + pos, beta)
+        tl.store(PrefixR + (base + pos) * K + kh, prefix)
+        is_latch = tl.load(LatchHeads + head)
+        if is_latch:
+            past_k = tl.load(
+                KR + (base + tt[:, None]) * K + kh[None, :],
+                mask=tt[:, None] < pos,
+                other=0.0,
+            )
+            past_prefix = tl.load(
+                PrefixR + (base + tt[:, None]) * K + kh[None, :],
+                mask=tt[:, None] < pos,
+                other=0.0,
+            )
+            # exp(prefix_t - prefix_s) avoids forming 1/d_s (overflow at W=16).
+            ell = past_k * tl.exp(prefix[None, :] - past_prefix)
+            kk = tl.sum(ell * k[None, :], axis=1)
+            kq = tl.sum(ell * q[None, :], axis=1)
+            phi = tl.load(
+                Phi + (slot * H + head) * K * G + kh[:, None] * G + gg[None, :],
+                mask=gg[None, :] < G,
+                other=0.0,
+            )
+            dk = tl.exp(prefix) * k
+            dq = tl.exp(prefix) * q
+            fs = tl.load(
+                FR + (base + tt[:, None]) * G + gg[None, :],
+                mask=(tt[:, None] < pos) & (gg[None, :] < G),
+                other=0.0,
+            )
+            f = beta * (
+                tl.sum(phi * dk[:, None], axis=0) - tl.sum(fs * kk[:, None], axis=0)
+            )
+            cur_kq = tl.sum(k * q)
+            c = (
+                tl.sum(phi * dq[:, None], axis=0)
+                - tl.sum(fs * kq[:, None], axis=0)
+                - f * cur_kq
+            )
+            us = tl.load(
+                UR + (base + tt[:, None]) * V + vv[None, :],
+                mask=tt[:, None] < pos,
+                other=0.0,
+            )
+            u = beta * (v - tl.sum(us * kk[:, None], axis=0))
+            latch = tl.load(
+                U + (slot * H + head) * V * G + vv[:, None] * G + gg[None, :],
+                mask=gg[None, :] < G,
+                other=0.0,
+            )
+            out = (
+                tl.sum(latch * c[None, :], axis=1)
+                + tl.sum(us * kq[:, None], axis=0)
+                + u * cur_kq
+            )
+            tl.store(FR + (base + pos) * G + gg, f, mask=gg < G)
+            tl.store(UR + (base + pos) * V + vv, u)
+        else:
+            # Existing dense recurrence; this head updates state on every step.
+            sp = State + (slot * H + head) * V * K + vv[:, None] * K + kh[None, :]
+            state = tl.load(sp) * tl.exp(log_a[None, :])
+            delta = beta * (v - tl.sum(state * k[None, :], axis=1))
+            state += delta[:, None] * k[None, :]
+            out = tl.sum(state * q[None, :], axis=1)
+            tl.store(sp, state)
+        tl.store(Out + (row * H + head) * V + vv, out)
 
 
 @triton.jit
@@ -177,26 +180,31 @@ def _flush(
     V: tl.constexpr,
     W: tl.constexpr,
     BV: tl.constexpr,
+    PARTIAL: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
     block = tl.program_id(2)
     slot = tl.load(Slots + row)
-    if (tl.load(Pos + slot) == W - 1) & tl.load(LatchHeads + head):
-        kk = tl.arange(0, K)
-        vv = block * BV + tl.arange(0, BV)
-        sp = State + (slot * H + head) * V * K + vv[:, None] * K + kk[None, :]
-        state = tl.load(sp, mask=vv[:, None] < V, other=0.0)
-        base = (slot * H + head) * W
-        for t in range(W):
-            k = tl.load(KR + (base + t) * K + kk)
-            v = tl.load(VR + (base + t) * V + vv, mask=vv < V, other=0.0)
-            log_a = tl.load(GR + (base + t) * K + kk)
-            beta = tl.load(BR + base + t)
-            state *= tl.exp(log_a[None, :])
-            delta = beta * (v - tl.sum(state * k[None, :], axis=1))
-            state += delta[:, None] * k[None, :]
-        tl.store(sp, state, mask=vv[:, None] < V)
+    if slot >= 0:
+        pos = tl.load(Pos + slot)
+        count = pos if PARTIAL else W
+        ready = pos > 0 if PARTIAL else pos == W - 1
+        if ready & tl.load(LatchHeads + head):
+            kk = tl.arange(0, K)
+            vv = block * BV + tl.arange(0, BV)
+            sp = State + (slot * H + head) * V * K + vv[:, None] * K + kk[None, :]
+            state = tl.load(sp, mask=vv[:, None] < V, other=0.0)
+            base = (slot * H + head) * W
+            for t in range(count):
+                k = tl.load(KR + (base + t) * K + kk)
+                v = tl.load(VR + (base + t) * V + vv, mask=vv < V, other=0.0)
+                log_a = tl.load(GR + (base + t) * K + kk)
+                beta = tl.load(BR + base + t)
+                state *= tl.exp(log_a[None, :])
+                delta = beta * (v - tl.sum(state * k[None, :], axis=1))
+                state += delta[:, None] * k[None, :]
+            tl.store(sp, state, mask=vv[:, None] < V)
 
 
 class KDALatchState:
@@ -217,6 +225,7 @@ class KDALatchState:
         window: int = 16,
         ridge: float = 1e-4,
         latch_heads: torch.Tensor | None = None,
+        head_ranks: torch.Tensor | None = None,
     ):
         if state.ndim != 4 or state.shape[-2:] != (128, 128):
             raise ValueError("Initial KDA port requires state (slots, heads, 128, 128)")
@@ -235,9 +244,21 @@ class KDALatchState:
         self.omega = omega.double().contiguous()
         self.window, self.ridge = window, ridge
         self.rank = omega.shape[-1]
+        if head_ranks is None:
+            head_ranks = torch.full((h,), self.rank, device=state.device)
+        if (
+            head_ranks.shape != (h,)
+            or (head_ranks < 0).any()
+            or (head_ranks > self.rank).any()
+        ):
+            raise ValueError("head_ranks must be one valid prefix rank per head")
+        self.rank_mask = (
+            torch.arange(self.rank, device=state.device)[None] < head_ranks[:, None]
+        )
+        self.omega = self.omega * self.rank_mask[:, None]
         self.pos = torch.zeros(n, device=state.device, dtype=torch.int32)
         if latch_heads is None:
-            latch_heads = torch.ones(h, device=state.device, dtype=torch.bool)
+            latch_heads = head_ranks > 0
         if latch_heads.shape != (h,) or latch_heads.device != state.device:
             raise ValueError("latch_heads must have shape (heads,) on the state device")
         self.latch_heads = latch_heads.bool().contiguous()
@@ -268,6 +289,7 @@ class KDALatchState:
         gram = u.transpose(-1, -2) @ u + eta * (
             self.omega.transpose(-1, -2) @ self.omega
         )
+        gram += torch.diag_embed((~self.rank_mask).double())
         phi = torch.linalg.solve(gram, numerator.transpose(-1, -2)).transpose(-1, -2)
         self.latch[slots] = u.float()
         self.phi[slots] = phi.float()
@@ -276,6 +298,47 @@ class KDALatchState:
     def reset(self, slots: torch.Tensor, state: torch.Tensor):
         """Seed from exact prefill state, also discarding an abandoned window."""
         self.state[slots] = state
+        self.pos[slots] = 0
+        self.refresh(slots)
+
+    @torch.no_grad()
+    def flush_pending(self, slots: torch.Tensor):
+        """Materialize raw pending writes before handing a slot to dense KDA.
+
+        This also starts a fresh window, so repeated calls are idempotent.
+        Approximate output metadata never enters the persistent state update.
+        """
+        if slots.ndim != 1 or slots.device != self.state.device:
+            raise ValueError(
+                "slots must be a one-dimensional tensor on the state device"
+            )
+        if not slots.numel():
+            return
+        if (
+            (slots < 0).any()
+            or (slots >= self.state.shape[0]).any()
+            or slots.unique().numel() != slots.numel()
+        ):
+            raise ValueError("Slot IDs must be distinct and in bounds")
+        slots = slots.to(torch.int32).contiguous()
+        _, h, v, k = self.state.shape
+        _flush[(slots.numel(), h, triton.cdiv(v, 8))](
+            slots,
+            self.pos,
+            self.state,
+            self.k,
+            self.v,
+            self.log_a,
+            self.beta,
+            self.latch_heads,
+            h,
+            k,
+            v,
+            self.window,
+            8,
+            PARTIAL=True,
+            num_warps=1,
+        )
         self.pos[slots] = 0
         self.refresh(slots)
 

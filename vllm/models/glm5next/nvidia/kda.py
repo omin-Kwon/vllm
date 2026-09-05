@@ -337,6 +337,44 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 indices_path,
             )
 
+        self._latch_cache = None
+        additional = vllm_config.additional_config
+        latch_options = (
+            additional.get("kda_latch") if isinstance(additional, dict) else None
+        )
+        if latch_options is not None:
+            if not isinstance(latch_options, dict):
+                raise ValueError("kda_latch must be a configuration dictionary")
+            cache = vllm_config.cache_config
+            if (
+                (
+                    not vllm_config.model_config.enforce_eager
+                    and not latch_options.get("graph")
+                )
+                or vllm_config.speculative_config is not None
+                or cache.enable_prefix_caching
+                or cache.mamba_cache_mode != "none"
+                or cache.use_replayssm
+                or self._kda_qmamba_bits
+                or indices_source is not None
+            ):
+                raise ValueError(
+                    "KDA latch requires graph cache or eager mode, no prefix cache, "
+                    "mamba_cache_mode=none, no speculation, ReplaySSM, Q-Mamba or DRRQR"
+                )
+            if self.get_state_dtype()[1] != torch.float32:
+                raise ValueError("Experimental KDA latch requires FP32 SSM state")
+            from vllm.models.glm5next.nvidia.kda_latch import KDALatchCache
+
+            self._latch_cache = KDALatchCache.from_config(
+                latch_options,
+                self.layer_idx,
+                self.num_heads,
+                self.tp_rank,
+                self.tp_size,
+            )
+            logger.info("Experimental KDA latch enabled for layer %d", self.layer_idx)
+
     def _apply_drrqr_mask(
         self, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -629,6 +667,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
+            if self._latch_cache is not None:
+                self._latch_cache.before_prefill(
+                    recurrent_state, non_spec_state_indices_tensor, has_initial_state
+                )
             initial_state = gather_initial_states(
                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
             )
@@ -678,25 +720,41 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Gate computed in-kernel (COMPUTE_GATE), beta sigmoided in-kernel.
             if not use_spec:
                 ns_out = spec_out
-            core_attn_out_non_spec, _ = fused_recurrent_kda(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
-                g=g1_ns,
-                beta=beta_ns,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata_narrowed.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                out=ns_out,
-                sigmoid_beta=True,
-                a_log=self.A_log,
-                g_bias=self.dt_bias,
-                compute_gate=True,
-                lower_bound=lower_bound,
-            )
+            if self._latch_cache is not None:
+                core_attn_out_non_spec = self._latch_cache.step(
+                    recurrent_state,
+                    non_spec_state_indices_tensor,
+                    _rearr(q_ns)[0],
+                    _rearr(k_ns)[0],
+                    _rearr(v_ns)[0],
+                    g1_ns[0],
+                    beta_ns[0],
+                    self.A_log,
+                    self.dt_bias,
+                    lower_bound,
+                ).unsqueeze(0)
+                if ns_out is not None:
+                    ns_out.copy_(core_attn_out_non_spec)
+            else:
+                core_attn_out_non_spec, _ = fused_recurrent_kda(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    g=g1_ns,
+                    beta=beta_ns,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : attn_metadata_narrowed.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    out=ns_out,
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
             self._quantize_qmamba_state(
                 recurrent_state,
                 non_spec_state_indices_tensor,
