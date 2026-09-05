@@ -1406,12 +1406,18 @@ def fused_recurrent_gated_delta_rule_replayssm(
             "LS6 인자는 다 주거나 하나도 주지 말아야 한다 — 반쯤 켜지면 "
             f"조용히 틀린 값이 나온다 (지금 {_n_ls6}/{len(_ls6_t)})")
     _ls6_on = _n_ls6 == len(_ls6_t)
+    _flush_impl = os.environ.get("NS_GDN_FLUSH_IMPL", "cuda")
     if _ls6_phi and (
         os.environ.get("NS_GDN_STEP_IMPL", "cuda") != "cuda"
-        or os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") != "cuda"
+        or _flush_impl not in ("cuda", "stream")
         or os.environ.get("NS_GDN_KERNEL", "v2") != "v2"
     ):
-        raise ValueError("Φ̄ 경로(ls6_phi)는 v2 CUDA step/flush 전용이다")
+        raise ValueError("Φ̄ 경로(ls6_phi)는 v2 CUDA step/flush(cuda|stream) 전용이다")
+    # stream = register-resident fold + LS6 epilogue in one kernel (Φ̄ path only);
+    # it replaces gdn_flush_cuda + gdn_ls6_epilogue below and otherwise behaves as cuda.
+    _flush_stream = _ls6_phi and _flush_impl == "stream"
+    if _flush_stream:
+        _flush_impl = "cuda"
     _ls6_g = int(ls6_ubar.shape[-2]) if _ls6_on else 1
     _ls6_r = int(ls6_r) if _ls6_on else 0
     _corr_t = (ls6_beta,)
@@ -1446,7 +1452,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
     _ls6_g_pow2 = not (_ls6_g & (_ls6_g - 1))
     if _ls6_on and not _ls6_g_pow2 and (
         os.environ.get("NS_GDN_STEP_IMPL", "cuda") != "cuda"
-        or os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") != "cuda"
+        or _flush_impl != "cuda"
     ):
         raise ValueError(
             f"compact LS6_G={_ls6_g}는 CUDA step/flush가 필요하다"
@@ -1669,7 +1675,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
                                          MAX_CACHE_LEN=max_cache_len,
                                          BB=triton.next_power_of_2(B), num_warps=4)
             _flush_cuda = False
-            if os.environ.get("NS_GDN_FLUSH_IMPL", "cuda") == "cuda":
+            if _flush_impl == "cuda":
                 from .gdn_flush_cuda import (
                     gdn_flush_cuda,
                     gdn_flush_supported,
@@ -1801,7 +1807,30 @@ def fused_recurrent_gated_delta_rule_replayssm(
                             ls6_beta=None, row_offset=_row_offset,
                             row_limit=_row_limit,
                         )
-                if not _chunked_fold:
+                _stream_ok = False
+                if _flush_stream and _exact_in_fold and not _chunked_fold:
+                    from .gdn_flush_stream_cuda import (
+                        gdn_flush_stream,
+                        gdn_flush_stream_supported,
+                    )
+                    _stream_ok = gdn_flush_stream_supported(
+                        K, V, max_cache_len, _ls6_g, _ls6_r
+                    )
+                    if not _stream_ok and not _FLUSH_FALLBACK_WARNED.get("stream"):
+                        _FLUSH_FALLBACK_WARNED["stream"] = True
+                        print(
+                            f"[gdn v2] stream flush unsupported (K={K} V={V} "
+                            f"W={max_cache_len} G={_ls6_g} R={_ls6_r}); using cuda",
+                            flush=True,
+                        )
+                if _stream_ok:
+                    gdn_flush_stream(
+                        initial_state, d_cache, k_cache, g_cache, _flist, B,
+                        fz_qbar, fz_kbar, ls6_map, ls6_mh, ls6_beta,
+                        ls6_ubar, ls6_phi, ls6_aq, ls6_ak,
+                        H, HV, K, V, max_cache_len, _ls6_g, _ls6_r,
+                    )
+                elif not _chunked_fold:
                     gdn_flush_cuda(
                         _grid, initial_state, d_cache, k_cache, g_cache,
                         ssm_state_indices, _flist, B,
@@ -1817,7 +1846,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
                         ls6_mh=ls6_mh if _ls6_on else None,
                         ls6_beta=ls6_beta if _exact_in_fold else None,
                     )
-                if _ls6_phi:
+                if _ls6_phi and not _stream_ok:
                     # 새 S_W 에서 Ū 사본·Φ̄[:r]ᵀ·꼬리 앵커를 다시 만든다(래치 head 만).
                     from .gdn_ls6_epilogue_cuda import gdn_ls6_epilogue
                     gdn_ls6_epilogue(
