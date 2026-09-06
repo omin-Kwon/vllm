@@ -67,8 +67,9 @@ class FullCoordinateRuntime:
         indices, positions = indices[:batch], positions[:batch]
         if batch == 0:
             return out, state
-        # vLLM includes a singleton sequence dimension in its output view.
-        step_out = out.squeeze(1) if out.ndim == 4 else out
+        # Decode uses (B,1,HV,V), mixed prefill/decode uses (1,B,HV,V).
+        # Both are contiguous views of the same per-token output layout.
+        step_out = out.view(batch, state.shape[1], 128)
         step(
             mixed,
             a,

@@ -23,7 +23,10 @@ from vllm.third_party.flash_linear_attention.ops.gdn_step_phi_cuda import gdn_st
 
 
 @pytest.mark.parametrize("g", [4, 32, 64, 128])
-def test_full_runtime_graph_with_paged_rings_and_staggered_flush(g, monkeypatch):
+@pytest.mark.parametrize("layout", ["decode", "mixed"])
+def test_full_runtime_graph_with_paged_rings_and_staggered_flush(
+    g, layout, monkeypatch
+):
     """Catch runtime dispatch, page-stride, and device flush-count errors."""
     from vllm.third_party.flash_linear_attention.ops.fused_recurrent_replayssm import (
         fused_recurrent_gated_delta_rule_replayssm as decode,
@@ -59,10 +62,11 @@ def test_full_runtime_graph_with_paged_rings_and_staggered_flush(g, monkeypatch)
     widths = ids.new_tensor([0, 1, g, g - 1, g, max(1, g - 3), 0, g, g])
     rows = ids.new_tensor([3, 1, 2, 0, 3])
     mixed = torch.randn(batch, 2 * h * k + hv * k, device="cuda", dtype=torch.bfloat16)
-    a = torch.full((batch, hv), -3.0, device="cuda")
+    a = torch.full((batch, hv), -3.0, device="cuda", dtype=torch.bfloat16)
     b = torch.randn_like(a)
     a_log = torch.zeros(hv, device="cuda")
-    bias = torch.zeros_like(a_log)
+    # Qwen keeps A_log in FP32 while dt_bias is a BF16 model parameter.
+    bias = torch.randn_like(a_log, dtype=torch.bfloat16) * 0.1
     runtime = FullCoordinateRuntime(batch, h, hv, g, "cuda")
     worlds = []
     for use_full in (False, True):
@@ -79,7 +83,8 @@ def test_full_runtime_graph_with_paged_rings_and_staggered_flush(g, monkeypatch)
         beta = torch.zeros(ns, hv, w, device="cuda")
         qbar = torch.zeros(ns, h, k, device="cuda")
         kbar = torch.zeros_like(qbar)
-        output = torch.zeros(batch, 1, hv, k, dtype=mixed.dtype, device="cuda")
+        output_shape = (batch, 1, hv, k) if layout == "decode" else (1, batch, hv, k)
+        output = torch.zeros(output_shape, dtype=mixed.dtype, device="cuda")
         pos = ids.new_tensor([15, 0, 7, 0])
         common = dict(
             ls6_ubar=u,
@@ -144,7 +149,7 @@ def test_full_runtime_graph_with_paged_rings_and_staggered_flush(g, monkeypatch)
         # The legacy path records beta in its model hook; the new step fuses it.
         def token(kwargs=kwargs, pos=pos, beta=beta, use_full=use_full):
             if not use_full:
-                beta[mapping[ids].long(), :, pos.long()] = torch.sigmoid(b)
+                beta[mapping[ids].long(), :, pos.long()] = torch.sigmoid(b).float()
             decode(**kwargs)
             pos.copy_((pos + 1) % w)
 

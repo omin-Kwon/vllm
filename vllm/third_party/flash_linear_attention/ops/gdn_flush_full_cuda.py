@@ -1124,7 +1124,9 @@ class FlushWorkspace:
         self.max_rows, self.h, self.hv, self.g = max_rows, h, hv, g
         self.ridge = float(ridge)
         # The initialization phase needs only the key-head dimension, not rings.
-        self._refresh_keys = torch.empty((0, h, 16, 128), device=device)
+        self._refresh_keys = torch.empty(
+            (0, h, 16, 128), dtype=torch.float32, device=device
+        )
         self.scratch = torch.empty(
             max_rows * hv * 128 * g, dtype=torch.float32, device=device
         )

@@ -143,7 +143,7 @@ template <int K, int V, int GT, int HPG, typename TIO>
 __global__ void __maxnreg__(80)
 gdn_step_kernel(
     const TIO* __restrict__ mixed_qkv, const void* __restrict__ a, const void* __restrict__ b, int ab_code,
-    const void* __restrict__ A_log, const void* __restrict__ dt_bias, int p_code,
+    const void* __restrict__ A_log, const void* __restrict__ dt_bias, int p_code, int bias_code,
     TIO* __restrict__ out, const float* __restrict__ h0,
     float* __restrict__ d_cache, float* __restrict__ k_cache, float* __restrict__ g_cache,
     const int* __restrict__ ssm_state_indices, const int* __restrict__ write_pos, float scale,
@@ -199,7 +199,7 @@ gdn_step_kernel(
     const float a_val = ldx(a, ab_code, (long)i_n * s_a + i_hv);
     const float b_val = ldx(b, ab_code, (long)i_n * s_b + i_hv);
     const float Al = ldx(A_log, p_code, i_hv);
-    const float dtb = ldx(dt_bias, p_code, i_hv);
+    const float dtb = ldx(dt_bias, bias_code, i_hv);
     TIO* p_o = out + (long)(i_n * HV + i_hv) * V + lane * VL;
     if (sidx <= 0) { st4<TIO>(p_o, make_float4(0.f, 0.f, 0.f, 0.f)); return; }
     const int mh = mh_raw;
@@ -513,7 +513,7 @@ void launch(torch::Tensor mixed, torch::Tensor a, torch::Tensor b, torch::Tensor
     }
     gdn_step_kernel<K,V,GT,HPG,TIO><<<dim3(B,H),96,SMEM,at::cuda::getCurrentCUDAStream()>>>(
         (const TIO*)mixed.data_ptr(), a.data_ptr(), b.data_ptr(), dt_code(a),
-        alog.data_ptr(), bias.data_ptr(), dt_code(alog), (TIO*)out.data_ptr(), state.data_ptr<float>(),
+        alog.data_ptr(), bias.data_ptr(), dt_code(alog), dt_code(bias), (TIO*)out.data_ptr(), state.data_ptr<float>(),
         writes.data_ptr<float>(), keys.data_ptr<float>(), gates.data_ptr<float>(),
         index.data_ptr<int>(), pos.data_ptr<int>(), (float)scale,
         u.data_ptr<float>(),phi.data_ptr<float>(),widths.data_ptr<int>(),factors.data_ptr<float>(),mapping.data_ptr<int>(), beta_ring.has_value() ? beta_ring->data_ptr<float>() : nullptr,
@@ -629,8 +629,8 @@ def step(
         raise ValueError("CUDA tensors on one device are required")
     if mixed.dtype not in (torch.float32, torch.bfloat16) or out.dtype != mixed.dtype:
         raise ValueError("Matching FP32/BF16 I/O required")
-    if a.dtype != b.dtype or a_log.dtype != bias.dtype:
-        raise ValueError("Gate input dtype pairs must match")
+    if a.dtype != b.dtype:
+        raise ValueError("Gate activation input dtypes must match")
     for tensor in (a, b, a_log, bias):
         if (
             tensor.dtype not in (torch.float32, torch.float16, torch.bfloat16)
