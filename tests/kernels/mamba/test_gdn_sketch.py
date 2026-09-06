@@ -6,6 +6,8 @@ Guard identity elision and packed per-head addressing, graph replay, padding,
 heterogeneous dense/sketch heads, and compatibility with exact WY refresh.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -18,6 +20,147 @@ from vllm.third_party.flash_linear_attention.ops.gdn_step_full_cuda import (
     step as cuda_step,
 )
 from vllm.third_party.flash_linear_attention.ops.gdn_step_phi_cuda import gdn_step_cuda
+
+
+@pytest.mark.parametrize("g", [4, 32, 64, 128])
+def test_full_runtime_graph_with_paged_rings_and_staggered_flush(g, monkeypatch):
+    """Catch runtime dispatch, page-stride, and device flush-count errors."""
+    from vllm.third_party.flash_linear_attention.ops.fused_recurrent_replayssm import (
+        fused_recurrent_gated_delta_rule_replayssm as decode,
+    )
+    from vllm.third_party.flash_linear_attention.ops.gdn_full_runtime import (
+        FullCoordinateRuntime,
+    )
+    from vllm.third_party.flash_linear_attention.ops.gdn_ls6_epilogue_cuda import (
+        gdn_ls6_epilogue,
+    )
+
+    monkeypatch.setenv("NS_GDN_STEP_IMPL", "cuda")
+    monkeypatch.setenv("NS_GDN_FLUSH_IMPL", "stream")
+    torch.manual_seed(982)
+    ns, batch, h, hv, k, w = 5, 4, 3, 9, 128, 16
+    shapes = [(hv, k, k), (hv, w, k), (h, w, k), (hv, w)]
+    sizes = [math.prod(shape) for shape in shapes]
+    page = ((sum(sizes) + 127) // 128 + 1) * 128
+    initial = torch.randn(ns, page, device="cuda") * 0.03
+
+    def buffers():
+        storage = initial.clone()
+        views, offset = [], 0
+        for shape, size in zip(shapes, sizes):
+            views.append(storage[:, offset : offset + size].view(ns, *shape))
+            offset += size
+        for ring in views[1:]:
+            ring.zero_()
+        return storage, views
+
+    ids = torch.tensor([3, 1, 2, 0], dtype=torch.int32, device="cuda")
+    mapping = ids.new_tensor([0, 2, 3, 1, 4])
+    widths = ids.new_tensor([0, 1, g, g - 1, g, max(1, g - 3), 0, g, g])
+    rows = ids.new_tensor([3, 1, 2, 0, 3])
+    mixed = torch.randn(batch, 2 * h * k + hv * k, device="cuda", dtype=torch.bfloat16)
+    a = torch.full((batch, hv), -3.0, device="cuda")
+    b = torch.randn_like(a)
+    a_log = torch.zeros(hv, device="cuda")
+    bias = torch.zeros_like(a_log)
+    runtime = FullCoordinateRuntime(batch, h, hv, g, "cuda")
+    worlds = []
+    for use_full in (False, True):
+        storage, (state, writes, keys, gates) = buffers()
+        if not use_full:
+            state = state.contiguous()
+            # The unchanged legacy wrapper accepts only contiguous rings.
+            writes, keys, gates = [x.contiguous() for x in (writes, keys, gates)]
+        u = torch.full((ns, hv, g, k), float("nan"), device="cuda")
+        phi = torch.full_like(u, float("nan"))
+        aq = torch.zeros(ns, hv, g, device="cuda")
+        ak = torch.zeros_like(aq)
+        factors = torch.zeros(ns, hv, w, g, device="cuda")
+        beta = torch.zeros(ns, hv, w, device="cuda")
+        qbar = torch.zeros(ns, h, k, device="cuda")
+        kbar = torch.zeros_like(qbar)
+        output = torch.zeros(batch, 1, hv, k, dtype=mixed.dtype, device="cuda")
+        pos = ids.new_tensor([15, 0, 7, 0])
+        common = dict(
+            ls6_ubar=u,
+            ls6_phi=phi,
+            ls6_mh=widths,
+            ls6_fs=factors,
+            ls6_r=128,
+            ls6_map=mapping,
+            ls6_beta=beta,
+        )
+        if use_full:
+            runtime.refresh(state, ids, mapping, widths, u, phi)
+            common["ls6_full_workspace"] = runtime
+        else:
+            gdn_ls6_epilogue(
+                state,
+                rows,
+                rows[batch:],
+                mapping,
+                qbar,
+                kbar,
+                widths,
+                u,
+                phi,
+                aq,
+                ak,
+                batch,
+                h,
+                hv,
+                k,
+                k,
+                g,
+                128,
+            )
+            common.update(
+                ls6_aq=aq,
+                ls6_ak=ak,
+                fz_nf=torch.where(widths > 0, 0, k).int(),
+                fz_u=torch.zeros(ns, hv, k, device="cuda"),
+                fz_z=torch.zeros(ns, hv, k, device="cuda"),
+                fz_qbar=qbar,
+                fz_kbar=kbar,
+            )
+        kwargs = dict(
+            mixed_qkv=mixed,
+            a=a,
+            b=b,
+            A_log=a_log,
+            dt_bias=bias,
+            scale=k**-0.5,
+            initial_state=state,
+            d_cache=writes,
+            k_cache=keys,
+            g_cache=gates,
+            out=output,
+            ssm_state_indices=ids,
+            write_pos=pos,
+            use_qk_l2norm_in_kernel=True,
+            **common,
+        )
+
+        # The legacy path records beta in its model hook; the new step fuses it.
+        def token(kwargs=kwargs, pos=pos, beta=beta, use_full=use_full):
+            if not use_full:
+                beta[mapping[ids].long(), :, pos.long()] = torch.sigmoid(b)
+            decode(**kwargs)
+            pos.copy_((pos + 1) % w)
+
+        token()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            token()
+        # CUDA graphs retain pointers, so keep every input allocation alive.
+        worlds.append((graph, storage, output, state, kwargs))
+    for _ in range(48):
+        for graph, *_ in worlds:
+            graph.replay()
+        torch.testing.assert_close(worlds[0][2], worlds[1][2], atol=4e-3, rtol=4e-3)
+        torch.testing.assert_close(worlds[0][3], worlds[1][3], atol=5e-5, rtol=4e-3)
+    for _, storage, _, _, _ in worlds:
+        torch.testing.assert_close(storage[:, -128:], initial[:, -128:], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("pattern", ["random", "collinear", "zero"])

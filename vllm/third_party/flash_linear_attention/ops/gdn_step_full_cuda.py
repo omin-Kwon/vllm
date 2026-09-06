@@ -619,9 +619,12 @@ def step(
         (positions, (batch,)),
         (mapping, (ns,)),
     )
-    for tensor, shape in expected:
+    for index, (tensor, shape) in enumerate(expected):
         if tuple(tensor.shape) != shape or tensor.device != mixed.device:
-            raise ValueError("Invalid shape or device")
+            raise ValueError(
+                f"Invalid input {index}: shape={tuple(tensor.shape)}, "
+                f"device={tensor.device}; expected {shape} on {mixed.device}"
+            )
     if not mixed.is_cuda or state.device != mixed.device:
         raise ValueError("CUDA tensors on one device are required")
     if mixed.dtype not in (torch.float32, torch.bfloat16) or out.dtype != mixed.dtype:

@@ -1123,6 +1123,8 @@ class FlushWorkspace:
             raise ValueError("G must be a multiple of four in [4,128]; ridge >=0")
         self.max_rows, self.h, self.hv, self.g = max_rows, h, hv, g
         self.ridge = float(ridge)
+        # The initialization phase needs only the key-head dimension, not rings.
+        self._refresh_keys = torch.empty((0, h, 16, 128), device=device)
         self.scratch = torch.empty(
             max_rows * hv * 128 * g, dtype=torch.float32, device=device
         )
@@ -1142,6 +1144,9 @@ class FlushWorkspace:
         self, phase, state, writes, keys, gates, rows, mapping, widths, beta, u, phi
     ):
         nx, hv, v, k = state.shape
+        if phase == 4:
+            writes = gates = beta = state
+            keys = self._refresh_keys
         ns = u.shape[0]
         if (
             (hv, v, k) != (self.hv, 128, 128)
@@ -1164,6 +1169,8 @@ class FlushWorkspace:
             ("phi", phi, (ns, hv, self.g, 128), torch.float32),
         ]
         for name, tensor, shape, dtype in tensors:
+            if phase == 4 and name in ("writes", "keys", "gates", "beta"):
+                continue
             if (
                 tuple(tensor.shape) != shape
                 or tensor.dtype != dtype
@@ -1172,11 +1179,14 @@ class FlushWorkspace:
                 raise ValueError(
                     f"invalid {name}: expected {shape}, {dtype}, {self.scratch.device}"
                 )
+            paged = name in ("state", "writes", "keys", "gates")
             if (
-                name != "state" and not tensor.is_contiguous()
-            ) or tensor.data_ptr() % 16:
+                (not paged and not tensor.is_contiguous())
+                or (paged and not tensor[0].is_contiguous())
+                or tensor.data_ptr() % 16
+            ):
                 raise ValueError(
-                    f"{name} must be contiguous (except state pages) and aligned to 16 bytes"
+                    f"{name} must have contiguous tails and aligned storage"
                 )
         with torch.cuda.device(state.device):
             self._ext.run(
@@ -1206,3 +1216,7 @@ class FlushWorkspace:
     def refresh(self, state, writes, keys, gates, rows, mapping, widths, beta, u, phi):
         """Initialize metadata from an exact prefill/boundary state without folding."""
         self._run(4, state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+
+    def refresh_state(self, state, rows, mapping, widths, u, phi):
+        """Build boundary metadata before any decode ring has been written."""
+        self._run(4, state, None, None, None, rows, mapping, widths, None, u, phi)

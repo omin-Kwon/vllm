@@ -1259,6 +1259,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
     # checkpoint deltas immediately before the ordinary decay-plus-delta fold.
     ls6_beta: torch.Tensor | None = None,
     ls6_r: int = 0,
+    ls6_full_workspace=None,
     # 슬롯 간접 (NX,) int32: fz_*/ls6_* 버퍼의 dim0 이 NX 가 아니라 compact NS 일 때. None = 항등.
     ls6_map: torch.Tensor | None = None,
     fz_nf: torch.Tensor | None = None,
@@ -1362,6 +1363,19 @@ def fused_recurrent_gated_delta_rule_replayssm(
         )
     if g_cache.dtype != torch.float32:
         raise ValueError(f"`g_cache` must be float32 (got {g_cache.dtype}).")
+
+    if ls6_full_workspace is not None:
+        if ls6_r != K or not use_qk_l2norm_in_kernel:
+            raise ValueError("full-coordinate GDN requires r=K and Q/K normalization")
+        if any(t is None for t in (ls6_ubar, ls6_phi, ls6_mh, ls6_fs, ls6_map, ls6_beta)):
+            raise ValueError("full-coordinate GDN requires complete boundary metadata")
+        if any(t is not None for t in (ls6_z, ls6_zbar, ls6_zk)):
+            raise ValueError("full-coordinate GDN does not consume truncated Z metadata")
+        return ls6_full_workspace.decode(
+            mixed_qkv, a, b, A_log, dt_bias, out, initial_state,
+            d_cache, k_cache, g_cache, ssm_state_indices, write_pos,
+            ls6_ubar, ls6_phi, ls6_mh, ls6_fs, ls6_map, ls6_beta, scale,
+        )
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
