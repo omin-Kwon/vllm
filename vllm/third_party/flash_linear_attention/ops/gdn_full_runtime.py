@@ -26,8 +26,8 @@ def _flush_rows(
 class FullCoordinateRuntime:
     """One reusable workspace per layer; rows/count remain on the device."""
 
-    def __init__(self, max_rows, h, hv, g, device):
-        self.flush = FlushWorkspace(max_rows, h, hv, g, device)
+    def __init__(self, max_rows, h, hv, g, device, *, widths=None):
+        self.flush = FlushWorkspace(max_rows, h, hv, g, device, widths=widths)
         self.rows = torch.empty(max_rows + 1, dtype=torch.int32, device=device)
         self.max_rows = max_rows
 

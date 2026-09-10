@@ -401,10 +401,16 @@ export NS_GDN_FULL_FLUSH_BUILD_DIR=/disk2/omin/.cache/gdn_full_flush
 .venv/bin/python benchmarks/kernels/benchmark_gdn_sketch.py --flush --output /tmp/gdn_flush.json
 ```
 
-## Comparison with base ReplaySSM flush
+## Comparison with our optimized dense ReplaySSM flush
+
+Provenance correction (September 7): the "base" timings in this section are
+our CUDA rewrite with approximation disabled, not the original GDN ReplaySSM
+port. They are an internal optimized baseline. The original source pin and
+paper comparison boundaries are recorded in
+[GDN ReplaySSM baseline provenance](gdn_replayssm_baseline_provenance.md).
 
 The preceding "old" columns mean the old sketch/anchor implementation, not
-base ReplaySSM. A separate B200 run now measures the actual default ReplaySSM
+dense ReplaySSM. A separate B200 run measures our default CUDA ReplaySSM
 dispatch, `gdn_flush_cuda` with all sketch/frozen/beta arguments absent (G=1,
 TV=8, grid=4*SM=592), and the established stream implementation with all widths
 zero (grid=2*SM=296). Stream totals include prep and the empty solve launch;
@@ -417,7 +423,7 @@ the basic CUDA flush was 362 us, while v12's dense stream kernel alone was
 281 us. In particular, comparing those B256 numbers with the preceding B128
 sketch numbers would mix batch sizes and, for 281 us, timing boundaries.
 
-| Batch | Sketch allocation | Base ReplaySSM, us | ReplaySSM stream total, us | New sketch flush, us | Sketch / base time |
+| Batch | Sketch allocation | Our CUDA ReplaySSM, us | ReplaySSM stream total, us | New sketch flush, us | Sketch / CUDA dense time |
 | ---: | :--- | ---: | ---: | ---: | ---: |
 | 128 | m=8 uniform | 180.68 | 160.82 | 451.27 | 2.50x |
 | 128 | m=32, 25% dense | 180.86 | 160.74 | 1357.04 | 7.50x |
@@ -459,8 +465,9 @@ penalties, and the separate m128 identity fast path.
 The full-coordinate flush now uses warp-private Gram tiles and width-specific
 RHS solves. At B128 with uniform heads, m8 flush is 451 -> 263 us and m32 is
 1488 -> 591 us; m33 is 2765 -> 768 us. The m8 complete window is 731 -> 545 us.
-The m32 25%-dense complete window is 2244 -> 1442 us. Native ReplaySSM flush
-remains faster (182 us at B128). Full m128 sees about 10 us of additional empty
+The m32 25%-dense complete window is 2244 -> 1442 us. Our CUDA dense ReplaySSM flush
+remains faster (182 us at B128; our optimized CUDA dense implementation, not
+the original GDN port). Full m128 sees about 10 us of additional empty
 bucket launch overhead; partial widths above 64 retain the previous solver.
 
 See [the updated width analysis](gdn_flush_width_analysis.md) for all timings,

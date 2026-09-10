@@ -181,6 +181,103 @@ Both factorization and RHS application matter; their balance changes with m.
 - These are kernel experiments with synthetic inputs, not end-to-end model
   accuracy or serving-throughput results. Production dispatch has not changed.
 
+## 2026-09-07: deferred solve, register Cholesky and memory access
+
+Super evaluation is stopped at the user's request. New experiments compare
+against the fixed-allocation solve plan described in `gdn_flush_solve_plan.md`.
+They do not change the serving dispatch. The same B128/H16/HV48/W16 dimensions
+and graph/event timing method above apply.
+
+### Cache a factor and solve just one vector per token
+
+`gdn_deferred_research.py` stores raw `C=Z_eta.T=[M,B]` instead of solved P,
+plus a Cholesky factor. Linearity permits raw-C projected WY factors, with
+`M^-1` applied only to the final query coefficient. This replaces K-m RHS
+solves at flush with one vector solve per token. No explicit inverse is built;
+the ridge numerator and exact state fold remain unchanged. It adds a persistent
+FP32 G-by-G factor per slot/value head (4 KiB at G32).
+
+The first version read the factor globally during substitutions. The second
+asynchronously preloads it into shared memory before the existing step work.
+Both passed three-window comparisons, including transformed projected factors.
+Small mixed cases cover FP32/BF16 gates and m8/16/32/64. Maximum output error is
+1.22e-4 there and 2.44e-4 in B128 runs; exact state error is zero. Reassociation
+means output bitwise identity is not claimed. These checks do not establish
+long model trajectory accuracy or numerical behavior for arbitrary ridge.
+
+| m | Current flush | Factor-cache flush | Current cycle | Global-factor cycle | Shared-factor cycle |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 | 263.47 | 256.86 | 546.53 | 598.16 | 582.72 |
+| 16 | 345.67 | 319.60 | 793.05 | 945.17 | 815.60 |
+| 32 | 582.32 | 490.28 | 1278.71 | 1665.12 | 1419.46 |
+| 64 | 1411.91 | 901.89 | 2605.93 | 4030.94 | 3636.80 |
+
+Current/flush columns are from the shared-factor run; global-factor cycles are
+from its separately recorded run. Moving solves successfully reduced flush,
+but increased whole-cycle time at every measured width. It is not a deployment
+candidate on this evidence. Extra cache reads and serial triangular dependency
+are plausible costs; they were not separately profiled in these variants.
+
+### Small Cholesky in warp registers
+
+`gdn_warp_cholesky_research.py` factors m<=32 within one warp using register rows
+and shuffles, leaving RHS substitutions and the stored representation intact.
+It replaces per-panel block barriers, but the measured gain is small. For
+m8/16/32, solve changes 27.25/70.39/232.19 to 23.47/66.11/225.50 us. Complete
+cycles change 546.42/793.26/1278.27 to 542.26/780.39/1279.70 us. Thus m32 has
+no observed whole-cycle benefit in this run.
+
+All three-window benchmark comparisons reported zero output/state/Phi error.
+The opt-in existing pytest suite adds CUDA graph trajectories, dense/full-width
+endpoints, compact mappings and independent recurrence oracles, and stresses
+all m1..32 on random/collinear/zero states at scales 1e-3/1/1e3: 25 cases pass.
+The independent oracle uses FP64; the kernel remains FP32. Resource inspection
+finds 32/48/64 registers at m8/16/32, with no local spills.
+
+### Profiling found strided RHS loads
+
+Nsight Compute on current m32 reports 72% excessive global sectors and only
+5.1 useful bytes per 32-byte sector for global loads. RHS loading assigned
+adjacent lanes adjacent RHS columns, while scratch stores each column's m
+entries contiguously. Thus those lanes read addresses separated by G floats.
+The `coalesced` candidate changes only the assignment of load iterations:
+
+```text
+old: i=o/ncol, c=o%ncol
+new: i=o%m,    c=o/m
+same assignment: sX[i*NCS+c] = scratch[(m+c)*G+i]
+```
+
+Each destination receives exactly the same FP32 bits before the same block
+barrier. Cholesky, RHS arithmetic, layout, precision and persistent capacity
+are unchanged. This candidate does not use the warp-factor change above.
+
+| m | Current solve | Coalesced solve | Current flush | Coalesced flush | Current cycle | Coalesced cycle |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 27.30 | 27.18 | 263.67 | 263.64 | 546.54 | 546.23 |
+| 16 | 70.40 | 64.16 | 346.56 | 340.26 | 793.31 | 777.93 |
+| 32 | 232.32 | 183.84 | 582.40 | 533.25 | 1278.36 | 1233.00 |
+| 64 | 889.57 | 849.38 | 1416.67 | 1374.62 | 2608.73 | 2556.86 |
+
+The profiler replay ran at different SM clocks (about 1.12 GHz); its 396 us
+duration is diagnostic and is not used in the timing table. Benchmark clocks
+and ordinary graph/event timings must be used for speed comparisons.
+
+The coalesced candidate passes all 16 opt-in graph/window regression cases
+(G4/8/16/20/32/36/64/128, FP32/BF16 gates), including independent recurrence
+and boundary coefficient checks. The B128 three-window comparisons above
+report zero output and state error. No model evaluation was resumed.
+
+Sources are research modules in `benchmarks/kernels`; raw JSON, logs, generated
+global-factor source, resource/profile artifacts and the algebra oracle are in
+`/disk2/omin/kda-latch-results/gdn_solver_research/deferred_20260907/`.
+The coalesced source is a promising measured implementation fix, not evidence
+that the runtime Gram or solve can be discarded.
+
+Exact conditions on Omega, calibration whitening versus runtime whitening,
+and invariant-subspace cancellation are derived in
+`nested_ssm/docs/latch/GDN_OMEGA_NO_SOLVE_CONDITIONS_20260907.md`.
+
 ## Why other apparent shortcuts are not drop-in identities
 
 For $H'=aH+XB^T$ with update rank at most W, the new Gram differs from $a^2M$

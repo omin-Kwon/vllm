@@ -1,0 +1,66 @@
+{
+  "scope": "Historical B200 evidence and unsuccessful RTX architecture compatibility attempt. Original pre-cleanup staged-source hashes below identify the preserved working tree, not a newly proven match to every historical run.",
+  "base_commit": "9e1ee3f954d864bb78345fa2d35b6a7139ed5aa1",
+  "source_sha256_before_lint_cleanup": {
+    "benchmarks/kernels/benchmark_gdn_fixed_metric.py": "70a736e12ddb4e4f82105628633e7c207d5b601e59844cb7aa4102bd4d8e376e",
+    "benchmarks/kernels/benchmark_gdn_flush_scheduling.py": "b9c50875da7aecfa199748b8a23c5d0fecf1f66c4aff0a73cd591da3b45a42ef",
+    "benchmarks/kernels/benchmark_gdn_sketch.py": "6fdcd736802f82b08936542bd16ecd5769d69186b95262fa5401323a42e5e94d",
+    "benchmarks/kernels/benchmark_gdn_solver_windows.py": "5a8ec9b99a01a6d476facde12844b87c7f82126a700ae24ebdf61c033e7f6cab",
+    "benchmarks/kernels/gdn_deferred_research.py": "201da91df060f5d407ea1e341f48e9aa319f013e5932cf591bcff65d7626c49c",
+    "benchmarks/kernels/gdn_fixed_metric_research.py": "5c6ad70d5c9d5f1c899ce0e1e2fe737a5ac22dc49cecd37c2b1b464a699d5b30",
+    "benchmarks/kernels/gdn_unfolded_research.py": "5ffd1d927c70d034f8fdc050cb4e26c6ed10325d0dad1e057c6db869ee039e2a",
+    "benchmarks/kernels/gdn_warp_cholesky_research.py": "d26199cf7203adb6111f2dbaa800aabf8d3bd41cb880eb5ceb4be2c79b6fe066",
+    "docs/design/gdn_fixed_metric.md": "00043bef709227232790fe70482bab6233ee02cf08d74f3ab8994755be023e25",
+    "docs/design/gdn_flush_solve_plan.md": "58def972ae5af8f4cb822021f11cabdc321221c751e04022907ad2dd5379d484",
+    "docs/design/gdn_flush_width_analysis.md": "eca8d749e04b9b2f77c7ce2d08293101cea67483d8684b0f84e9e8d5b0bcfd10",
+    "docs/design/gdn_replayssm_baseline_provenance.md": "42c785061699378dcf61cbd112b1111d312587dbfe537dfbb8f66afd6ee08fb8",
+    "docs/design/gdn_sketch_full_dimension.md": "698988269372e81b3f38cc3e0139a7c47fcee36cbfdf725afbf8439a7c51ee0b",
+    "docs/design/gdn_solver_research.md": "8cf9393deaa715ffb28951338d2cc40016d0fe6bf681e9f7ab66912a9fc9577f",
+    "tests/kernels/mamba/test_gdn_sketch.py": "7d6fcfcfbdf2194e5a779041e588b9931e5fdf904ffb4f6d8b89f525253a4b5d",
+    "vllm/model_executor/layers/mamba/gdn/gdn_ls6.py": "c29ee3b156741ba235ed4a7c1e81b7caa836551b1ec170c6c1fabfeb5313aa4c",
+    "vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py": "80855187fd01bac87ff159a97bcfbc448f4eaaf18a6eec7032f19a6889a4b68f",
+    "vllm/third_party/flash_linear_attention/ops/gdn_full_runtime.py": "4106a0282073c25c0bfe2bff90e877afcbdb76bab5da67add07776e796e0907f"
+  },
+  "evidence": {
+    "solve_plan_20260907_pytest_plan.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_full_dimension_review/solve_plan_20260907/pytest_plan.log",
+      "sha256": "0a653c7a91fe27069375a60aa6798c0f53505b4e7510526434fb869076e7e80b"
+    },
+    "solve_plan_20260907_pytest_integration.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_full_dimension_review/solve_plan_20260907/pytest_integration.log",
+      "sha256": "ddb490044ca195712c44a4ddafd4b6ed59c1766de81e2636330fa817403f8894"
+    },
+    "solve_plan_20260907_pytest_baseline_bits.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_full_dimension_review/solve_plan_20260907/pytest_baseline_bits.log",
+      "sha256": "7a5a9185913f0571d980d109648de50e90bd2e1c061855059bd92ac1b3ecacee"
+    },
+    "solve_plan_20260907_verification.json": {
+      "source": "/disk2/omin/kda-latch-results/gdn_full_dimension_review/solve_plan_20260907/verification.json",
+      "sha256": "67ed146cb9975a1b776d18b10c20487d6b3a0fc1c68477b10fe664e0723ff0b4"
+    },
+    "deferred_20260907_pytest_warp.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_solver_research/deferred_20260907/pytest_warp.log",
+      "sha256": "7e0de9410264421d42d646f6362495e39b9ad2a98474694019d9c466a3a2ecd4"
+    },
+    "deferred_20260907_pytest_coalesced.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_solver_research/deferred_20260907/pytest_coalesced.log",
+      "sha256": "0b2541aa2736f2b4359e4a3fc5c6dbaf28bac8c69a456025e382ad308678df34"
+    },
+    "fixed_metric_20260907_pytest.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_solver_research/fixed_metric_20260907/pytest.log",
+      "sha256": "cb46a4517752939f765840a000c9858829f9551cd280508d72bc7e717fc08a0b"
+    },
+    "fixed_metric_20260907_memcheck.log": {
+      "source": "/disk2/omin/kda-latch-results/gdn_solver_research/fixed_metric_20260907/memcheck.log",
+      "sha256": "5ac8a6504458c20b71bf6c930bbe8fd0c3dc4b4548057557503bcbcdfccda024"
+    },
+    "fixed_metric_20260907_manifest.json": {
+      "source": "/disk2/omin/kda-latch-results/gdn_solver_research/fixed_metric_20260907/manifest.json",
+      "sha256": "63d2b50e4b7c1e3d586bb0dd1e365925cd7804f1ccfa8f3b9d84d9677e7a8bfb"
+    },
+    "rtx_plan_attempt.log": {
+      "source": "/tmp/gdn_archive_plan_20260910.log",
+      "sha256": "6dc0ec60f1dfe50621a98c348f5931e6421cdc6e630129fb69d828eb93bd2447"
+    }
+  }
+}

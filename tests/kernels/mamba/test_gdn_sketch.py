@@ -67,7 +67,7 @@ def test_full_runtime_graph_with_paged_rings_and_staggered_flush(
     a_log = torch.zeros(hv, device="cuda")
     # Qwen keeps A_log in FP32 while dt_bias is a BF16 model parameter.
     bias = torch.randn_like(a_log, dtype=torch.bfloat16) * 0.1
-    runtime = FullCoordinateRuntime(batch, h, hv, g, "cuda")
+    runtime = FullCoordinateRuntime(batch, h, hv, g, "cuda", widths=widths)
     worlds = []
     for use_full in (False, True):
         storage, (state, writes, keys, gates) = buffers()
@@ -228,7 +228,8 @@ def test_augmented_qr_preserves_ridge_projection(monkeypatch, pattern, scale):
 
 @pytest.mark.parametrize("g", [4, 8, 16, 20, 32, 36, 64, 128])
 @pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16])
-def test_full_dimension_gpu_flush_across_windows(g, gate_dtype):
+@pytest.mark.parametrize("solver", ["current", "warp", "coalesced"])
+def test_full_dimension_gpu_flush_across_windows(g, gate_dtype, solver, monkeypatch):
     """Catch refresh/fold/addressing errors through actual next-window outputs.
 
     The unchanged stream+solve is one oracle; a dense recurrence and FP64
@@ -241,6 +242,24 @@ def test_full_dimension_gpu_flush_across_windows(g, gate_dtype):
     from vllm.third_party.flash_linear_attention.ops.gdn_flush_stream_cuda import (
         gdn_flush_stream,
     )
+
+    workspace_cls = FlushWorkspace
+    if solver != "current":
+        import os
+        from pathlib import Path
+
+        if os.environ.get("NS_GDN_WARP_RESEARCH_TESTS") != "1":
+            pytest.skip("Opt-in B200 warp Cholesky research kernel")
+        root = Path(__file__).resolve().parents[3]
+        monkeypatch.syspath_prepend(str(root / "benchmarks/kernels"))
+        from gdn_warp_cholesky_research import (
+            CoalescedSolveWorkspace,
+            WarpCholeskyWorkspace,
+        )
+
+        workspace_cls = (
+            CoalescedSolveWorkspace if solver == "coalesced" else WarpCholeskyWorkspace
+        )
 
     torch.manual_seed(173)
     dev = "cuda"
@@ -274,7 +293,7 @@ def test_full_dimension_gpu_flush_across_windows(g, gate_dtype):
         ]
 
     actual, reference = rings(), rings()
-    workspace = FlushWorkspace(batch, h, hv, g, dev, ridge=0.1, grid=2)
+    workspace = workspace_cls(batch, h, hv, g, dev, ridge=0.1, grid=2, widths=mh)
     args = (
         state,
         actual[0],
@@ -490,6 +509,200 @@ def test_full_dimension_gpu_flush_across_windows(g, gate_dtype):
         assert phi[0].isnan().all() and u[0].isnan().all()
 
 
+@pytest.mark.parametrize("pattern", ["random", "collinear", "zero"])
+@pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
+def test_warp_cholesky_ridge_and_padding(monkeypatch, pattern, scale):
+    """Check every small width against independent ridge solves, including rank loss."""
+    import os
+    from pathlib import Path
+
+    if os.environ.get("NS_GDN_WARP_RESEARCH_TESTS") != "1":
+        pytest.skip("Opt-in B200 warp Cholesky research kernel")
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(root / "benchmarks/kernels"))
+    from gdn_warp_cholesky_research import WarpCholeskyWorkspace
+
+    torch.manual_seed(824)
+    ns, h, hv, g = 5, 11, 33, 128
+    state = torch.randn(ns, hv, 128, 128, device="cuda") * scale
+    if pattern == "collinear":
+        state = state[..., :1].expand_as(state).clone()
+    elif pattern == "zero":
+        state.zero_()
+    before = state.clone()
+    u = torch.full((ns, hv, g, 128), float("nan"), device="cuda")
+    phi = torch.full_like(u, float("nan"))
+    widths = torch.arange(hv, dtype=torch.int32, device="cuda")
+    rows = widths.new_tensor([3, 1, 2, 0, 3])
+    mapping = widths.new_tensor([0, 3, 1, 2, 4])
+    workspace = WarpCholeskyWorkspace(4, h, hv, g, "cuda", ridge=0.1, widths=widths)
+    args = (state, None, None, None, rows, mapping, widths, None, u, phi)
+    workspace.refresh(*args)
+    for slot in [1, 2, 3]:
+        compact = int(mapping[slot])
+        for m in range(1, 33):
+            matrix = state[slot, m].double()
+            gram = matrix.T @ matrix
+            gram += 0.1 * gram.trace() / 128 * torch.eye(128, device="cuda")
+            # FP64 is confined to the independent test oracle, never the kernel.
+            expected = torch.eye(m, 128, device="cuda", dtype=torch.float64)
+            if pattern != "zero":
+                expected = torch.linalg.solve(gram[:m, :m], gram[:m])
+            torch.testing.assert_close(
+                phi[compact, m, :m].double(), expected, atol=3e-5, rtol=3e-3
+            )
+            torch.testing.assert_close(
+                u[compact, m, :m].T, state[slot, m, :, :m], atol=0, rtol=0
+            )
+            assert torch.count_nonzero(u[compact, m, m:]) == 0
+            assert torch.count_nonzero(phi[compact, m, m:]) == 0
+    torch.testing.assert_close(state, before, atol=0, rtol=0)
+    assert u[[0, 4]].isnan().all() and phi[[0, 4]].isnan().all()
+    assert u[:, 0].isnan().all() and phi[:, 0].isnan().all()
+
+
+@pytest.mark.parametrize("g", [4, 8, 20, 32, 64, 128])
+@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16])
+def test_fixed_metric_graph_reads_and_exact_state(monkeypatch, g, gate_dtype):
+    """Validate the changed read against a direct recurrence, keeping exact writes.
+
+    Fixed and dynamic reads intentionally differ. A dense recurrence starting
+    from H_hat=H[:,:m] P0 is the independent read oracle for each new window.
+    Double precision appears only in this test oracle, never in the kernels.
+    """
+    import os
+    from pathlib import Path
+
+    if os.environ.get("NS_GDN_FIXED_METRIC_TESTS") != "1":
+        pytest.skip("Opt-in B200 fixed-metric research kernel")
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(root / "benchmarks/kernels"))
+    from benchmark_gdn_fixed_metric import make_worlds
+
+    widths = [0, 1, min(g, 5), g, max(1, g - 3), g - 1, 0, min(g, 64), g]
+    worlds, inputs = make_worlds(g, 4, True, gate_dtype, widths)
+    base, private, shared = worlds
+    pages = []
+    for world in worlds:
+        storage = torch.full((5, 9 * 128 * 128 + 128), 37.0, device="cuda")
+        view = storage[:, :-128].view(5, 9, 128, 128)
+        view.copy_(world.state)
+        world.state = view
+        world.args = (view, *world.args[1:])
+        pages.append(storage)
+        world.cycle(inputs)  # Initialize all CUDA entry points outside capture.
+
+    coefficients = shared.coefficients.clone()
+    for head, m in enumerate(widths):
+        if 0 < m < 128:
+            e = shared.metric[head].double()
+            expected = torch.linalg.solve(e[:m, :m], e[:m])
+            torch.testing.assert_close(
+                coefficients[head, :m].double(), expected, atol=3e-5, rtol=3e-3
+            )
+    assert shared.phi.stride(0) == 0
+    assert shared.workspace.scratch.numel() == 0
+    traces = [
+        torch.empty((16, *w.out.shape), device="cuda", dtype=w.out.dtype)
+        for w in worlds
+    ]
+    graphs = []
+    torch.accelerator.synchronize()
+    for world, trace in zip(worlds, traces):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for t in range(16):
+                world.token(t, inputs)
+                trace[t].copy_(world.out)
+            world.flush()
+        graphs.append(graph)
+
+    active = torch.tensor([0, 2, 3], device="cuda")
+    slots = shared.indices[active].long()
+    compact = shared.mapping[slots].long()
+    dense_mask = (shared.widths == 0) | (shared.widths == 128)
+    for _ in range(3):
+        boundary = shared.state[slots].double()
+        approximate = (
+            shared.u[compact].double().transpose(-1, -2) @ coefficients.double()
+        )
+        approximate = torch.where(
+            dense_mask[None, :, None, None], boundary, approximate
+        )
+        dense = boundary.clone()
+        untouched = shared.state[[0, 4]].clone()
+        for graph in graphs:
+            graph.replay()
+        torch.testing.assert_close(
+            traces[1].view(torch.int16), traces[2].view(torch.int16), atol=0, rtol=0
+        )
+        assert torch.count_nonzero(traces[2][:, 1]) == 0
+        for t in range(16):
+            mixed = inputs[0][t, active]
+            query = mixed[:, : 3 * 128].float().view(3, 3, 128)
+            query = (
+                query
+                * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+                * 128**-0.5
+            )
+            query = query.double().repeat_interleave(3, dim=1)
+            key = shared.keys[slots, :, t].double().repeat_interleave(3, dim=1)
+            alpha = shared.gates[slots, :, t].double().exp()[..., None, None]
+            beta = inputs[2][t, active].float().sigmoid().to(gate_dtype).double()
+            torch.testing.assert_close(
+                shared.beta[compact, :, t].double(), beta, atol=1e-7, rtol=1e-6
+            )
+            value = mixed[:, 6 * 128 :].double().view(3, 9, 128)
+            for matrix in (approximate, dense):
+                erased = (matrix @ key[..., None])[..., 0]
+                delta = beta[..., None] * (value - alpha[..., 0] * erased)
+                matrix.mul_(alpha).add_(delta[..., None] * key[..., None, :])
+            expected = (approximate @ query[..., None])[..., 0].to(traces[2].dtype)
+            torch.testing.assert_close(
+                traces[2][t, active], expected, atol=4e-3, rtol=4e-3
+            )
+        torch.testing.assert_close(
+            shared.state[slots].double(), dense, atol=5e-5, rtol=4e-3
+        )
+        torch.testing.assert_close(shared.state[[0, 4]], untouched, atol=0, rtol=0)
+        for world in worlds[1:]:
+            torch.testing.assert_close(
+                world.state.view(torch.int32),
+                base.state.view(torch.int32),
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                world.u.view(torch.int32), base.u.view(torch.int32), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                world.writes.view(torch.int32),
+                base.writes.view(torch.int32),
+                atol=0,
+                rtol=0,
+            )
+        torch.testing.assert_close(
+            shared.coefficients.view(torch.int32),
+            coefficients.view(torch.int32),
+            atol=0,
+            rtol=0,
+        )
+        for storage in pages:
+            assert (storage[:, -128:] == 37.0).all()
+
+    # A captured flush must observe an empty device count and leave U/state alone.
+    shared.rows[-1] = 0
+    flush_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(flush_graph):
+        shared.flush()
+    before = (shared.state.clone(), shared.u.clone())
+    flush_graph.replay()
+    for got, want in zip((shared.state, shared.u), before):
+        torch.testing.assert_close(
+            got.view(torch.int32), want.view(torch.int32), atol=0, rtol=0
+        )
+
+
 @pytest.mark.parametrize("hpg", [1, 2, 3, 4])
 def test_full_dimension_flush_worklist_rollover(hpg):
     """Exercise table refills, shared-key groups, and every actual width."""
@@ -527,7 +740,7 @@ def test_full_dimension_flush_worklist_rollover(hpg):
     qbar = torch.randn(nx, h, 128, device=dev)
     kbar = torch.randn_like(qbar)
     aq, ak = torch.zeros(nx, hv, g, device=dev), torch.zeros(nx, hv, g, device=dev)
-    workspace = FlushWorkspace(14, h, hv, g, dev, ridge=0.01, grid=1)
+    workspace = FlushWorkspace(14, h, hv, g, dev, ridge=0.01, grid=1, widths=mh)
     workspace.flush(state, writes, keys, gates, rows, mapping, mh, beta, u, phi)
     gdn_flush_stream(
         ref,
@@ -568,6 +781,75 @@ def test_full_dimension_flush_worklist_rollover(hpg):
                 )
             else:
                 assert phi[:, head].isnan().all()
+
+
+@pytest.mark.parametrize("case", ["all_widths", "dense", "identity", "small_padded"])
+def test_fixed_flush_plan_is_bitwise_equal_across_graph_replays(case):
+    """Changing solve scheduling must preserve every write, including sentinels.
+
+    Cover all bucket boundaries, empty plans, G padding, device row counts,
+    refresh and repeated folds. Reject stale allocations before launching work.
+    """
+    from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
+        FlushWorkspace,
+    )
+
+    torch.manual_seed(391)
+    values = {
+        "all_widths": list(range(129)),
+        "dense": [0, 0, 0],
+        "identity": [128, 128, 0],
+        "small_padded": [0, 1, 8, 0, 4, 128],
+    }[case]
+    ns, hv, g, batch = 4, len(values), 128, 3
+    widths = torch.tensor(values, device="cuda", dtype=torch.int32)
+    mapping = widths.new_tensor([0, 3, 1, 2])
+    rows = widths.new_tensor([3, 1, 0, 3])
+    initial = torch.randn(ns, hv, 128, 128, device="cuda") * 0.03
+    writes = torch.randn(ns, hv, 16, 128, device="cuda") * 0.03
+    keys = torch.nn.functional.normalize(torch.randn_like(writes), dim=-1)
+    gates = torch.full((ns, hv, 16), -0.05, device="cuda")
+    beta = torch.rand_like(gates)
+    worlds = []
+    for fixed in (False, True):
+        workspace = FlushWorkspace(
+            batch, hv, hv, g, "cuda", grid=2, widths=widths if fixed else None
+        )
+        state = initial.clone()
+        u = torch.full_like(state, float("nan"))
+        phi = torch.full_like(u, float("nan"))
+        args = (state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+        workspace.refresh(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            workspace.flush(*args)
+        worlds.append((workspace, graph, args))
+
+    def compare():
+        for index in (0, 8, 9):
+            torch.testing.assert_close(
+                worlds[0][2][index].view(torch.int32),
+                worlds[1][2][index].view(torch.int32),
+                atol=0,
+                rtol=0,
+            )
+
+    compare()
+    for count in (0, 1, 3, 2, 3):
+        rows[-1] = count
+        for _, graph, _ in worlds:
+            graph.replay()
+        compare()
+    for workspace, _, args in worlds:
+        workspace.refresh(*args)
+    compare()
+    workspace, _, args = worlds[1]
+    replaced = (*args[:6], widths.clone(), *args[7:])
+    with pytest.raises(ValueError, match="fixed widths changed"):
+        workspace.flush(*replaced)
+    widths[0] = (widths[0] + 1) % 129
+    with pytest.raises(ValueError, match="fixed widths changed"):
+        workspace.flush(*args)
 
 
 @pytest.mark.parametrize(

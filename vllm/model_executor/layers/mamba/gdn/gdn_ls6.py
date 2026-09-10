@@ -357,6 +357,7 @@ def _bufs(layer, ssm_state):
             HV,
             G,
             dev,
+            widths=L6["mh"],
         )
     else:
         b.update(

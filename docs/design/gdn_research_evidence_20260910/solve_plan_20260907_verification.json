@@ -1,0 +1,23 @@
+{
+  "created_utc": "2026-09-07T16:06:48.171745+00:00",
+  "change": "Fixed-allocation solve scheduling; no state/Gram/Cholesky arithmetic changes",
+  "source_sha256": {
+    "/disk2/omin/vllm-qwen38next/vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py": "80855187fd01bac87ff159a97bcfbc448f4eaaf18a6eec7032f19a6889a4b68f",
+    "/disk2/omin/vllm-qwen38next/vllm/third_party/flash_linear_attention/ops/gdn_full_runtime.py": "4106a0282073c25c0bfe2bff90e877afcbdb76bab5da67add07776e796e0907f",
+    "/disk2/omin/vllm-qwen38next/vllm/model_executor/layers/mamba/gdn/gdn_ls6.py": "c29ee3b156741ba235ed4a7c1e81b7caa836551b1ec170c6c1fabfeb5313aa4c",
+    "/disk2/omin/vllm-qwen38next/tests/kernels/mamba/test_gdn_sketch.py": "6eae5ea6a1c77bcc745b9b662aaab4136f2b9c853bef624026b2dc122a43264a",
+    "/disk2/omin/vllm-qwen38next/benchmarks/kernels/benchmark_gdn_sketch.py": "6fdcd736802f82b08936542bd16ecd5769d69186b95262fa5401323a42e5e94d",
+    "/disk2/omin/kda-latch-results/gdn_full_dimension_review/solve_plan_20260907/gdn_flush_full_baseline.py": "0c1f196fa3fa45614a423f0f972a7cc5609a8ac067bede6082105ea46f0fc1b4"
+  },
+  "checks": {
+    "pytest_plan.log": "4 passed, 77 deselected, 14 warnings in 38.50s",
+    "pytest_integration.log": "28 passed, 53 deselected, 14 warnings in 166.22s (0:02:46)",
+    "pytest_baseline_bits.log": "4 passed, 77 deselected, 14 warnings in 1.93s"
+  },
+  "baseline_comparison": "Raw int32 bits of FP32 state/U/Phi across m=0..128 and repeated graph flush/refresh",
+  "new_numeric_state_cache_bytes": 0,
+  "head_index_bytes_max_hv48": 192,
+  "new_model_evaluation": false,
+  "uncontended_performance_measurement": null,
+  "performance_note": "B200 shared with active Super evaluation; do not infer latency from correctness runs"
+}

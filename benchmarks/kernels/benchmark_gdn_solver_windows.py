@@ -8,8 +8,10 @@ from pathlib import Path
 
 import torch
 from benchmark_gdn_solvers import Candidate, measure
+from gdn_deferred_research import DeferredWorkspace
 from gdn_qr_research import QRWorkspace
 from gdn_unfolded_research import UnfoldedWorkspace
+from gdn_warp_cholesky_research import CoalescedSolveWorkspace, WarpCholeskyWorkspace
 
 from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
     FlushWorkspace,
@@ -43,6 +45,9 @@ class World:
         self.positions = [torch.full_like(self.indices, p) for p in range(16)]
         self.out = torch.zeros(batch, hv, k, device="cuda", dtype=torch.bfloat16)
         cls = {
+            "coalesced": CoalescedSolveWorkspace,
+            "warp": WarpCholeskyWorkspace,
+            "deferred": DeferredWorkspace,
             "unfolded": UnfoldedWorkspace,
             "qr": QRWorkspace,
             "qr_tensor": QRWorkspace,
@@ -56,6 +61,7 @@ class World:
             "cuda",
             ridge=0.1,
             grid=2 if small else None,
+            widths=self.widths,
             **(
                 {"split": kind == "qr_tensor", "mgs": kind == "qr_mgs"}
                 if kind.startswith("qr")
@@ -113,10 +119,12 @@ class World:
 
     def token(self, t, inputs):
         mixed, a, b, a_log, bias = inputs
-        fn = self.workspace.step if self.kind == "unfolded" else step
+        fn = self.workspace.step if self.kind in ("unfolded", "deferred") else step
         kwargs = {"beta_ring": self.beta}
         if self.kind == "unfolded":
             kwargs["inverse"] = self.workspace.inverse
+        elif self.kind == "deferred":
+            kwargs["cholesky"] = self.workspace.factor
         fn(
             mixed[t],
             a[t],
@@ -187,15 +195,25 @@ def run(
                     (w.out.float() - base.out.float()).abs().max().item(),
                 )
                 torch.testing.assert_close(w.writes, base.writes, atol=5e-5, rtol=4e-3)
-        if small and "unfolded" in kinds:
-            unfolded = next(w for w in worlds if w.kind == "unfolded")
+        for unfolded in [
+            w for w in worlds if small and w.kind in ("unfolded", "deferred")
+        ]:
             for s in unfolded.slots:
                 c = int(unfolded.mapping[s])
                 for head, width in enumerate(widths):
                     if 0 < width < 128:
-                        im = unfolded.workspace.inverse[c, head, :width, :width].T
+                        if unfolded.kind == "deferred":
+                            transformed = torch.linalg.solve(
+                                unfolded.phi[c, head, :width, :width],
+                                unfolded.factors[c, head, :, :width].T,
+                            ).T
+                        else:
+                            im = unfolded.workspace.inverse[c, head, :width, :width].T
+                            transformed = (
+                                im @ unfolded.factors[c, head, :, :width].T
+                            ).T
                         torch.testing.assert_close(
-                            (im @ unfolded.factors[c, head, :, :width].T).T,
+                            transformed,
                             base.factors[c, head, :, :width],
                             atol=5e-5,
                             rtol=4e-3,
@@ -228,6 +246,10 @@ def run(
                             if w.kind == "unfolded":
                                 im = w.workspace.inverse[c, head, :width, :width].T
                                 effective = im @ effective
+                            elif w.kind == "deferred":
+                                effective = torch.linalg.solve(
+                                    w.phi[c, head, :width, :width], effective
+                                )
                             expected = base.phi[c, head, :width]
                             if w.kind.startswith("qr"):
                                 effective = w.u[c, head, :width].T @ effective
@@ -273,7 +295,17 @@ def main():
     p.add_argument(
         "--kinds",
         nargs="+",
-        choices=["current", "unfolded", "dx", "qr", "qr_tensor", "qr_mgs"],
+        choices=[
+            "current",
+            "unfolded",
+            "deferred",
+            "warp",
+            "coalesced",
+            "dx",
+            "qr",
+            "qr_tensor",
+            "qr_mgs",
+        ],
         default=["current", "unfolded", "dx"],
     )
     args = p.parse_args()

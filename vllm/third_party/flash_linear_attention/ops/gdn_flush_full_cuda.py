@@ -122,12 +122,13 @@ template <int M>
 __global__ void __launch_bounds__(NTB)
 gdn_ls6_solve_kernel(
     const int* __restrict__ rows, const int* __restrict__ n_ptr, const int* __restrict__ ls6_map,
-    const int* __restrict__ ls6_mh,
+    const int* __restrict__ ls6_mh, const int* __restrict__ heads,
     const float* __restrict__ scratch, float* __restrict__ ls6_phi,
     long s_phi_slot, int HV, int G)
 {
-    const int r_i = blockIdx.x, hv = blockIdx.y;
+    const int r_i = blockIdx.x;
     if (r_i >= *n_ptr) return;
+    const int hv = heads ? heads[blockIdx.y] : blockIdx.y;
     const int m = ls6_mh[hv];
     constexpr int LOWER = M == 8 ? 0 : M == 48 ? 32 : M == 64 ? 48 : M / 2;
     if (m <= LOWER || m > M || m == 128) return;
@@ -997,7 +998,8 @@ static const CUtensorMap* h0_tensor_map(const torch::Tensor& h0) {
 void run(int phase, int grid, torch::Tensor h0, torch::Tensor writes, torch::Tensor keys,
     torch::Tensor gates, torch::Tensor rows, int n_off, torch::Tensor mapping,
     torch::Tensor widths, torch::Tensor beta, torch::Tensor u, torch::Tensor phi,
-    torch::Tensor scratch, torch::Tensor prep, torch::Tensor prep_i, double ridge)
+    torch::Tensor scratch, torch::Tensor prep, torch::Tensor prep_i, double ridge,
+    torch::Tensor solve_heads, std::vector<int64_t> solve_offsets)
 {
     const int H = keys.size(1), HV = h0.size(1), G = u.size(2), max_rows = n_off;
     const size_t smemS = SMEM_STREAM + 1024;
@@ -1009,6 +1011,15 @@ void run(int phase, int grid, torch::Tensor h0, torch::Tensor writes, torch::Ten
     TORCH_CHECK(scratch.numel() >= (long)max_rows * HV * SK * G, "full flush: scratch size");
     TORCH_CHECK(prep.numel() >= (long)max_rows * (H * PREP_K_BYTES + HV * PREP_T_BYTES), "full flush: prep size");
     TORCH_CHECK(prep_i.numel() >= (long)max_rows * (H + HV), "full flush: exponent size");
+    const bool planned = !solve_offsets.empty();
+    if (planned) {
+        TORCH_CHECK(solve_offsets.size() == 7 && solve_offsets.front() == 0
+            && solve_offsets.back() == solve_heads.numel(), "full flush: solve plan size");
+        for (int i = 0; i < 6; ++i)
+            TORCH_CHECK(solve_offsets[i] <= solve_offsets[i + 1], "full flush: solve offsets");
+        TORCH_CHECK(solve_heads.scalar_type() == torch::kInt32 && solve_heads.is_contiguous()
+            && solve_heads.device() == h0.device(), "full flush: solve head indices");
+    }
     if (max_rows == 0) return;
     auto st = at::cuda::getCurrentCUDAStream().stream();
     static std::unordered_map<int, std::array<size_t, 3>> attributes;
@@ -1052,15 +1063,22 @@ void run(int phase, int grid, torch::Tensor h0, torch::Tensor writes, torch::Ten
             u.data_ptr<float>(), scratch.data_ptr<float>(), h0.stride(0), h0.stride(1), u.stride(0), HV, G, (float)ridge);
     }
     if (phase == 0 || phase == 3 || phase == 4) {
-        // Width predicates are device-side; graph replay never reads widths on the CPU.
-        #define SOLVE(M) gdn_ls6_solve_kernel<M><<<dim3(max_rows, HV), NTB, M == 128 ? smemB128 : (M * (M + 1) + M * (129 - M)) * 4, st>>>( \
-            fl, fl + n_off, lm, widths.data_ptr<int>(), scratch.data_ptr<float>(), phi.data_ptr<float>(), phi.stride(0), HV, G)
-        SOLVE(8);
-        if (G > 8) { SOLVE(16); }
-        if (G > 16) { SOLVE(32); }
-        if (G > 32) { SOLVE(48); }
-        if (G > 48) { SOLVE(64); }
-        if (G > 64) { SOLVE(128); }
+        // Fixed head lists are prepared before capture. Keep the device predicate
+        // and identical arithmetic; only remove empty launches and unrelated CTAs.
+        #define SOLVE(M, B) { \
+            const int count = planned ? solve_offsets[B + 1] - solve_offsets[B] : HV; \
+            if (count) { \
+                const int* heads = planned ? solve_heads.data_ptr<int>() + solve_offsets[B] : nullptr; \
+                gdn_ls6_solve_kernel<M><<<dim3(max_rows, count), NTB, M == 128 ? smemB128 : (M * (M + 1) + M * (129 - M)) * 4, st>>>( \
+                    fl, fl + n_off, lm, widths.data_ptr<int>(), heads, scratch.data_ptr<float>(), phi.data_ptr<float>(), phi.stride(0), HV, G); \
+            } \
+        }
+        SOLVE(8, 0);
+        if (G > 8) { SOLVE(16, 1); }
+        if (G > 16) { SOLVE(32, 2); }
+        if (G > 32) { SOLVE(48, 3); }
+        if (G > 48) { SOLVE(64, 4); }
+        if (G > 64) { SOLVE(128, 5); }
         #undef SOLVE
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1073,7 +1091,8 @@ _CPP = r"""
 void run(int phase, int grid, torch::Tensor h0, torch::Tensor writes, torch::Tensor keys,
     torch::Tensor gates, torch::Tensor rows, int n_off, torch::Tensor mapping,
     torch::Tensor widths, torch::Tensor beta, torch::Tensor u, torch::Tensor phi,
-    torch::Tensor scratch, torch::Tensor prep, torch::Tensor prep_i, double ridge);
+    torch::Tensor scratch, torch::Tensor prep, torch::Tensor prep_i, double ridge,
+    torch::Tensor solve_heads, std::vector<int64_t> solve_offsets);
 """
 
 
@@ -1088,7 +1107,7 @@ def _extension():
     )
     build.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name="gdn_full_flush_v1",
+        name="gdn_full_flush_v2",
         cpp_sources=_CPP,
         cuda_sources=_SRC,
         functions=["run"],
@@ -1109,12 +1128,20 @@ class FlushWorkspace:
     Widths are fixed per value head in [0,G]. Zero denotes the exact dense
     delta-ring convention; positive widths use raw-WY writes and beta history.
     Active rows must be unique, positive state slots with valid compact mappings.
-    The device count rows[n_off] must be in [0,n_off]. No host scalar reads occur.
+    The device count rows[n_off] must be in [0,n_off]. Flush/refresh never read
+    device scalars on the host.
     Full-width Phi is unused and deliberately left untouched, as in the new step.
     The caller advances positions; neither flush nor refresh resets rings.
+
+    Optional widths binds a fixed allocation and compacts the solve head lists.
+    It is read once on the host during construction, before graph capture.
+    The bound tensor must remain unchanged and be passed to every call; no
+    per-step device-to-host transfer, allocation, or new numeric cache is needed.
     """
 
-    def __init__(self, max_rows, h, hv, g, device, *, ridge=None, grid=None):
+    def __init__(
+        self, max_rows, h, hv, g, device, *, ridge=None, grid=None, widths=None
+    ):
         if ridge is None:
             ridge = float(os.environ.get("NS_GDN_LS6_RIDGE", "0.1"))
         if max_rows < 0 or h < 1 or hv % h or not 1 <= hv // h <= 4:
@@ -1140,11 +1167,54 @@ class FlushWorkspace:
         self.grid = min(2 * sm, max(1, max_rows * hv)) if grid is None else int(grid)
         if self.grid <= 0:
             raise ValueError("grid must be positive")
+        self._widths = widths
+        self._widths_version = None
+        self._solve_offsets = []
+        heads = []
+        if widths is not None:
+            if (
+                widths.shape != (hv,)
+                or widths.dtype != torch.int32
+                or widths.device != self.scratch.device
+                or not widths.is_contiguous()
+            ):
+                raise ValueError(
+                    "fixed widths requires a contiguous CUDA int32 head vector"
+                )
+            with torch.cuda.device(self.scratch.device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "construct the fixed solve plan before graph capture"
+                    )
+            values = widths.tolist()
+            if any(m < 0 or m > g for m in values):
+                raise ValueError("fixed widths must lie in [0,G]")
+            if not widths.is_inference():
+                self._widths_version = widths._version
+            self._solve_offsets = [0]
+            lower = 0
+            for upper in (8, 16, 32, 48, 64, 128):
+                heads.extend(
+                    i for i, m in enumerate(values) if lower < m <= upper and m < 128
+                )
+                self._solve_offsets.append(len(heads))
+                lower = upper
+        self._solve_heads = torch.tensor(
+            heads, dtype=torch.int32, device=self.scratch.device
+        )
         self._ext = _extension()
 
     def _run(
         self, phase, state, writes, keys, gates, rows, mapping, widths, beta, u, phi
     ):
+        if self._widths is not None and (
+            widths is not self._widths
+            or (
+                self._widths_version is not None
+                and widths._version != self._widths_version
+            )
+        ):
+            raise ValueError("fixed widths changed; construct a new flush workspace")
         nx, hv, v, k = state.shape
         if phase == 4:
             writes = gates = beta = state
@@ -1209,6 +1279,8 @@ class FlushWorkspace:
                 self.prep,
                 self.prep_i,
                 self.ridge,
+                self._solve_heads,
+                self._solve_offsets,
             )
 
     def flush(self, state, writes, keys, gates, rows, mapping, widths, beta, u, phi):

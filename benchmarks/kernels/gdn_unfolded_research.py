@@ -146,7 +146,7 @@ def inverse_extension():
         constexpr int smem = (M * (M + 1) + M * (M | 1)) * 4; \\
         static bool init = false; \\
         if (!init) { C10_CUDA_CHECK(cudaFuncSetAttribute(gdn_ls6_solve_kernel<M>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem)); init = true; } \\
-        gdn_ls6_solve_kernel<M><<<dim3(max_rows, HV), 128, smem, stream>>>(rows.data_ptr<int>(), rows.data_ptr<int>() + max_rows, mapping.data_ptr<int>(), widths.data_ptr<int>(), scratch.data_ptr<float>(), phi.data_ptr<float>(), phi.stride(0), inverse.data_ptr<float>(), inverse.stride(0), HV, G); \\
+        gdn_ls6_solve_kernel<M><<<dim3(max_rows, HV), 128, smem, stream>>>(rows.data_ptr<int>(), rows.data_ptr<int>() + max_rows, mapping.data_ptr<int>(), widths.data_ptr<int>(), nullptr, scratch.data_ptr<float>(), phi.data_ptr<float>(), phi.stride(0), inverse.data_ptr<float>(), inverse.stride(0), HV, G); \\
     } while (0)
     INV(8);
     if (G > 8) { INV(16); }

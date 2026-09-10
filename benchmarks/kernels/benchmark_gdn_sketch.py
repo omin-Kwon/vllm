@@ -208,7 +208,9 @@ def run(batch, g, dense_mix, heterogeneous=False, cuda_only=False, position=8):
     )
 
 
-def run_flush(batch, g, dense_mix, heterogeneous=False, replayssm=False):
+def run_flush(
+    batch, g, dense_mix, heterogeneous=False, replayssm=False, fixed_solve_plan=False
+):
     """Time real flushes and 16-step cycles, excluding model hooks and setup.
 
     Fixed input sequences let both paths use precomputed beta history. The new
@@ -248,7 +250,15 @@ def run_flush(batch, g, dense_mix, heterogeneous=False, replayssm=False):
     qbar, kbar = zeros(ns, h, k).normal_(0, 0.1), zeros(ns, h, k).normal_(0, 0.1)
     aq, ak, frozen = zeros(ns, hv, g), zeros(ns, hv, g), zeros(ns, hv, k)
     nf = torch.where(mh > 0, 0, k).int()
-    workspace = FlushWorkspace(batch, h, hv, g, "cuda", ridge=0.1)
+    workspace = FlushWorkspace(
+        batch,
+        h,
+        hv,
+        g,
+        "cuda",
+        ridge=0.1,
+        widths=mh if fixed_solve_plan else None,
+    )
     args = (state, writes, keys, gates, rows, mapping, mh, beta_ring, u, phi)
     workspace.refresh(*args)
     # The reference reads full-width Phi; the new refresh intentionally skips it.
@@ -293,7 +303,7 @@ def run_flush(batch, g, dense_mix, heterogeneous=False, replayssm=False):
             ls6_map=mapping,
         )
 
-    def new_step(t):
+    def new_step(t, step_widths=mh):
         cuda_step(
             mix[t],
             a[t],
@@ -309,7 +319,7 @@ def run_flush(batch, g, dense_mix, heterogeneous=False, replayssm=False):
             positions[t],
             u,
             phi,
-            mh,
+            step_widths,
             factors,
             mapping,
             k**-0.5,
@@ -391,14 +401,12 @@ def run_flush(batch, g, dense_mix, heterogeneous=False, replayssm=False):
 
         # ReplaySSM stores exact deltas; sketch heads store raw-WY writes.
         # Generate each representation from the same state and input window.
-        mh.zero_()
+        dense_widths = torch.zeros_like(mh)
         reset()
         for t in range(w):
-            new_step(t)
+            new_step(t, dense_widths)
         dense_writes = writes.clone()
-        mh.copy_(torch.tensor(widths, device="cuda", dtype=torch.int32))
         reset()
-        dense_widths = torch.zeros_like(mh)
         dense_u, dense_phi = zeros(ns, hv, 8, k), zeros(ns, hv, 8, k)
         dense_aq, dense_ak = zeros(ns, hv, 8), zeros(ns, hv, 8)
         sm = torch.cuda.get_device_properties(state.device).multi_processor_count
@@ -501,18 +509,24 @@ def run_flush(batch, g, dense_mix, heterogeneous=False, replayssm=False):
         g=g,
         dense_mix=dense_mix,
         heterogeneous=heterogeneous,
+        fixed_solve_plan=fixed_solve_plan,
         **timings,
         **replay_timings,
         flush_speedup=timings["reference_flush_us"] / timings["full_flush_us"],
         cycle_speedup=timings["reference_cycle_us"] / timings["full_cycle_us"],
         workspace_bytes=sum(
             x.numel() * x.element_size()
-            for x in (workspace.scratch, workspace.prep, workspace.prep_i)
+            for x in (
+                workspace.scratch,
+                workspace.prep,
+                workspace.prep_i,
+                workspace._solve_heads,
+            )
         ),
     )
 
 
-def analyze_flush_width(m, g=None, profile=False):
+def analyze_flush_width(m, g=None, profile=False, fixed_solve_plan=False):
     """Isolate actual m from allocation G, with every head using the same m."""
     from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
         FlushWorkspace,
@@ -536,7 +550,15 @@ def analyze_flush_width(m, g=None, profile=False):
     mapping = torch.arange(ns, device="cuda", dtype=torch.int32)
     rows = torch.cat([mapping[1:], mapping.new_tensor([batch])])
     widths = torch.full((hv,), m, dtype=torch.int32, device="cuda")
-    workspace = FlushWorkspace(batch, h, hv, g, "cuda", ridge=0.1)
+    workspace = FlushWorkspace(
+        batch,
+        h,
+        hv,
+        g,
+        "cuda",
+        ridge=0.1,
+        widths=widths if fixed_solve_plan else None,
+    )
     args = (state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
     workspace.flush(*args)
     torch.accelerator.synchronize()
@@ -563,6 +585,7 @@ def analyze_flush_width(m, g=None, profile=False):
         batch=batch,
         m=m,
         g=g,
+        fixed_solve_plan=fixed_solve_plan,
         **timings,
         coefficient_refresh=0 < m < k,
         gram_padded_width=mc,
@@ -573,11 +596,19 @@ def analyze_flush_width(m, g=None, profile=False):
         solve_rhs=k - m,
         solve_columns_per_warp=32 if m <= 64 else 1,
         solve_row_capacity=capacity,
-        solve_launches=1 + sum(g > lower for lower in (8, 16, 32, 48, 64)),
-        solve_shared_bytes=4
-        * (
-            solve_stride * (solve_stride + 1)
-            + (capacity * (129 - capacity) if capacity <= 64 else 64 * 65)
+        solve_launches=(
+            int(m < k)
+            if fixed_solve_plan
+            else 1 + sum(g > lower for lower in (8, 16, 32, 48, 64))
+        ),
+        solve_shared_bytes=(
+            0
+            if fixed_solve_plan and m == k
+            else 4
+            * (
+                solve_stride * (solve_stride + 1)
+                + (capacity * (129 - capacity) if capacity <= 64 else 64 * 65)
+            )
         ),
     )
 
@@ -592,6 +623,7 @@ def main():
     parser.add_argument("--width-sweep", action="store_true")
     parser.add_argument("--profile-width", type=int)
     parser.add_argument("--allocation-g", type=int)
+    parser.add_argument("--fixed-solve-plan", action="store_true")
     args = parser.parse_args()
     torch.manual_seed(83)
     results = []
@@ -603,7 +635,10 @@ def main():
         )
         for m in widths:
             result = analyze_flush_width(
-                m, args.allocation_g, args.profile_width is not None
+                m,
+                args.allocation_g,
+                args.profile_width is not None,
+                args.fixed_solve_plan,
             )
             results.append(result)
             print(json.dumps(result), flush=True)
@@ -626,7 +661,14 @@ def main():
         ]
     for batch, g, dense_mix, heterogeneous in cases:
         result = (
-            run_flush(batch, g, dense_mix, heterogeneous, replayssm=args.replayssm)
+            run_flush(
+                batch,
+                g,
+                dense_mix,
+                heterogeneous,
+                replayssm=args.replayssm,
+                fixed_solve_plan=args.fixed_solve_plan,
+            )
             if args.flush or args.replayssm
             else run(
                 batch,

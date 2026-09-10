@@ -302,10 +302,12 @@ kernel versus this tuning, not the r-truncation reference):
 | 128 | 128 | 25% dense | 255.1 | 276.1 | 1495.4 | 1506.6 |
 | 128 | 128 | heterogeneous | 2441.2 | 1511.2 | 3536.9 | 2594.6 |
 
-Native ReplaySSM is separately remeasured: B128 m8 configuration 182.2 us
+Our optimized CUDA dense ReplaySSM is separately remeasured: B128 m8 configuration 182.2 us
 versus the new sketch flush 262.8 us (1.44x), and the m32/25%-dense
 configuration 181.6 us versus 543.4 us (2.99x). Proper delta versus raw-WY
 rings are constructed from the same inputs; the boundary-state maximum
 absolute difference is 3.58e-7. This is not a claim that the new sketch flush
-is faster than the native ReplaySSM flush. The extra reconstruction work
-remains visible.
+is faster than our optimized dense ReplaySSM flush. The extra reconstruction
+work remains visible. These are not original-port timings; see
+[baseline provenance](gdn_replayssm_baseline_provenance.md) for the archived
+original GDN source and the required paper comparison boundaries.

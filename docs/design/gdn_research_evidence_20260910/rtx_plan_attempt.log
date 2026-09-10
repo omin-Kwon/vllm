@@ -1,0 +1,672 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+___ test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[all_widths] ____
+
+case = 'all_widths'
+
+    @pytest.mark.parametrize("case", ["all_widths", "dense", "identity", "small_padded"])
+    def test_fixed_flush_plan_is_bitwise_equal_across_graph_replays(case):
+        """Changing solve scheduling must preserve every write, including sentinels.
+    
+        Cover all bucket boundaries, empty plans, G padding, device row counts,
+        refresh and repeated folds. Reject stale allocations before launching work.
+        """
+        from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
+            FlushWorkspace,
+        )
+    
+        torch.manual_seed(391)
+        values = {
+            "all_widths": list(range(129)),
+            "dense": [0, 0, 0],
+            "identity": [128, 128, 0],
+            "small_padded": [0, 1, 8, 0, 4, 128],
+        }[case]
+        ns, hv, g, batch = 4, len(values), 128, 3
+        widths = torch.tensor(values, device="cuda", dtype=torch.int32)
+        mapping = widths.new_tensor([0, 3, 1, 2])
+        rows = widths.new_tensor([3, 1, 0, 3])
+        initial = torch.randn(ns, hv, 128, 128, device="cuda") * 0.03
+        writes = torch.randn(ns, hv, 16, 128, device="cuda") * 0.03
+        keys = torch.nn.functional.normalize(torch.randn_like(writes), dim=-1)
+        gates = torch.full((ns, hv, 16), -0.05, device="cuda")
+        beta = torch.rand_like(gates)
+        worlds = []
+        for fixed in (False, True):
+            workspace = FlushWorkspace(
+                batch, hv, hv, g, "cuda", grid=2, widths=widths if fixed else None
+            )
+            state = initial.clone()
+            u = torch.full_like(state, float("nan"))
+            phi = torch.full_like(u, float("nan"))
+            args = (state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+>           workspace.refresh(*args)
+
+tests/kernels/mamba/test_gdn_sketch.py:821: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1292: in refresh
+    self._run(4, state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda.FlushWorkspace object at 0x76e655d5c500>
+phase = 4
+state = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [ 2.7799e-02, -1.2923e-02,  3.6880e-02,  ...,  1.0199e-02,
+           -6.7462e-02,  7.7657e-03]]]], device='cuda:0')
+writes = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [ 2.7799e-02, -1.2923e-02,  3.6880e-02,  ...,  1.0199e-02,
+           -6.7462e-02,  7.7657e-03]]]], device='cuda:0')
+keys = tensor([], device='cuda:0', size=(0, 129, 16, 128))
+gates = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [ 2.7799e-02, -1.2923e-02,  3.6880e-02,  ...,  1.0199e-02,
+           -6.7462e-02,  7.7657e-03]]]], device='cuda:0')
+rows = tensor([3, 1, 0, 3], device='cuda:0', dtype=torch.int32)
+mapping = tensor([0, 3, 1, 2], device='cuda:0', dtype=torch.int32)
+widths = tensor([  0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,
+         14,  15,  16,  17,  18,  19,  2...114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+        126, 127, 128], device='cuda:0', dtype=torch.int32)
+beta = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [ 2.7799e-02, -1.2923e-02,  3.6880e-02,  ...,  1.0199e-02,
+           -6.7462e-02,  7.7657e-03]]]], device='cuda:0')
+u = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+phi = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+
+    def _run(
+        self, phase, state, writes, keys, gates, rows, mapping, widths, beta, u, phi
+    ):
+        if self._widths is not None and (
+            widths is not self._widths
+            or (
+                self._widths_version is not None
+                and widths._version != self._widths_version
+            )
+        ):
+            raise ValueError("fixed widths changed; construct a new flush workspace")
+        nx, hv, v, k = state.shape
+        if phase == 4:
+            writes = gates = beta = state
+            keys = self._refresh_keys
+        ns = u.shape[0]
+        if (
+            (hv, v, k) != (self.hv, 128, 128)
+            or state.stride()[1:] != (16384, 128, 1)
+            or state.stride(0) % 128
+        ):
+            raise ValueError(
+                "state requires dense (HV,128,128) pages with stride divisible by 128"
+            )
+        tensors = [
+            ("state", state, (nx, hv, 128, 128), torch.float32),
+            ("writes", writes, (nx, hv, 16, 128), torch.float32),
+            ("keys", keys, (nx, self.h, 16, 128), torch.float32),
+            ("gates", gates, (nx, hv, 16), torch.float32),
+            ("rows", rows, (self.max_rows + 1,), torch.int32),
+            ("mapping", mapping, (nx,), torch.int32),
+            ("widths", widths, (hv,), torch.int32),
+            ("beta", beta, (ns, hv, 16), torch.float32),
+            ("u", u, (ns, hv, self.g, 128), torch.float32),
+            ("phi", phi, (ns, hv, self.g, 128), torch.float32),
+        ]
+        for name, tensor, shape, dtype in tensors:
+            if phase == 4 and name in ("writes", "keys", "gates", "beta"):
+                continue
+            if (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != dtype
+                or tensor.device != self.scratch.device
+            ):
+                raise ValueError(
+                    f"invalid {name}: expected {shape}, {dtype}, {self.scratch.device}"
+                )
+            paged = name in ("state", "writes", "keys", "gates")
+            if (
+                (not paged and not tensor.is_contiguous())
+                or (paged and not tensor[0].is_contiguous())
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(
+                    f"{name} must have contiguous tails and aligned storage"
+                )
+        with torch.cuda.device(state.device):
+>           self._ext.run(
+                phase,
+                self.grid,
+                state,
+                writes,
+                keys,
+                gates,
+                rows,
+                self.max_rows,
+                mapping,
+                widths,
+                beta,
+                u,
+                phi,
+                self.scratch,
+                self.prep,
+                self.prep_i,
+                self.ridge,
+                self._solve_heads,
+                self._solve_offsets,
+            )
+E           torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+E           Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+E           For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1264: AcceleratorError
+______ test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[dense] ______
+
+case = 'dense'
+
+    @pytest.mark.parametrize("case", ["all_widths", "dense", "identity", "small_padded"])
+    def test_fixed_flush_plan_is_bitwise_equal_across_graph_replays(case):
+        """Changing solve scheduling must preserve every write, including sentinels.
+    
+        Cover all bucket boundaries, empty plans, G padding, device row counts,
+        refresh and repeated folds. Reject stale allocations before launching work.
+        """
+        from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
+            FlushWorkspace,
+        )
+    
+        torch.manual_seed(391)
+        values = {
+            "all_widths": list(range(129)),
+            "dense": [0, 0, 0],
+            "identity": [128, 128, 0],
+            "small_padded": [0, 1, 8, 0, 4, 128],
+        }[case]
+        ns, hv, g, batch = 4, len(values), 128, 3
+        widths = torch.tensor(values, device="cuda", dtype=torch.int32)
+        mapping = widths.new_tensor([0, 3, 1, 2])
+        rows = widths.new_tensor([3, 1, 0, 3])
+        initial = torch.randn(ns, hv, 128, 128, device="cuda") * 0.03
+        writes = torch.randn(ns, hv, 16, 128, device="cuda") * 0.03
+        keys = torch.nn.functional.normalize(torch.randn_like(writes), dim=-1)
+        gates = torch.full((ns, hv, 16), -0.05, device="cuda")
+        beta = torch.rand_like(gates)
+        worlds = []
+        for fixed in (False, True):
+            workspace = FlushWorkspace(
+                batch, hv, hv, g, "cuda", grid=2, widths=widths if fixed else None
+            )
+            state = initial.clone()
+            u = torch.full_like(state, float("nan"))
+            phi = torch.full_like(u, float("nan"))
+            args = (state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+>           workspace.refresh(*args)
+
+tests/kernels/mamba/test_gdn_sketch.py:821: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1292: in refresh
+    self._run(4, state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda.FlushWorkspace object at 0x76e85b328380>
+phase = 4
+state = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+writes = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+keys = tensor([], device='cuda:0', size=(0, 3, 16, 128))
+gates = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+rows = tensor([3, 1, 0, 3], device='cuda:0', dtype=torch.int32)
+mapping = tensor([0, 3, 1, 2], device='cuda:0', dtype=torch.int32)
+widths = tensor([0, 0, 0], device='cuda:0', dtype=torch.int32)
+beta = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+u = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+phi = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+
+    def _run(
+        self, phase, state, writes, keys, gates, rows, mapping, widths, beta, u, phi
+    ):
+        if self._widths is not None and (
+            widths is not self._widths
+            or (
+                self._widths_version is not None
+                and widths._version != self._widths_version
+            )
+        ):
+            raise ValueError("fixed widths changed; construct a new flush workspace")
+        nx, hv, v, k = state.shape
+        if phase == 4:
+            writes = gates = beta = state
+            keys = self._refresh_keys
+        ns = u.shape[0]
+        if (
+            (hv, v, k) != (self.hv, 128, 128)
+            or state.stride()[1:] != (16384, 128, 1)
+            or state.stride(0) % 128
+        ):
+            raise ValueError(
+                "state requires dense (HV,128,128) pages with stride divisible by 128"
+            )
+        tensors = [
+            ("state", state, (nx, hv, 128, 128), torch.float32),
+            ("writes", writes, (nx, hv, 16, 128), torch.float32),
+            ("keys", keys, (nx, self.h, 16, 128), torch.float32),
+            ("gates", gates, (nx, hv, 16), torch.float32),
+            ("rows", rows, (self.max_rows + 1,), torch.int32),
+            ("mapping", mapping, (nx,), torch.int32),
+            ("widths", widths, (hv,), torch.int32),
+            ("beta", beta, (ns, hv, 16), torch.float32),
+            ("u", u, (ns, hv, self.g, 128), torch.float32),
+            ("phi", phi, (ns, hv, self.g, 128), torch.float32),
+        ]
+        for name, tensor, shape, dtype in tensors:
+            if phase == 4 and name in ("writes", "keys", "gates", "beta"):
+                continue
+            if (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != dtype
+                or tensor.device != self.scratch.device
+            ):
+                raise ValueError(
+                    f"invalid {name}: expected {shape}, {dtype}, {self.scratch.device}"
+                )
+            paged = name in ("state", "writes", "keys", "gates")
+            if (
+                (not paged and not tensor.is_contiguous())
+                or (paged and not tensor[0].is_contiguous())
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(
+                    f"{name} must have contiguous tails and aligned storage"
+                )
+        with torch.cuda.device(state.device):
+>           self._ext.run(
+                phase,
+                self.grid,
+                state,
+                writes,
+                keys,
+                gates,
+                rows,
+                self.max_rows,
+                mapping,
+                widths,
+                beta,
+                u,
+                phi,
+                self.scratch,
+                self.prep,
+                self.prep_i,
+                self.ridge,
+                self._solve_heads,
+                self._solve_offsets,
+            )
+E           torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+E           Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+E           For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1264: AcceleratorError
+____ test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[identity] _____
+
+case = 'identity'
+
+    @pytest.mark.parametrize("case", ["all_widths", "dense", "identity", "small_padded"])
+    def test_fixed_flush_plan_is_bitwise_equal_across_graph_replays(case):
+        """Changing solve scheduling must preserve every write, including sentinels.
+    
+        Cover all bucket boundaries, empty plans, G padding, device row counts,
+        refresh and repeated folds. Reject stale allocations before launching work.
+        """
+        from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
+            FlushWorkspace,
+        )
+    
+        torch.manual_seed(391)
+        values = {
+            "all_widths": list(range(129)),
+            "dense": [0, 0, 0],
+            "identity": [128, 128, 0],
+            "small_padded": [0, 1, 8, 0, 4, 128],
+        }[case]
+        ns, hv, g, batch = 4, len(values), 128, 3
+        widths = torch.tensor(values, device="cuda", dtype=torch.int32)
+        mapping = widths.new_tensor([0, 3, 1, 2])
+        rows = widths.new_tensor([3, 1, 0, 3])
+        initial = torch.randn(ns, hv, 128, 128, device="cuda") * 0.03
+        writes = torch.randn(ns, hv, 16, 128, device="cuda") * 0.03
+        keys = torch.nn.functional.normalize(torch.randn_like(writes), dim=-1)
+        gates = torch.full((ns, hv, 16), -0.05, device="cuda")
+        beta = torch.rand_like(gates)
+        worlds = []
+        for fixed in (False, True):
+            workspace = FlushWorkspace(
+                batch, hv, hv, g, "cuda", grid=2, widths=widths if fixed else None
+            )
+            state = initial.clone()
+            u = torch.full_like(state, float("nan"))
+            phi = torch.full_like(u, float("nan"))
+            args = (state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+>           workspace.refresh(*args)
+
+tests/kernels/mamba/test_gdn_sketch.py:821: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1292: in refresh
+    self._run(4, state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda.FlushWorkspace object at 0x76e85b329220>
+phase = 4
+state = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+writes = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+keys = tensor([], device='cuda:0', size=(0, 3, 16, 128))
+gates = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+rows = tensor([3, 1, 0, 3], device='cuda:0', dtype=torch.int32)
+mapping = tensor([0, 3, 1, 2], device='cuda:0', dtype=torch.int32)
+widths = tensor([128, 128,   0], device='cuda:0', dtype=torch.int32)
+beta = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-1.7686e-02,  1.0483e-02, -2.6232e-02,  ..., -2.0074e-02,
+            6.1479e-02,  2.1862e-02]]]], device='cuda:0')
+u = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+phi = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+
+    def _run(
+        self, phase, state, writes, keys, gates, rows, mapping, widths, beta, u, phi
+    ):
+        if self._widths is not None and (
+            widths is not self._widths
+            or (
+                self._widths_version is not None
+                and widths._version != self._widths_version
+            )
+        ):
+            raise ValueError("fixed widths changed; construct a new flush workspace")
+        nx, hv, v, k = state.shape
+        if phase == 4:
+            writes = gates = beta = state
+            keys = self._refresh_keys
+        ns = u.shape[0]
+        if (
+            (hv, v, k) != (self.hv, 128, 128)
+            or state.stride()[1:] != (16384, 128, 1)
+            or state.stride(0) % 128
+        ):
+            raise ValueError(
+                "state requires dense (HV,128,128) pages with stride divisible by 128"
+            )
+        tensors = [
+            ("state", state, (nx, hv, 128, 128), torch.float32),
+            ("writes", writes, (nx, hv, 16, 128), torch.float32),
+            ("keys", keys, (nx, self.h, 16, 128), torch.float32),
+            ("gates", gates, (nx, hv, 16), torch.float32),
+            ("rows", rows, (self.max_rows + 1,), torch.int32),
+            ("mapping", mapping, (nx,), torch.int32),
+            ("widths", widths, (hv,), torch.int32),
+            ("beta", beta, (ns, hv, 16), torch.float32),
+            ("u", u, (ns, hv, self.g, 128), torch.float32),
+            ("phi", phi, (ns, hv, self.g, 128), torch.float32),
+        ]
+        for name, tensor, shape, dtype in tensors:
+            if phase == 4 and name in ("writes", "keys", "gates", "beta"):
+                continue
+            if (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != dtype
+                or tensor.device != self.scratch.device
+            ):
+                raise ValueError(
+                    f"invalid {name}: expected {shape}, {dtype}, {self.scratch.device}"
+                )
+            paged = name in ("state", "writes", "keys", "gates")
+            if (
+                (not paged and not tensor.is_contiguous())
+                or (paged and not tensor[0].is_contiguous())
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(
+                    f"{name} must have contiguous tails and aligned storage"
+                )
+        with torch.cuda.device(state.device):
+>           self._ext.run(
+                phase,
+                self.grid,
+                state,
+                writes,
+                keys,
+                gates,
+                rows,
+                self.max_rows,
+                mapping,
+                widths,
+                beta,
+                u,
+                phi,
+                self.scratch,
+                self.prep,
+                self.prep_i,
+                self.ridge,
+                self._solve_heads,
+                self._solve_offsets,
+            )
+E           torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+E           Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+E           For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1264: AcceleratorError
+__ test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[small_padded] ___
+
+case = 'small_padded'
+
+    @pytest.mark.parametrize("case", ["all_widths", "dense", "identity", "small_padded"])
+    def test_fixed_flush_plan_is_bitwise_equal_across_graph_replays(case):
+        """Changing solve scheduling must preserve every write, including sentinels.
+    
+        Cover all bucket boundaries, empty plans, G padding, device row counts,
+        refresh and repeated folds. Reject stale allocations before launching work.
+        """
+        from vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda import (
+            FlushWorkspace,
+        )
+    
+        torch.manual_seed(391)
+        values = {
+            "all_widths": list(range(129)),
+            "dense": [0, 0, 0],
+            "identity": [128, 128, 0],
+            "small_padded": [0, 1, 8, 0, 4, 128],
+        }[case]
+        ns, hv, g, batch = 4, len(values), 128, 3
+        widths = torch.tensor(values, device="cuda", dtype=torch.int32)
+        mapping = widths.new_tensor([0, 3, 1, 2])
+        rows = widths.new_tensor([3, 1, 0, 3])
+        initial = torch.randn(ns, hv, 128, 128, device="cuda") * 0.03
+        writes = torch.randn(ns, hv, 16, 128, device="cuda") * 0.03
+        keys = torch.nn.functional.normalize(torch.randn_like(writes), dim=-1)
+        gates = torch.full((ns, hv, 16), -0.05, device="cuda")
+        beta = torch.rand_like(gates)
+        worlds = []
+        for fixed in (False, True):
+            workspace = FlushWorkspace(
+                batch, hv, hv, g, "cuda", grid=2, widths=widths if fixed else None
+            )
+            state = initial.clone()
+            u = torch.full_like(state, float("nan"))
+            phi = torch.full_like(u, float("nan"))
+            args = (state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+>           workspace.refresh(*args)
+
+tests/kernels/mamba/test_gdn_sketch.py:821: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1292: in refresh
+    self._run(4, state, writes, keys, gates, rows, mapping, widths, beta, u, phi)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.third_party.flash_linear_attention.ops.gdn_flush_full_cuda.FlushWorkspace object at 0x76e85b328590>
+phase = 4
+state = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-2.9876e-02, -3.7490e-02,  3.4199e-02,  ..., -4.9559e-02,
+           -3.7126e-02, -3.0207e-02]]]], device='cuda:0')
+writes = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-2.9876e-02, -3.7490e-02,  3.4199e-02,  ..., -4.9559e-02,
+           -3.7126e-02, -3.0207e-02]]]], device='cuda:0')
+keys = tensor([], device='cuda:0', size=(0, 6, 16, 128))
+gates = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-2.9876e-02, -3.7490e-02,  3.4199e-02,  ..., -4.9559e-02,
+           -3.7126e-02, -3.0207e-02]]]], device='cuda:0')
+rows = tensor([3, 1, 0, 3], device='cuda:0', dtype=torch.int32)
+mapping = tensor([0, 3, 1, 2], device='cuda:0', dtype=torch.int32)
+widths = tensor([  0,   1,   8,   0,   4, 128], device='cuda:0', dtype=torch.int32)
+beta = tensor([[[[-3.2125e-02,  1.0619e-02, -3.4470e-02,  ..., -1.3314e-03,
+           -2.3468e-02, -3.7179e-02],
+          [...   [-2.9876e-02, -3.7490e-02,  3.4199e-02,  ..., -4.9559e-02,
+           -3.7126e-02, -3.0207e-02]]]], device='cuda:0')
+u = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+phi = tensor([[[[nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, n...n],
+          [nan, nan, nan,  ..., nan, nan, nan],
+          [nan, nan, nan,  ..., nan, nan, nan]]]], device='cuda:0')
+
+    def _run(
+        self, phase, state, writes, keys, gates, rows, mapping, widths, beta, u, phi
+    ):
+        if self._widths is not None and (
+            widths is not self._widths
+            or (
+                self._widths_version is not None
+                and widths._version != self._widths_version
+            )
+        ):
+            raise ValueError("fixed widths changed; construct a new flush workspace")
+        nx, hv, v, k = state.shape
+        if phase == 4:
+            writes = gates = beta = state
+            keys = self._refresh_keys
+        ns = u.shape[0]
+        if (
+            (hv, v, k) != (self.hv, 128, 128)
+            or state.stride()[1:] != (16384, 128, 1)
+            or state.stride(0) % 128
+        ):
+            raise ValueError(
+                "state requires dense (HV,128,128) pages with stride divisible by 128"
+            )
+        tensors = [
+            ("state", state, (nx, hv, 128, 128), torch.float32),
+            ("writes", writes, (nx, hv, 16, 128), torch.float32),
+            ("keys", keys, (nx, self.h, 16, 128), torch.float32),
+            ("gates", gates, (nx, hv, 16), torch.float32),
+            ("rows", rows, (self.max_rows + 1,), torch.int32),
+            ("mapping", mapping, (nx,), torch.int32),
+            ("widths", widths, (hv,), torch.int32),
+            ("beta", beta, (ns, hv, 16), torch.float32),
+            ("u", u, (ns, hv, self.g, 128), torch.float32),
+            ("phi", phi, (ns, hv, self.g, 128), torch.float32),
+        ]
+        for name, tensor, shape, dtype in tensors:
+            if phase == 4 and name in ("writes", "keys", "gates", "beta"):
+                continue
+            if (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != dtype
+                or tensor.device != self.scratch.device
+            ):
+                raise ValueError(
+                    f"invalid {name}: expected {shape}, {dtype}, {self.scratch.device}"
+                )
+            paged = name in ("state", "writes", "keys", "gates")
+            if (
+                (not paged and not tensor.is_contiguous())
+                or (paged and not tensor[0].is_contiguous())
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(
+                    f"{name} must have contiguous tails and aligned storage"
+                )
+        with torch.cuda.device(state.device):
+>           self._ext.run(
+                phase,
+                self.grid,
+                state,
+                writes,
+                keys,
+                gates,
+                rows,
+                self.max_rows,
+                mapping,
+                widths,
+                beta,
+                u,
+                phi,
+                self.scratch,
+                self.prep,
+                self.prep_i,
+                self.ridge,
+                self._solve_heads,
+                self._solve_offsets,
+            )
+E           torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+E           Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+E           For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py:1264: AcceleratorError
+=============================== warnings summary ===============================
+tests/kernels/mamba/test_gdn_sketch.py: 14 warnings
+  /disk2/omin/miniconda3/envs/vllm029_q38next/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/kernels/mamba/test_gdn_sketch.py::test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[all_widths]
+FAILED tests/kernels/mamba/test_gdn_sketch.py::test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[dense]
+FAILED tests/kernels/mamba/test_gdn_sketch.py::test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[identity]
+FAILED tests/kernels/mamba/test_gdn_sketch.py::test_fixed_flush_plan_is_bitwise_equal_across_graph_replays[small_padded]
+4 failed, 130 deselected, 14 warnings in 39.08s

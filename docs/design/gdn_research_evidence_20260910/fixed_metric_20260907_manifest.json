@@ -1,0 +1,33 @@
+{
+  "recorded_utc": "2026-09-07T17:17:47.286966+00:00",
+  "git_head": "9e1ee3f954d864bb78345fa2d35b6a7139ed5aa1",
+  "worktree_changes_included": true,
+  "python": "3.12.14 | packaged by conda-forge | (main, Aug 21 2026, 22:48:28) [GCC 14.4.0]",
+  "torch": "2.13.0+cu130",
+  "torch_cuda": "13.0",
+  "gpu": "NVIDIA B200",
+  "method": "fixed E0 metric with shared per-head coefficients",
+  "metric_source": "synthetic positive-definite non-diagonal metric; no model calibration used in these timings",
+  "serving_dispatch_changed": false,
+  "model_evaluation_started": false,
+  "tests": {
+    "graph_oracle_cases_passed": 12,
+    "memcheck_cases_passed": 2,
+    "memcheck_errors": 0
+  },
+  "files_sha256": {
+    "/disk2/omin/vllm-qwen38next/benchmarks/kernels/gdn_fixed_metric_research.py": "5c6ad70d5c9d5f1c899ce0e1e2fe737a5ac22dc49cecd37c2b1b464a699d5b30",
+    "/disk2/omin/vllm-qwen38next/benchmarks/kernels/benchmark_gdn_fixed_metric.py": "70a736e12ddb4e4f82105628633e7c207d5b601e59844cb7aa4102bd4d8e376e",
+    "/disk2/omin/vllm-qwen38next/benchmarks/kernels/benchmark_gdn_solver_windows.py": "5a8ec9b99a01a6d476facde12844b87c7f82126a700ae24ebdf61c033e7f6cab",
+    "/disk2/omin/vllm-qwen38next/benchmarks/kernels/gdn_warp_cholesky_research.py": "d26199cf7203adb6111f2dbaa800aabf8d3bd41cb880eb5ceb4be2c79b6fe066",
+    "/disk2/omin/vllm-qwen38next/vllm/third_party/flash_linear_attention/ops/gdn_flush_full_cuda.py": "80855187fd01bac87ff159a97bcfbc448f4eaaf18a6eec7032f19a6889a4b68f",
+    "/disk2/omin/vllm-qwen38next/vllm/third_party/flash_linear_attention/ops/gdn_step_full_cuda.py": "0220a89c5df126151d932f54252034639969e9b54cc043320ee9b250e483a456",
+    "/disk2/omin/vllm-qwen38next/tests/kernels/mamba/test_gdn_sketch.py": "7d6fcfcfbdf2194e5a779041e588b9931e5fdf904ffb4f6d8b89f525253a4b5d",
+    "/disk2/omin/vllm-qwen38next/docs/design/gdn_fixed_metric.md": "00043bef709227232790fe70482bab6233ee02cf08d74f3ab8994755be023e25"
+  },
+  "results_sha256": {
+    "small_batches.json": "d997325d3f121aa91b6cdab2717358c160b7a6b7ee9f1714e38bc5cfbea9bfae",
+    "benchmark.json": "50b5c0bddd3ee5c4a460fca1c3bae6a4dbfdc5e366cc68457844a5a838d3813c",
+    "benchmark_repeated.json": "f37a5ae9c7e77267d0c7449c66b49714a3e702da29ccb49dd467111f8507bd95"
+  }
+}
