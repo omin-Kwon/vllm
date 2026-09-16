@@ -31,10 +31,15 @@ def wy_update(raw, KR, VR, GR, BR, slot, h, H: tl.constexpr):
     rhs = (
         tl.trans(values) - tl.dot(raw, tl.trans(a), input_precision="tf32x3")
     ) * beta[None, :]
-    for i in tl.static_range(16):
-        column = tl.sum(tl.where(t[None, :] == i, rhs, 0.0), axis=1)
-        factors = tl.sum(tl.where(t[None, :] == i, lower, 0.0), axis=1)
-        rhs -= column[:, None] * factors[None, :]
+    # Strictly lower 16x16 L has L**16=0: this finite factorization is
+    # the exact triangular inverse, not a truncated iterative approximation.
+    identity = (t[:, None] == t[None, :]).to(tl.float32)
+    inverse = identity - lower
+    power = lower
+    for _ in tl.static_range(3):
+        power = tl.dot(power, power, input_precision="ieee")
+        inverse = inverse + tl.dot(inverse, power, input_precision="ieee")
+    rhs = tl.dot(rhs, tl.trans(inverse), input_precision="tf32x3")
     result = raw + tl.dot(rhs, c, input_precision="tf32x3")
     final_prefix = tl.exp(tl.sum(tl.where(t[:, None] == 15, log_prefix, 0.0), axis=0))
     return result * final_prefix[None, :]
