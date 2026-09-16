@@ -9,6 +9,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -49,6 +50,9 @@ else:
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
     )
+
+
+logger = init_logger(__name__)
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -318,6 +322,26 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
 
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import bits_from_env
+
+        self._kda_qmamba_bits = bits_from_env()
+        if self._kda_qmamba_bits:
+            if not current_platform.is_cuda():
+                raise RuntimeError("Q-Mamba KDA DSQ is implemented only on CUDA")
+            if (
+                vllm_config.cache_config.use_replayssm
+                or vllm_config.cache_config.use_kda_recoverssm
+            ):
+                raise RuntimeError(
+                    "Q-Mamba DSQ cannot be combined with ReplaySSM or RecoverSSM"
+                )
+            if vllm_config.speculative_config is not None:
+                raise RuntimeError("Q-Mamba DSQ does not support speculative decoding")
+            logger.info_once(
+                "GLM-5 KDA Q-Mamba DSQ enabled: bits=%d granularity=dsq_qm",
+                self._kda_qmamba_bits,
+            )
+
         additional_config = vllm_config.additional_config
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
             additional_config.get("kda_prefill_backend", "auto")
@@ -369,6 +393,33 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     vllm_config.model_config.dtype,
                 ),
             )
+
+    def _quantize_qmamba_state(
+        self,
+        state: torch.Tensor,
+        state_indices: torch.Tensor | None,
+        row_mask: torch.Tensor | None,
+    ) -> None:
+        if not self._kda_qmamba_bits:
+            return
+        if state_indices is None or row_mask is None:
+            raise RuntimeError(
+                "Q-Mamba KDA DSQ reached a state update without exact row metadata"
+            )
+        from vllm.model_executor.layers.mamba.gdn.gdn_quant import quantize_slots_
+
+        num_rows = row_mask.numel()
+        if state_indices.numel() < num_rows:
+            raise RuntimeError(
+                "Q-Mamba state-index metadata is shorter than its row mask: "
+                f"{state_indices.numel()} < {num_rows}"
+            )
+        quantize_slots_(
+            state,
+            state_indices.reshape(-1)[:num_rows],
+            self._kda_qmamba_bits,
+            row_mask,
+        )
 
     def _flashkda_prefill(
         self,
@@ -731,6 +782,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 last_recurrent_state,
                 non_spec_state_indices_tensor,
             )
+            if attn_metadata_narrowed.num_decodes > 0:
+                self._quantize_qmamba_state(
+                    recurrent_state,
+                    non_spec_state_indices_tensor[: attn_metadata_narrowed.num_decodes],
+                    attn_metadata_narrowed.qmamba_quantize_d,
+                )
+            self._quantize_qmamba_state(
+                recurrent_state,
+                non_spec_state_indices_tensor[attn_metadata_narrowed.num_decodes :],
+                attn_metadata_narrowed.qmamba_quantize_p,
+            )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
@@ -758,6 +820,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 g_bias=self.dt_bias,
                 compute_gate=True,
                 lower_bound=lower_bound,
+            )
+            self._quantize_qmamba_state(
+                recurrent_state,
+                non_spec_state_indices_tensor,
+                attn_metadata_narrowed.qmamba_quantize_d,
             )
 
         # --- merge spec / non-spec outputs back into token order ---

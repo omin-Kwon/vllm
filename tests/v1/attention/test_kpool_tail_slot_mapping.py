@@ -50,6 +50,7 @@ def test_tail_backend_layout_matches_kernel_pointer_arithmetic():
     _, _, head_stride, state_stride, content_stride = strides
 
     assert layout is KVCacheLayout.LBHNC
+    assert not spec.uses_slot_mapping
     assert head_stride == KPOOL * 128 * torch.bfloat16.itemsize
     assert state_stride == 128 * torch.bfloat16.itemsize
     assert content_stride == 1

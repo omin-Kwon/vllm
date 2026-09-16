@@ -11,6 +11,10 @@ def create_cache(vllm_config, layer_idx, heads, head_dim, lower_bound):
     options = vllm_config.additional_config.get("kda_window")
     if options is None:
         return None
+    from vllm.model_executor.layers.mamba.gdn.gdn_quant import bits_from_env
+
+    if bits_from_env():
+        raise ValueError("Q-Mamba DSQ cannot be combined with GLM window replay/sketch")
     allowed = {"mode", "window", "checkpoint", "pivots"}
     if not isinstance(options, dict) or set(options) - allowed:
         raise ValueError("Invalid kda_window configuration keys")

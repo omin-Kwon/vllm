@@ -980,6 +980,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 class KpoolTailSpec(SlidingWindowSpec):
     """One-block circular scratch cache for a kpool indexer's raw tail."""
 
+    @property
+    def uses_slot_mapping(self) -> bool:
+        # The indexer maps positions modulo the pool size. The V2 runner's
+        # generic sequence-wide mapping would exceed this one-block table.
+        return False
+
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:

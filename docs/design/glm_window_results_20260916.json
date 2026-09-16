@@ -103,7 +103,7 @@
     "vllm/model_executor/layers/mamba/ops/glm_window/wy_update.py": "4431fb88e2fd859b2a53ee718b1d9d936d5afaefff79d7d9dba64e70dda6a19f",
     "vllm/model_executor/layers/mamba/ops/glm_window/metadata_high_p6_wy.py": "1a96793d321cf6c613389e3471aefffc9af5ef0a894a845b97e6321492a66b1e",
     "vllm/model_executor/layers/mamba/ops/glm_window/controls.py": "82047888b902f769dc0cf5102f9df603dd5b031f3b2e8c1ea661d17bbc1f918d",
-    "vllm/model_executor/layers/mamba/ops/glm_window/config.py": "ccf119b0305724e2656a2f058b2771500573098f5242b7c6123a0dec50d35a32",
+    "vllm/model_executor/layers/mamba/ops/glm_window/config.py": "a28c5da5975e0dc6203e2112a861d9ae039e028542e782197455330d8271f477",
     "vllm/model_executor/layers/mamba/ops/glm_window/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
     "vllm/model_executor/layers/mamba/ops/glm_window/sketch.py": "3fbd654f424b91196beb0333dac5d3409d15a8fb4cc94a4999975fa1ee7a7fff",
     "vllm/model_executor/layers/mamba/ops/glm_window/routing.py": "47906ac9f8715f5140e69723f52eb621f2de8d28686f022d9cc40a448911e082"
@@ -122,5 +122,22 @@
     "kda_suite": 18,
     "runner_suite": 10,
     "status": "PASS"
+  },
+  "concurrent_integration": {
+    "remote_commit": "3daf64c2fa27504cf34e9ab4dbed6ce5ccaf18fa",
+    "implementation_commit": "c0f9c65fef2e281da417f4ee9a7c4d10e7cffb66",
+    "kda_tests": 20,
+    "runner_tests": 10,
+    "metadata_tail_tests": 32,
+    "qmamba_tests": 17,
+    "merged_model_gate": {
+      "mode": "sketch G4 P4",
+      "status": "PASS",
+      "requests": 4,
+      "generated_tokens": 384,
+      "kda_layers": 34,
+      "mixed_decode_tokens_per_layer": 1
+    },
+    "premerge_metrics_not_reinterpreted": true
   }
 }

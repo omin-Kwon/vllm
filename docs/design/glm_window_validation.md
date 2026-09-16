@@ -134,3 +134,15 @@ Full benchmark accuracy has not been remeasured on the new window path. P6 is
 covered by the kernel/oracle/mixed-routing tests; the real Sketch model smoke
 uses P4. Machine-readable results are in
 [`glm_window_results_20260916.json`](glm_window_results_20260916.json).
+
+### Concurrent branch integration
+
+Before publishing, integrated remote commit `3daf64c2fa` (GLM Q-Mamba DSQ and
+circular kpool-tail mapping) while preserving its changes. Window replay/sketch
+now explicitly rejects simultaneous Q-Mamba state quantization.
+
+After integration, the KDA suite passed 20 tests (two new method-combination
+guards); GDN metadata and kpool-tail tests passed 32; Q-Mamba tests passed 17,
+including CUDA cases. The real G4/P4 mixed-batch model gate also passed again.
+The earlier Dense/Replay/shadow measurements above precede this remote merge;
+they are not a benchmark accuracy claim for the combined branch.

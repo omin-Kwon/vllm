@@ -22,6 +22,20 @@ H, D = 16, 128
 LOWER_BOUND = -5.0
 
 
+@pytest.mark.parametrize("mode", ["replay", "sketch"])
+def test_window_rejects_simultaneous_qmamba_quantization(monkeypatch, mode):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.ops.glm_window.config import create_cache
+
+    monkeypatch.setenv("NS_GDN_QBITS", "8")
+    monkeypatch.delenv("NS_GDN_QGRAN", raising=False)
+    monkeypatch.delenv("NS_GDN_QSR", raising=False)
+    config = SimpleNamespace(additional_config={"kda_window": {"mode": mode}})
+    with pytest.raises(ValueError, match="Q-Mamba DSQ cannot be combined"):
+        create_cache(config, 0, 64, 128, -5.0)
+
+
 def test_window_checkpoint_load_ignores_model_cuda_default_device(tmp_path):
     """vLLM constructs layers inside a CUDA default-device context."""
     from vllm.model_executor.layers.mamba.ops.glm_window.sketch import load_checkpoint
