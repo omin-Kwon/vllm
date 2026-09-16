@@ -84,6 +84,7 @@ def _acquire_row(
     S1: tl.constexpr,
     S2: tl.constexpr,
     S3: tl.constexpr,
+    DIRECT_STATE: tl.constexpr = False,
 ):
     slot = tl.load(Slots + row)
     if slot < 0:
@@ -97,7 +98,10 @@ def _acquire_row(
     offset = h * S1 + v[:, None] * S2 + k[None, :] * S3
     pool = Pool + (slot * H + h) * 16384 + v[:, None] * 128 + k[None, :]
     if old > 0:
-        raw = tl.load(pool)
+        if DIRECT_STATE:  # noqa: SIM108 -- constexpr excludes the unused pointer
+            raw = tl.load(State + old * S0 + offset)
+        else:
+            raw = tl.load(pool)
         if tl.load(Ranks + h) > 0:
             count = tl.load(OldPos + row)
             ring = (slot * H + h) * 16
@@ -111,8 +115,9 @@ def _acquire_row(
                 delta = beta * (value - tl.sum(raw * key[None, :], axis=1))
                 raw += delta[:, None] * key[None, :]
         tl.store(State + old * S0 + offset, raw)
-    raw = tl.load(State + physical * S0 + offset)
-    tl.store(pool, raw)
+    if not DIRECT_STATE:
+        raw = tl.load(State + physical * S0 + offset)
+        tl.store(pool, raw)
     if h == 0:
         tl.store(Owners + slot, physical)
         tl.store(Pos + slot, 0)
@@ -189,6 +194,7 @@ def _acquire_work(
     WorkRows,
     WorkCounts,
     Capacity: tl.constexpr,
+    DIRECT_STATE: tl.constexpr = False,
 ):
     total = tl.load(WorkCounts) * H
     for item in range(tl.program_id(0), total, tl.num_programs(0)):
@@ -216,6 +222,7 @@ def _acquire_work(
             S1,
             S2,
             S3,
+            DIRECT_STATE,
         )
 
 
@@ -357,11 +364,12 @@ def _prefill_handoff(
     S1: tl.constexpr,
     S2: tl.constexpr,
     S3: tl.constexpr,
+    DIRECT_STATE: tl.constexpr = False,
 ):
     row, block = tl.program_id(0), tl.program_id(1)
     slot = tl.load(Slots + row)
     if slot >= 0:
-        if tl.load(Initial + row):
+        if not DIRECT_STATE and tl.load(Initial + row):
             physical = tl.load(IDs + row).to(tl.int64)
             x = block * X + tl.arange(0, X)
             offset = (x // 16384) * S1 + ((x // 128) % 128) * S2 + (x % 128) * S3
@@ -388,6 +396,12 @@ def _flush(
     BV: tl.constexpr,
     PARTIAL: tl.constexpr = False,
     RAW_K_RING: tl.constexpr = False,
+    DIRECT_STATE: tl.constexpr = False,
+    Owners=None,
+    S0: tl.constexpr = 0,
+    S1: tl.constexpr = 0,
+    S2: tl.constexpr = 0,
+    S3: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -400,7 +414,17 @@ def _flush(
         if ready & tl.load(LatchHeads + head):
             kk = tl.arange(0, K)
             vv = block * BV + tl.arange(0, BV)
-            sp = State + (slot * H + head) * V * K + vv[:, None] * K + kk[None, :]
+            if DIRECT_STATE:
+                physical = tl.load(Owners + slot).to(tl.int64)
+                sp = (
+                    State
+                    + physical * S0
+                    + head * S1
+                    + vv[:, None] * S2
+                    + kk[None, :] * S3
+                )
+            else:
+                sp = State + (slot * H + head) * V * K + vv[:, None] * K + kk[None, :]
             state = tl.load(sp, mask=vv[:, None] < V, other=0.0)
             base = (slot * H + head) * W
             for t in range(count):

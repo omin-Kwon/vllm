@@ -127,7 +127,7 @@ class SketchCache(ReplayCache):
                 num_stages=1,
             )
 
-    def _decode(self, slots, q, k, v, gate, beta, a_log, bias):
+    def _decode(self, state, indices, slots, q, k, v, gate, beta, a_log, bias):
         self._metadata(slots, False)
         p = self.pool
         out = torch.zeros_like(v)

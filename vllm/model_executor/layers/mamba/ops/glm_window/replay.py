@@ -89,6 +89,7 @@ def replay_step(
 
 @gluon.jit
 def replay_read(
+    IDs,
     Slots,
     Pos,
     State,
@@ -101,6 +102,10 @@ def replay_read(
     Out,
     H: gl.constexpr,
     BV: gl.constexpr,
+    S0: gl.constexpr,
+    S1: gl.constexpr,
+    S2: gl.constexpr,
+    S3: gl.constexpr,
 ):
     block, head, row = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])
@@ -122,7 +127,11 @@ def replay_read(
     replay_out = gl.load(ReplayOut + offset + vp)
     beta = gl.load(Scalars + (row * H + head) * 2)
     kq = gl.load(Scalars + (row * H + head) * 2 + 1)
-    state = gl.load(State + (slot * H + head) * 16384 + vv[:, None] * 128 + kp[None, :])
+    physical = gl.load(IDs + row).to(gl.int64)
+    state = gl.load(
+        State + physical * S0 + head * S1 + vv[:, None] * S2 + kp[None, :] * S3,
+        cache_modifier=".cg",
+    )
     projection_k = gl.convert_layout(gl.sum(state * k[None, :], axis=1), packed)
     projection_q = gl.convert_layout(gl.sum(state * q[None, :], axis=1), packed)
     delta = rhs - beta * projection_k
@@ -133,6 +142,7 @@ def replay_read(
 
 @triton.jit
 def replay_flush(
+    IDs,
     Q,
     Slots,
     State,
@@ -148,6 +158,10 @@ def replay_flush(
     Capacity: tl.constexpr,
     H: tl.constexpr,
     BV: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    S3: tl.constexpr,
 ):
     """Fuse exact WY window update and full-state output for flush rows only."""
     tiles: tl.constexpr = 128 // BV
@@ -159,8 +173,9 @@ def replay_flush(
         slot = tl.load(Slots + row).to(tl.int64)
         k = tl.arange(0, 128)
         v = v_start + tl.arange(0, BV)
-        sp = State + (slot * H + head) * 16384 + v[:, None] * 128 + k[None, :]
-        state = tl.load(sp)
+        physical = tl.load(IDs + row).to(tl.int64)
+        sp = State + physical * S0 + head * S1 + v[:, None] * S2 + k[None, :] * S3
+        state = tl.load(sp, cache_modifier=".cg")
         base = (slot * H + head) * 16
         prefix = tl.load(PrefixR + (slot * H + head) * 128 + k)
         decay = tl.exp(prefix)

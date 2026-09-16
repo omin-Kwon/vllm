@@ -12,7 +12,6 @@ from .controls import (
     _acquire,
     _acquire_work,
     _advance,
-    _advance_work,
     _bump,
     _flush,
     _prefill_handoff,
@@ -24,6 +23,9 @@ from .replay import replay_flush, replay_read, replay_step
 
 class ReplayCache:
     """Keep raw updates until W16; materialize before native prefill handoff.
+
+    Exact Replay reads and updates the native page directly. Sketch retains a
+    private checkpoint pool. Both retain the same slot ownership and raw rings.
 
     Physical page zero is padding. Live page IDs in a batch must be unique.
     The runner must invalidate finished/preempted owners before page reuse.
@@ -45,7 +47,11 @@ class ReplayCache:
         ip = dict(device=device, dtype=torch.int32)
         ring = (capacity, heads, 16, 128)
         self.pool = SimpleNamespace(
-            state=torch.zeros(capacity, heads, 128, 128, **fp),
+            state=(
+                torch.empty(0, **fp)
+                if replay_factors
+                else torch.zeros(capacity, heads, 128, 128, **fp)
+            ),
             pos=torch.zeros(capacity, **ip),
             k=torch.zeros(ring, device=device, dtype=torch.bfloat16),
             v=torch.zeros(ring, device=device, dtype=torch.bfloat16),
@@ -73,7 +79,8 @@ class ReplayCache:
         self.work_counts = torch.zeros(2, **ip)
         self.mixed_decode_tokens = 0
         self.flush_programs = min(
-            4 * torch.cuda.get_device_properties(device).multi_processor_count,
+            (8 if replay_factors else 4)
+            * torch.cuda.get_device_properties(device).multi_processor_count,
             capacity * heads,
         )
 
@@ -112,7 +119,7 @@ class ReplayCache:
         _flush[(batch, self.heads, 4)](
             flush_slots,
             p.pos,
-            p.state,
+            state if self.replay_factors else p.state,
             p.k,
             p.v,
             p.log_a,
@@ -125,6 +132,12 @@ class ReplayCache:
             32,
             PARTIAL=True,
             RAW_K_RING=True,
+            DIRECT_STATE=self.replay_factors,
+            Owners=self.owners,
+            S0=state.stride(0),
+            S1=state.stride(1),
+            S2=state.stride(2),
+            S3=state.stride(3),
             num_warps=4,
         )
         _prefill_handoff[(batch, self.heads)](
@@ -133,14 +146,15 @@ class ReplayCache:
             slots,
             self.owners,
             state,
-            p.state,
+            state if self.replay_factors else p.state,
             self.heads * 16384,
             16384,
             *state.stride(),
+            DIRECT_STATE=self.replay_factors,
             num_warps=4,
         )
 
-    def _decode(self, slots, q, k, v, gate, beta, a_log, bias):
+    def _decode(self, state, indices, slots, q, k, v, gate, beta, a_log, bias):
         p = self.pool
         out = torch.empty_like(v)
         replay_step[(self.heads, q.shape[0])](
@@ -169,9 +183,10 @@ class ReplayCache:
             num_warps=1,
         )
         replay_read[(4, self.heads, q.shape[0])](
+            indices,
             slots,
             p.pos,
-            p.state,
+            state,
             p.delta,
             self.query_scaled,
             self.key_scaled,
@@ -181,12 +196,14 @@ class ReplayCache:
             out,
             self.heads,
             32,
+            *state.stride(),
             num_warps=4,
         )
         replay_flush[(self.flush_programs,)](
+            indices,
             q,
             slots,
-            p.state,
+            state,
             p.prefix,
             p.direct_decay,
             self.key_scaled,
@@ -199,8 +216,12 @@ class ReplayCache:
             self.capacity,
             self.heads,
             32,
-            num_warps=4,
+            num_warps=1,
             num_stages=1,
+            S0=state.stride(0),
+            S1=state.stride(1),
+            S2=state.stride(2),
+            S3=state.stride(3),
         )
         return out
 
@@ -245,7 +266,7 @@ class ReplayCache:
             self.owners,
             p.pos,
             state,
-            p.state,
+            state if self.replay_factors else p.state,
             p.k,
             p.v,
             p.log_a,
@@ -260,32 +281,25 @@ class ReplayCache:
                 self.work_rows,
                 self.work_counts,
                 self.capacity,
+                DIRECT_STATE=True,
                 num_warps=4,
             )
         else:
             _acquire[(batch, self.heads)](*acquire_args, num_warps=4)
-        out = self._decode(slots, q, k, v, gate, beta, a_log, bias)
-        advance_args = (
-            indices,
-            slots,
-            p.pos,
-            state,
-            p.state,
-            self.heads,
-            self.heads * 16384,
-            16,
-            4096 if self.replay_factors else 16384,
-            *state.stride(),
-        )
-        if self.replay_factors:
-            _advance_work[(self.flush_programs,)](
-                *advance_args,
-                self.work_rows,
-                self.work_counts,
-                self.capacity,
+        out = self._decode(state, indices, slots, q, k, v, gate, beta, a_log, bias)
+        if not self.replay_factors:
+            _advance[(batch, self.heads)](
+                indices,
+                slots,
+                p.pos,
+                state,
+                p.state,
+                self.heads,
+                self.heads * 16384,
+                16,
+                16384,
+                *state.stride(),
                 num_warps=4,
             )
-        else:
-            _advance[(batch, self.heads)](*advance_args, num_warps=4)
         _bump[(1,)](slots, p.pos, batch, 16, triton.next_power_of_2(batch))
         return out

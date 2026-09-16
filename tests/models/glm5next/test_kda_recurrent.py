@@ -164,6 +164,8 @@ def test_window_wy_replay_varied_inputs_and_channel_decay():
     bias = torch.zeros(h, 128, device="cuda")
     gate_center = torch.linspace(-9, 9, 128, device="cuda")
     for step in range(64):
+        if step % 16 == 0:
+            checkpoint = state[1].clone()
         q, k, v, gate = [
             torch.randn(1, h, 128, device="cuda", dtype=torch.bfloat16)
             for _ in range(4)
@@ -186,6 +188,9 @@ def test_window_wy_replay_varied_inputs_and_channel_decay():
             torch.testing.assert_close(
                 state[1].double(), reference, atol=3e-6, rtol=5e-5
             )
+        else:
+            # Exact Replay must leave the full native checkpoint unchanged.
+            assert torch.equal(state[1], checkpoint)
 
 
 @pytest.mark.parametrize("mode", ["replay", "p4", "p6"])

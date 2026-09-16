@@ -4,7 +4,7 @@
 
 One synthetic KDA layer, H64/K128/V128, FP32 state and raw BF16 inputs.
 Includes ownership and state handoff kernels in replay modes. The optional old
-core also uses the current lifecycle implementation. These are kernel
+core retains the pooled-state lifecycle used by Sketch. These are kernel
 measurements, not model throughput. No artificial cursor resets are timed.
 """
 
@@ -26,7 +26,10 @@ def legacy_class(path):
     spec.loader.exec_module(module)
 
     class LegacyCache(ReplayCache):
-        def _decode(self, slots, q, k, v, gate, beta, a_log, bias):
+        def __init__(self, heads, capacity, device):
+            super().__init__(heads, capacity, device, replay_factors=False)
+
+        def _decode(self, state, indices, slots, q, k, v, gate, beta, a_log, bias):
             p = self.pool
             out = torch.zeros_like(v)
             module.replay_step[(q.shape[0], self.heads, 4)](
@@ -131,12 +134,35 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 32, 64, 128])
     parser.add_argument("--legacy-source", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--layers", type=int, nargs="+")
+    parser.add_argument("--pivots", type=int, default=4)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     torch.set_num_threads(2)
     classes = {"native": ReplayCache, "parallel_replay": ReplayCache}
     if args.legacy_source:
         classes["sequential_replay"] = legacy_class(args.legacy_source)
+    pack = None
+    if args.checkpoint:
+        from vllm.model_executor.layers.mamba.ops.glm_window.sketch import (
+            SketchCache,
+            load_checkpoint,
+        )
+
+        pack = load_checkpoint(str(args.checkpoint))
+        classes = {"native": ReplayCache}
+        for layer in args.layers or sorted(pack["frames"]):
+
+            def factory(heads, capacity, device, layer=layer):
+                return SketchCache(
+                    pack["frames"][layer].to(device),
+                    pack["ranks"][layer].to(device),
+                    capacity=capacity,
+                    pivots=args.pivots,
+                )
+
+            classes[f"sketch_p{args.pivots}_layer{layer}"] = factory
     rows = []
     for batch in args.batches:
         for mode, cls in classes.items():
@@ -146,7 +172,12 @@ def main():
             torch.accelerator.empty_cache()
     args.out.write_text(
         json.dumps(
-            dict(scope="synthetic_one_layer_including_lifecycle", results=rows),
+            dict(
+                scope="synthetic_one_layer_including_lifecycle",
+                checkpoint=str(args.checkpoint) if args.checkpoint else None,
+                checkpoint_meta=pack["meta"] if pack else None,
+                results=rows,
+            ),
             indent=2,
         )
         + "\n"
