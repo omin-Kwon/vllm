@@ -10,7 +10,9 @@ from vllm.triton_utils import triton
 
 from .controls import (
     _acquire,
+    _acquire_work,
     _advance,
+    _advance_work,
     _bump,
     _flush,
     _prefill_handoff,
@@ -38,6 +40,7 @@ class ReplayCache:
         if heads < 1 or capacity < 1:
             raise ValueError("Positive head count and slot capacity required")
         self.heads, self.capacity = heads, capacity
+        self.replay_factors = replay_factors
         fp = dict(device=device, dtype=torch.float32)
         ip = dict(device=device, dtype=torch.int32)
         ring = (capacity, heads, 16, 128)
@@ -51,13 +54,14 @@ class ReplayCache:
             latch_heads=torch.ones(heads, device=device, dtype=torch.bool),
         )
         if replay_factors:
-            self.pool.prefix = torch.zeros(ring, **fp)
+            self.pool.prefix = torch.zeros(capacity, heads, 128, **fp)
             self.pool.direct_decay = torch.zeros(ring, **fp)
-            self.pool.f = torch.zeros(ring, **fp)
-            self.pool.u = torch.zeros(ring, **fp)
             self.pool.delta = torch.zeros(ring, **fp)
-            self.effective = torch.empty(capacity, heads, 128, **fp)
-            self.replay_out = torch.empty_like(self.effective)
+            self.query_scaled = torch.empty(capacity, heads, 128, **fp)
+            self.key_scaled = torch.empty_like(self.query_scaled)
+            self.rhs = torch.empty_like(self.query_scaled)
+            self.replay_out = torch.empty_like(self.query_scaled)
+            self.scalars = torch.empty(capacity, heads, 2, **fp)
         self.ranks = torch.ones(heads, **ip)
         self.owners = torch.full((capacity,), -1, **ip)
         self.slots = torch.empty(capacity, **ip)
@@ -138,8 +142,8 @@ class ReplayCache:
 
     def _decode(self, slots, q, k, v, gate, beta, a_log, bias):
         p = self.pool
-        out = torch.zeros_like(v)
-        replay_step[(q.shape[0], self.heads, 1)](
+        out = torch.empty_like(v)
+        replay_step[(self.heads, q.shape[0])](
             q,
             k,
             v,
@@ -149,31 +153,31 @@ class ReplayCache:
             bias,
             slots,
             p.pos,
-            p.state,
             p.k,
             p.v,
             p.log_a,
             p.beta,
             p.prefix,
             p.direct_decay,
-            p.f,
-            p.u,
-            self.effective,
+            p.delta,
+            self.query_scaled,
+            self.key_scaled,
+            self.rhs,
             self.replay_out,
-            out,
+            self.scalars,
             self.heads,
-            128,
-            num_warps=4,
+            num_warps=1,
         )
-        replay_read[(q.shape[0], self.heads, 4)](
+        replay_read[(4, self.heads, q.shape[0])](
             slots,
             p.pos,
             p.state,
-            p.f,
-            p.u,
             p.delta,
-            self.effective,
+            self.query_scaled,
+            self.key_scaled,
+            self.rhs,
             self.replay_out,
+            self.scalars,
             out,
             self.heads,
             32,
@@ -185,16 +189,17 @@ class ReplayCache:
             p.state,
             p.prefix,
             p.direct_decay,
-            p.f,
-            p.u,
+            self.key_scaled,
+            self.rhs,
+            self.scalars,
             p.delta,
             out,
             self.work_rows,
             self.work_counts,
             self.capacity,
             self.heads,
-            64,
-            num_warps=8,
+            32,
+            num_warps=4,
             num_stages=1,
         )
         return out
@@ -231,7 +236,7 @@ class ReplayCache:
             self.work_counts,
             num_warps=4,
         )
-        _acquire[(batch, self.heads)](
+        acquire_args = (
             indices,
             slots,
             self.old,
@@ -248,10 +253,19 @@ class ReplayCache:
             self.ranks,
             self.heads,
             *state.stride(),
-            num_warps=4,
         )
+        if self.replay_factors:
+            _acquire_work[(self.flush_programs,)](
+                *acquire_args,
+                self.work_rows,
+                self.work_counts,
+                self.capacity,
+                num_warps=4,
+            )
+        else:
+            _acquire[(batch, self.heads)](*acquire_args, num_warps=4)
         out = self._decode(slots, q, k, v, gate, beta, a_log, bias)
-        _advance[(batch, self.heads)](
+        advance_args = (
             indices,
             slots,
             p.pos,
@@ -260,9 +274,18 @@ class ReplayCache:
             self.heads,
             self.heads * 16384,
             16,
-            16384,
+            4096 if self.replay_factors else 16384,
             *state.stride(),
-            num_warps=4,
         )
+        if self.replay_factors:
+            _advance_work[(self.flush_programs,)](
+                *advance_args,
+                self.work_rows,
+                self.work_counts,
+                self.capacity,
+                num_warps=4,
+            )
+        else:
+            _advance[(batch, self.heads)](*advance_args, num_warps=4)
         _bump[(1,)](slots, p.pos, batch, 16, triton.next_power_of_2(batch))
         return out

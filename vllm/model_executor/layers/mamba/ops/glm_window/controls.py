@@ -62,7 +62,9 @@ def _resolve_work(
 
 
 @triton.jit
-def _acquire(
+def _acquire_row(
+    row,
+    h,
     IDs,
     Slots,
     Old,
@@ -83,7 +85,6 @@ def _acquire(
     S2: tl.constexpr,
     S3: tl.constexpr,
 ):
-    row, h = tl.program_id(0), tl.program_id(1)
     slot = tl.load(Slots + row)
     if slot < 0:
         return
@@ -118,6 +119,136 @@ def _acquire(
 
 
 @triton.jit
+def _acquire(
+    IDs,
+    Slots,
+    Old,
+    OldPos,
+    Fresh,
+    Owners,
+    Pos,
+    State,
+    Pool,
+    KR,
+    VR,
+    GR,
+    BR,
+    Ranks,
+    H: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    S3: tl.constexpr,
+):
+    _acquire_row(
+        tl.program_id(0),
+        tl.program_id(1),
+        IDs,
+        Slots,
+        Old,
+        OldPos,
+        Fresh,
+        Owners,
+        Pos,
+        State,
+        Pool,
+        KR,
+        VR,
+        GR,
+        BR,
+        Ranks,
+        H,
+        S0,
+        S1,
+        S2,
+        S3,
+    )
+
+
+@triton.jit
+def _acquire_work(
+    IDs,
+    Slots,
+    Old,
+    OldPos,
+    Fresh,
+    Owners,
+    Pos,
+    State,
+    Pool,
+    KR,
+    VR,
+    GR,
+    BR,
+    Ranks,
+    H: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    S3: tl.constexpr,
+    WorkRows,
+    WorkCounts,
+    Capacity: tl.constexpr,
+):
+    total = tl.load(WorkCounts) * H
+    for item in range(tl.program_id(0), total, tl.num_programs(0)):
+        row = tl.load(WorkRows + item // H)
+        h = item % H
+        _acquire_row(
+            row,
+            h,
+            IDs,
+            Slots,
+            Old,
+            OldPos,
+            Fresh,
+            Owners,
+            Pos,
+            State,
+            Pool,
+            KR,
+            VR,
+            GR,
+            BR,
+            Ranks,
+            H,
+            S0,
+            S1,
+            S2,
+            S3,
+        )
+
+
+@triton.jit
+def _advance_row(
+    row,
+    block,
+    IDs,
+    Slots,
+    Pos,
+    State,
+    Pool,
+    H: tl.constexpr,
+    SIZE: tl.constexpr,
+    W: tl.constexpr,
+    X: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    S3: tl.constexpr,
+):
+    slot = tl.load(Slots + row)
+    if slot >= 0:
+        pos = tl.load(Pos + slot)
+        if pos == W - 1:
+            physical = tl.load(IDs + row).to(tl.int64)
+            x = block * X + tl.arange(0, X)
+            offset = (x // 16384) * S1 + ((x // 128) % 128) * S2 + (x % 128) * S3
+            value = tl.load(Pool + slot * SIZE + x, x < SIZE, other=0.0)
+            tl.store(State + physical * S0 + offset, value, x < SIZE)
+
+
+@triton.jit
 def _advance(
     IDs,
     Slots,
@@ -133,16 +264,52 @@ def _advance(
     S2: tl.constexpr,
     S3: tl.constexpr,
 ):
-    row, block = tl.program_id(0), tl.program_id(1)
-    slot = tl.load(Slots + row)
-    if slot >= 0:
-        pos = tl.load(Pos + slot)
-        if pos == W - 1:
-            physical = tl.load(IDs + row).to(tl.int64)
-            x = block * X + tl.arange(0, X)
-            offset = (x // 16384) * S1 + ((x // 128) % 128) * S2 + (x % 128) * S3
-            value = tl.load(Pool + slot * SIZE + x, x < SIZE, other=0.0)
-            tl.store(State + physical * S0 + offset, value, x < SIZE)
+    _advance_row(
+        tl.program_id(0),
+        tl.program_id(1),
+        IDs,
+        Slots,
+        Pos,
+        State,
+        Pool,
+        H,
+        SIZE,
+        W,
+        X,
+        S0,
+        S1,
+        S2,
+        S3,
+    )
+
+
+@triton.jit
+def _advance_work(
+    IDs,
+    Slots,
+    Pos,
+    State,
+    Pool,
+    H: tl.constexpr,
+    SIZE: tl.constexpr,
+    W: tl.constexpr,
+    X: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    S3: tl.constexpr,
+    WorkRows,
+    WorkCounts,
+    Capacity: tl.constexpr,
+):
+    blocks: tl.constexpr = triton.cdiv(SIZE, X)
+    total = tl.load(WorkCounts + 1) * blocks
+    for item in range(tl.program_id(0), total, tl.num_programs(0)):
+        row = tl.load(WorkRows + Capacity + item // blocks)
+        block = item % blocks
+        _advance_row(
+            row, block, IDs, Slots, Pos, State, Pool, H, SIZE, W, X, S0, S1, S2, S3
+        )
 
 
 @triton.jit

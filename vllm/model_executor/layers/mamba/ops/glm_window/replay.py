@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact parallel WY read: full-dimensional counterpart of projected SketchSSM.
 
-Maintain pi_s in K dimensions and raw-write u_s in V dimensions. Each decode
-computes the new factors and effective query by parallel ring reductions;
-only flush materializes the state. Raw BF16 k/v and FP32 gate/beta are retained.
+Contract the exact WY factors as delta_s = u_s - S0 @ pi_s. This yields
+S_t = S0 * d_t + sum_s delta_s ell_s(t)^T. Each non-flush reads S0 once
+for the current query and key; ring reductions remain parallel. Only flush
+materializes state. Raw BF16 k/v and FP32 gate/beta are retained for handoff.
+This contraction uses the full state, never a sketched/approximate state read.
 """
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import gl, gluon, tl, triton
 
 
-@triton.jit
+@gluon.jit
 def replay_step(
     Q,
     K,
@@ -21,119 +23,112 @@ def replay_step(
     Bias,
     Slots,
     Pos,
-    State,
     KR,
     VR,
     GR,
     BR,
     PrefixR,
     DR,
-    FR,
-    UR,
-    Effective,
+    DeltaR,
+    QueryScaled,
+    KeyScaled,
+    Rhs,
     ReplayOut,
-    Out,
-    H: tl.constexpr,
-    BV: tl.constexpr,
+    Scalars,
+    H: gl.constexpr,
 ):
-    row, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    slot = tl.load(Slots + row)
+    head, row = gl.program_id(0), gl.program_id(1)
+    slot = gl.load(Slots + row)
     if slot < 0:
         return
-    pos = tl.load(Pos + slot)
-    kk = tl.arange(0, 128)
-    vv = block * BV + tl.arange(0, BV)
-    raw_k = tl.load(K + (row * H + head) * 128 + kk).to(tl.float32)
-    value = tl.load(V + (row * H + head) * 128 + vv).to(tl.float32)
-    query = tl.load(Q + (row * H + head) * 128 + kk).to(tl.float32)
-    query *= tl.rsqrt(tl.sum(query * query) + 1.0e-6) * 128**-0.5
-    key = raw_k * tl.rsqrt(tl.sum(raw_k * raw_k) + 1.0e-6)
-    raw_g = tl.load(Gate + (row * H + head) * 128 + kk).to(tl.float32)
-    raw_g += tl.load(Bias + head * 128 + kk)
-    log_a = -5.0 / (1.0 + tl.exp(-tl.exp(tl.load(A + head)) * raw_g))
-    beta = tl.sigmoid(tl.load(Beta + row * H + head).to(tl.float32))
+    pos = gl.load(Pos + slot)
+    # One warp keeps the ring reductions in registers; vectorize along K/V.
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [1, 1], [1, 0])
+    k = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+    t = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+    offset = (row * H + head) * 128
+    raw_k = gl.load(K + offset + k).to(gl.float32)
+    value = gl.load(V + offset + k).to(gl.float32)
+    query = gl.load(Q + offset + k).to(gl.float32)
+    query *= gl.rsqrt(gl.sum(query * query) + 1e-6) * 128**-0.5
+    key = raw_k * gl.rsqrt(gl.sum(raw_k * raw_k) + 1e-6)
+    raw_g = gl.load(Gate + offset + k).to(gl.float32)
+    raw_g += gl.load(Bias + head * 128 + k)
+    log_a = -5.0 / (1.0 + gl.exp(-gl.exp(gl.load(A + head)) * raw_g))
+    beta = 1.0 / (1.0 + gl.exp(-gl.load(Beta + row * H + head).to(gl.float32)))
     base = (slot * H + head) * 16
-    if block == 0:
-        tl.store(KR + (base + pos) * 128 + kk, raw_k)
-        tl.store(GR + (base + pos) * 128 + kk, log_a)
-        tl.store(BR + base + pos, beta)
-    tl.store(VR + (base + pos) * 128 + vv, value)
-    previous = tl.load(PrefixR + (base + pos - 1) * 128 + kk, mask=pos > 0, other=0.0)
+    gl.store(KR + (base + pos) * 128 + k, raw_k)
+    gl.store(VR + (base + pos) * 128 + k, value)
+    gl.store(GR + (base + pos) * 128 + k, log_a)
+    gl.store(BR + base + pos, beta)
+    previous = gl.load(PrefixR + (slot * H + head) * 128 + k, mask=pos > 0, other=0.0)
     prefix = previous + log_a
-    decay = tl.exp(prefix)
-    if block == 0:
-        tl.store(PrefixR + (base + pos) * 128 + kk, prefix)
-        tl.store(DR + (base + pos) * 128 + kk, key * tl.exp(-prefix))
-    t = tl.arange(0, 16)
-    past_d = tl.load(
-        DR + (base + t[:, None]) * 128 + kk[None, :],
-        mask=t[:, None] < pos,
-        other=0.0,
+    decay = gl.exp(prefix)
+    gl.store(PrefixR + (slot * H + head) * 128 + k, prefix)
+    gl.store(DR + (base + pos) * 128 + k, key * gl.exp(-prefix))
+    past_d = gl.load(
+        DR + (base + t[:, None]) * 128 + k[None, :], mask=t[:, None] < pos, other=0.0
     )
     ell = past_d * decay[None, :]
-    kk_inner = tl.sum(ell * key[None, :], axis=1)
-    kq_inner = tl.sum(ell * query[None, :], axis=1)
-    factors = tl.load(
-        FR + (base + t[:, None]) * 128 + kk[None, :],
+    kk_inner = gl.sum(ell * key[None, :], axis=1)
+    kq_inner = gl.sum(ell * query[None, :], axis=1)
+    delta = gl.load(
+        DeltaR + (base + t[:, None]) * 128 + k[None, :],
         mask=t[:, None] < pos,
         other=0.0,
     )
-    current_factor = beta * (decay * key - tl.sum(factors * kk_inner[:, None], axis=0))
-    current_kq = tl.sum(key * query)
-    effective = (
-        decay * query
-        - tl.sum(factors * kq_inner[:, None], axis=0)
-        - current_factor * current_kq
-    )
-    if block == 0:
-        tl.store(FR + (base + pos) * 128 + kk, current_factor)
-    writes = tl.load(
-        UR + (base + t[:, None]) * 128 + vv[None, :],
-        mask=t[:, None] < pos,
-        other=0.0,
-    )
-    current_write = beta * (value - tl.sum(writes * kk_inner[:, None], axis=0))
-    replay_out = tl.sum(writes * kq_inner[:, None], axis=0) + current_write * current_kq
-    tl.store(UR + (base + pos) * 128 + vv, current_write)
-    if pos == 15:
-        return
-    tl.store(Effective + (row * H + head) * 128 + kk, effective)
-    tl.store(ReplayOut + (row * H + head) * 128 + vv, replay_out)
+    rhs = beta * (value - gl.sum(delta * kk_inner[:, None], axis=0))
+    ring_out = gl.sum(delta * kq_inner[:, None], axis=0)
+    gl.store(QueryScaled + offset + k, decay * query)
+    gl.store(KeyScaled + offset + k, decay * key)
+    gl.store(Rhs + offset + k, rhs)
+    gl.store(ReplayOut + offset + k, ring_out)
+    gl.store(Scalars + (row * H + head) * 2, beta)
+    gl.store(Scalars + (row * H + head) * 2 + 1, gl.sum(key * query))
 
 
-@triton.jit
+@gluon.jit
 def replay_read(
     Slots,
     Pos,
     State,
-    FR,
-    UR,
     DeltaR,
-    Effective,
+    QueryScaled,
+    KeyScaled,
+    Rhs,
     ReplayOut,
+    Scalars,
     Out,
-    H: tl.constexpr,
-    BV: tl.constexpr,
+    H: gl.constexpr,
+    BV: gl.constexpr,
 ):
-    row, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    slot = tl.load(Slots + row)
+    block, head, row = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])
+    packed: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    kp = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+    vp = block * BV + gl.arange(0, BV, layout=packed)
+    vv = block * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, layout))
+    slot = gl.load(Slots + row)
+    offset = (row * H + head) * 128
     if slot < 0:
+        gl.store(Out + offset + vp, 0.0)
         return
-    pos = tl.load(Pos + slot)
+    pos = gl.load(Pos + slot)
     if pos == 15:
         return
-    kk = tl.arange(0, 128)
-    vv = block * BV + tl.arange(0, BV)
-    effective = tl.load(Effective + (row * H + head) * 128 + kk)
-    replay_out = tl.load(ReplayOut + (row * H + head) * 128 + vv)
-    state = tl.load(State + (slot * H + head) * 16384 + vv[:, None] * 128 + kk[None, :])
+    q = gl.load(QueryScaled + offset + kp)
+    k = gl.load(KeyScaled + offset + kp)
+    rhs = gl.load(Rhs + offset + vp)
+    replay_out = gl.load(ReplayOut + offset + vp)
+    beta = gl.load(Scalars + (row * H + head) * 2)
+    kq = gl.load(Scalars + (row * H + head) * 2 + 1)
+    state = gl.load(State + (slot * H + head) * 16384 + vv[:, None] * 128 + kp[None, :])
+    projection_k = gl.convert_layout(gl.sum(state * k[None, :], axis=1), packed)
+    projection_q = gl.convert_layout(gl.sum(state * q[None, :], axis=1), packed)
+    delta = rhs - beta * projection_k
     base = (slot * H + head) * 16 + pos
-    factor = tl.load(FR + base * 128 + kk)
-    write = tl.load(UR + base * 128 + vv)
-    delta = write - tl.sum(state * factor[None, :], axis=1)
-    tl.store(DeltaR + base * 128 + vv, delta)
-    output = tl.sum(state * effective[None, :], axis=1) + replay_out
-    tl.store(Out + (row * H + head) * 128 + vv, output)
+    gl.store(DeltaR + base * 128 + vp, delta)
+    gl.store(Out + offset + vp, projection_q + replay_out + delta * kq)
 
 
 @triton.jit
@@ -143,8 +138,9 @@ def replay_flush(
     State,
     PrefixR,
     DR,
-    FR,
-    UR,
+    KeyScaled,
+    Rhs,
+    Scalars,
     DeltaR,
     Out,
     WorkRows,
@@ -165,23 +161,21 @@ def replay_flush(
         v = v_start + tl.arange(0, BV)
         sp = State + (slot * H + head) * 16384 + v[:, None] * 128 + k[None, :]
         state = tl.load(sp)
-        t = tl.arange(0, 16)
         base = (slot * H + head) * 16
-        prefix = tl.load(PrefixR + (base + 15) * 128 + k)
+        prefix = tl.load(PrefixR + (slot * H + head) * 128 + k)
         decay = tl.exp(prefix)
-        last_factor = tl.load(FR + (base + 15) * 128 + k)
-        left = tl.load(DR + (base + t[:, None]) * 128 + k[None, :]) * decay[None, :]
-        last_write = tl.load(UR + (base + 15) * 128 + v)
-        last_delta = last_write - tl.sum(state * last_factor[None, :], axis=1)
-        residual = tl.load(
-            DeltaR + (base + t[None, :]) * 128 + v[:, None],
-            mask=t[None, :] < 15,
-            other=0.0,
-        )
-        residual = tl.where(t[None, :] == 15, last_delta[:, None], residual)
-        state = state * decay[None, :] + tl.dot(
-            residual, left, input_precision="tf32x3"
-        )
+        last_key = tl.load(KeyScaled + (row * H + head) * 128 + k)
+        last_rhs = tl.load(Rhs + (row * H + head) * 128 + v)
+        beta = tl.load(Scalars + (row * H + head) * 2)
+        last_delta = last_rhs - beta * tl.sum(state * last_key[None, :], axis=1)
+        state *= decay[None, :]
+        for i in tl.static_range(16):
+            left = tl.load(DR + (base + i) * 128 + k) * decay
+            if i == 15:  # noqa: SIM108 -- static branch avoids slot-15 loads
+                delta = last_delta
+            else:
+                delta = tl.load(DeltaR + (base + i) * 128 + v)
+            state += delta[:, None] * left[None, :]
         tl.store(sp, state)
         query = tl.load(Q + (row.to(tl.int64) * H + head) * 128 + k).to(tl.float32)
         query *= tl.rsqrt(tl.sum(query * query) + 1.0e-6) * 128**-0.5

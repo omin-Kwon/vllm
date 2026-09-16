@@ -3,7 +3,8 @@
 """Ordered W16 CUDA-graph latency, native vs parallel Replay vs optional old Replay.
 
 One synthetic KDA layer, H64/K128/V128, FP32 state and raw BF16 inputs.
-Includes ownership and state handoff kernels in replay modes. These are kernel
+Includes ownership and state handoff kernels in replay modes. The optional old
+core also uses the current lifecycle implementation. These are kernel
 measurements, not model throughput. No artificial cursor resets are timed.
 """
 
