@@ -62,7 +62,7 @@ class SketchCache(ReplayCache):
         ):
             raise ValueError("One integer rank in [0, 128] is required per head")
         cpu = torch.where(cpu == 128, 0, cpu).long()
-        super().__init__(len(frame), capacity, frame.device)
+        super().__init__(len(frame), capacity, frame.device, replay_factors=False)
         self.frame = frame.float().contiguous()
         self.ranks = cpu.to(device=frame.device, dtype=torch.int32)
         self.rank = max(8, (int(cpu.max()) + 7) // 8 * 8)

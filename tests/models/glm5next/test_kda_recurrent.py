@@ -149,6 +149,45 @@ def test_window_replay_survives_reorder_eviction_release_and_prefill(graph):
     torch.testing.assert_close(state, expected_state, rtol=3e-5, atol=2e-6)
 
 
+@torch.inference_mode()
+def test_window_wy_replay_varied_inputs_and_channel_decay():
+    """Parallel factors must retain erase cross terms and bounded KDA decay."""
+    from vllm.model_executor.layers.mamba.ops.glm_window.cache import ReplayCache
+
+    torch.manual_seed(491)
+    h = 3
+    state = torch.randn(2, h, 128, 128, device="cuda") * 0.1
+    reference = state[1].double()
+    cache = ReplayCache(h, 1, state.device)
+    ids = torch.ones(1, device="cuda", dtype=torch.int32)
+    a = torch.zeros(h, device="cuda")
+    bias = torch.zeros(h, 128, device="cuda")
+    gate_center = torch.linspace(-9, 9, 128, device="cuda")
+    for step in range(64):
+        q, k, v, gate = [
+            torch.randn(1, h, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(4)
+        ]
+        gate.add_(gate_center)
+        beta = torch.randn(1, h, device="cuda", dtype=torch.bfloat16)
+        out = cache.step(state, ids, q, k, v, gate, beta, a, bias)
+        qd, kd, vd = q[0].double(), k[0].double(), v[0].double()
+        qd = qd / (qd.square().sum(-1, keepdim=True) + 1e-6).sqrt() * 128**-0.5
+        kd = kd / (kd.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+        decay = (-5 * gate[0].double().sigmoid()).exp()
+        reference *= decay[:, None, :]
+        delta = beta[0].double().sigmoid()[:, None] * (
+            vd - torch.einsum("hvk,hk->hv", reference, kd)
+        )
+        reference += delta[:, :, None] * kd[:, None, :]
+        expected = torch.einsum("hvk,hk->hv", reference, qd)
+        torch.testing.assert_close(out[0].double(), expected, atol=1e-4, rtol=0.008)
+        if step % 16 == 15:
+            torch.testing.assert_close(
+                state[1].double(), reference, atol=3e-6, rtol=5e-5
+            )
+
+
 @pytest.mark.parametrize("mode", ["replay", "p4", "p6"])
 @torch.inference_mode()
 def test_mixed_window_decode_never_enters_flashkda_prefill(mode):

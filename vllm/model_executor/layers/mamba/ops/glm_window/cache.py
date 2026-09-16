@@ -17,7 +17,7 @@ from .controls import (
     _prefill_resolve,
     _resolve_work,
 )
-from .replay import replay_step
+from .replay import replay_flush, replay_read, replay_step
 
 
 class ReplayCache:
@@ -27,7 +27,14 @@ class ReplayCache:
     The runner must invalidate finished/preempted owners before page reuse.
     """
 
-    def __init__(self, heads: int, capacity: int, device: torch.device):
+    def __init__(
+        self,
+        heads: int,
+        capacity: int,
+        device: torch.device,
+        *,
+        replay_factors: bool = True,
+    ):
         if heads < 1 or capacity < 1:
             raise ValueError("Positive head count and slot capacity required")
         self.heads, self.capacity = heads, capacity
@@ -43,6 +50,14 @@ class ReplayCache:
             beta=torch.zeros(capacity, heads, 16, **fp),
             latch_heads=torch.ones(heads, device=device, dtype=torch.bool),
         )
+        if replay_factors:
+            self.pool.prefix = torch.zeros(ring, **fp)
+            self.pool.direct_decay = torch.zeros(ring, **fp)
+            self.pool.f = torch.zeros(ring, **fp)
+            self.pool.u = torch.zeros(ring, **fp)
+            self.pool.delta = torch.zeros(ring, **fp)
+            self.effective = torch.empty(capacity, heads, 128, **fp)
+            self.replay_out = torch.empty_like(self.effective)
         self.ranks = torch.ones(heads, **ip)
         self.owners = torch.full((capacity,), -1, **ip)
         self.slots = torch.empty(capacity, **ip)
@@ -53,6 +68,10 @@ class ReplayCache:
         self.work_rows = torch.empty(2 * capacity, **ip)
         self.work_counts = torch.zeros(2, **ip)
         self.mixed_decode_tokens = 0
+        self.flush_programs = min(
+            4 * torch.cuda.get_device_properties(device).multi_processor_count,
+            capacity * heads,
+        )
 
     def reset(self):
         """Discard capture/warmup ownership without writing physical pages."""
@@ -120,7 +139,7 @@ class ReplayCache:
     def _decode(self, slots, q, k, v, gate, beta, a_log, bias):
         p = self.pool
         out = torch.zeros_like(v)
-        replay_step[(q.shape[0], self.heads, 4)](
+        replay_step[(q.shape[0], self.heads, 1)](
             q,
             k,
             v,
@@ -135,10 +154,48 @@ class ReplayCache:
             p.v,
             p.log_a,
             p.beta,
+            p.prefix,
+            p.direct_decay,
+            p.f,
+            p.u,
+            self.effective,
+            self.replay_out,
+            out,
+            self.heads,
+            128,
+            num_warps=4,
+        )
+        replay_read[(q.shape[0], self.heads, 4)](
+            slots,
+            p.pos,
+            p.state,
+            p.f,
+            p.u,
+            p.delta,
+            self.effective,
+            self.replay_out,
             out,
             self.heads,
             32,
             num_warps=4,
+        )
+        replay_flush[(self.flush_programs,)](
+            q,
+            slots,
+            p.state,
+            p.prefix,
+            p.direct_decay,
+            p.f,
+            p.u,
+            p.delta,
+            out,
+            self.work_rows,
+            self.work_counts,
+            self.capacity,
+            self.heads,
+            64,
+            num_warps=8,
+            num_stages=1,
         )
         return out
 
