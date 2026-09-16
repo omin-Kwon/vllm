@@ -1060,9 +1060,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        additional = self.vllm_config.additional_config
+        if isinstance(additional, dict) and additional.get("kda_window"):
+            context = self.vllm_config.compilation_config.static_forward_context
+            for layer in context.values():
+                cache = getattr(layer, "_window_cache", None)
+                if cache is not None:
+                    cache.reset()
         return cuda_graph_size
 
+    def _release_window_blocks(self, req_id: str, *, materialize=False) -> None:
+        additional = self.vllm_config.additional_config
+        if not isinstance(additional, dict) or not additional.get("kda_window"):
+            return
+        req_idx = self.req_states.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return
+        context = self.vllm_config.compilation_config.static_forward_context
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            caches = [
+                (context[name], getattr(context[name], "_window_cache", None))
+                for name in group.layer_names
+                if name in context
+            ]
+            caches = [(layer, cache) for layer, cache in caches if cache is not None]
+            if not caches:
+                continue
+            count = int(self.block_tables.num_blocks.np[group_id, req_idx])
+            ids = self.block_tables.block_tables[group_id].gpu[req_idx, :count]
+            for layer, cache in caches:
+                assert cache is not None
+                if materialize:
+                    cache.before_prefill(
+                        layer.kv_cache[1], ids, torch.ones_like(ids, dtype=torch.bool)
+                    )
+                else:
+                    cache.release_finished(ids)
+
     def _remove_request(self, req_id: str) -> bool:
+        self._release_window_blocks(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1113,6 +1149,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+
+            if new_req_data.num_computed_tokens > 0:
+                # A continuing streaming prompt retains its physical SSM state.
+                # Materialize its pending window before removing request metadata.
+                self._release_window_blocks(req_id, materialize=True)
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below

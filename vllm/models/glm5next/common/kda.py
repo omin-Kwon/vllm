@@ -327,6 +327,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
+        self._window_cache = None
+        if isinstance(additional_config, dict) and "kda_window" in additional_config:
+            from vllm.model_executor.layers.mamba.ops.glm_window.config import (
+                create_cache,
+            )
+
+            if self.kda_prefill_backend != "flashkda":
+                raise ValueError(
+                    "GLM window runtime requires the FlashKDA prefill backend"
+                )
+            self._window_cache = create_cache(
+                vllm_config,
+                self.layer_idx,
+                self.local_num_heads,
+                self.head_dim,
+                self.kda_lower_bound,
+            )
+
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
         ) = None
@@ -597,6 +615,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         def _rearr(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
+
+        if self._window_cache is not None:
+            from vllm.model_executor.layers.mamba.ops.glm_window.routing import (
+                window_attention,
+            )
+
+            if use_spec:
+                raise RuntimeError("GLM window cache cannot run speculative batches")
+            window_attention(
+                self._window_cache,
+                recurrent_state,
+                attn_metadata_narrowed,
+                _rearr(q_ns),
+                _rearr(k_ns),
+                _rearr(v_ns),
+                g1_ns,
+                beta_ns,
+                self.A_log,
+                self.dt_bias,
+                core_attn_out,
+                self._flashkda_prefill,
+            )
+            return
 
         # --- core attention: spec (draft-verify) path ---
         core_attn_out_spec = None

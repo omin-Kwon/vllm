@@ -1,0 +1,126 @@
+{
+  "base_commit": "ec4a3a537068db40afbc9374a67da719c8c9b964",
+  "gpu": "NVIDIA B300",
+  "window": 16,
+  "model": "GLM-5.3-Flash-NVFP4",
+  "model_gates": {
+    "dense": {
+      "status": "PASS",
+      "requests": 4,
+      "generated_tokens": 384,
+      "kda_layers": 34,
+      "packed_uint8_bytes": 152202903552,
+      "engine_steps": 125,
+      "decoded_tokens_per_layer": null,
+      "mixed_decode_tokens_per_layer": null,
+      "pivot_count": null
+    },
+    "replay": {
+      "status": "PASS",
+      "requests": 4,
+      "generated_tokens": 384,
+      "kda_layers": 34,
+      "packed_uint8_bytes": 152202903552,
+      "engine_steps": 123,
+      "decoded_tokens_per_layer": 380,
+      "mixed_decode_tokens_per_layer": 1,
+      "pivot_count": null
+    },
+    "sketch": {
+      "status": "PASS",
+      "requests": 4,
+      "generated_tokens": 384,
+      "kda_layers": 34,
+      "packed_uint8_bytes": 152202903552,
+      "engine_steps": 120,
+      "decoded_tokens_per_layer": 380,
+      "mixed_decode_tokens_per_layer": 1,
+      "pivot_count": 4
+    }
+  },
+  "greedy_comparison": {
+    "replay": [
+      {
+        "request": "0",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 16,
+        "length": 96
+      },
+      {
+        "request": "1",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 34,
+        "length": 96
+      },
+      {
+        "request": "2",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 75,
+        "length": 96
+      },
+      {
+        "request": "3",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 44,
+        "length": 96
+      }
+    ],
+    "sketch": [
+      {
+        "request": "0",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 2,
+        "length": 96
+      },
+      {
+        "request": "1",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 34,
+        "length": 96
+      },
+      {
+        "request": "2",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 27,
+        "length": 96
+      },
+      {
+        "request": "3",
+        "identical_token_sequence": false,
+        "common_prefix_tokens": 5,
+        "length": 96
+      }
+    ]
+  },
+  "benchmark_accuracy_remeasured": false,
+  "runtime_sha256": {
+    "vllm/model_executor/layers/mamba/ops/glm_window/step_direct_decay.py": "a2a60e72b15d866bd3d92278974df3998085526fe081641389305ec8410c61d6",
+    "vllm/model_executor/layers/mamba/ops/glm_window/replay.py": "8a27e3642345a1a6b9c64a424c7de46d5f0fc0f92af9263ef55923cf037438ca",
+    "vllm/model_executor/layers/mamba/ops/glm_window/metadata_high_p4_wy.py": "e9b1559cafe21bb7235b145440c15b17e3d5ad41691a858299dc4242412c9bce",
+    "vllm/model_executor/layers/mamba/ops/glm_window/metadata_smallrank.py": "8c2183df177bcdfcc7b4d4e61e088846cc658fdf765724ed2af6cbf930c15599",
+    "vllm/model_executor/layers/mamba/ops/glm_window/cache.py": "5015103cec60d1fd8515b99d26205b806d1053e7e1c043c55b5d4eb3dd5b116a",
+    "vllm/model_executor/layers/mamba/ops/glm_window/metadata_rank1.py": "c134fe5441ea15f01d317a4ca330c0120bc542d8209b9d74eeac36ce85cfcf67",
+    "vllm/model_executor/layers/mamba/ops/glm_window/wy_update.py": "4431fb88e2fd859b2a53ee718b1d9d936d5afaefff79d7d9dba64e70dda6a19f",
+    "vllm/model_executor/layers/mamba/ops/glm_window/metadata_high_p6_wy.py": "1a96793d321cf6c613389e3471aefffc9af5ef0a894a845b97e6321492a66b1e",
+    "vllm/model_executor/layers/mamba/ops/glm_window/controls.py": "82047888b902f769dc0cf5102f9df603dd5b031f3b2e8c1ea661d17bbc1f918d",
+    "vllm/model_executor/layers/mamba/ops/glm_window/config.py": "ccf119b0305724e2656a2f058b2771500573098f5242b7c6123a0dec50d35a32",
+    "vllm/model_executor/layers/mamba/ops/glm_window/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm/model_executor/layers/mamba/ops/glm_window/sketch.py": "3fbd654f424b91196beb0333dac5d3409d15a8fb4cc94a4999975fa1ee7a7fff",
+    "vllm/model_executor/layers/mamba/ops/glm_window/routing.py": "47906ac9f8715f5140e69723f52eb621f2de8d28686f022d9cc40a448911e082"
+  },
+  "actual_layer_replay_native_probe": {
+    "max_output_absolute_error": 6.103515625e-05,
+    "max_output_relative_l2_error": 0.0006823736475780606,
+    "max_flush_state_relative_l2_error": 1.693944398084568e-07,
+    "layers": 34,
+    "decoded_tokens_per_layer": 380,
+    "mode": "eager",
+    "same_layer_inputs": true,
+    "outputs_replaced": false
+  },
+  "unit_tests": {
+    "kda_suite": 18,
+    "runner_suite": 10,
+    "status": "PASS"
+  }
+}
