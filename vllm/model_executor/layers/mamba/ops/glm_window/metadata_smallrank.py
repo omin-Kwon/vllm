@@ -69,18 +69,18 @@ def small_metadata(
                 )
         mu = tl.sum(tl.sum(raw * raw, axis=0), axis=0) / 128.0
         ridge = 0.1 * tl.where(mu > 0, mu, 1.0)
-        omega0 = tl.load(frame + h.to(tl.int64) * 16384 + k * 128 + 0, m > 0, 0.0)
+        omega0 = tl.load(frame + h.to(tl.int64) * 16384 + k + 0 * 128, m > 0, 0.0)
         u0 = tl.sum(raw * omega0[None, :], axis=1)
-        tl.store(u + (slot * H + h) * 128 * G + v * G + 0, u0, m > 0)
-        omega1 = tl.load(frame + h.to(tl.int64) * 16384 + k * 128 + 1, m > 1, 0.0)
+        tl.store(u + (slot * H + h) * 128 * G + v + 0 * 128, u0, m > 0)
+        omega1 = tl.load(frame + h.to(tl.int64) * 16384 + k + 1 * 128, m > 1, 0.0)
         u1 = tl.sum(raw * omega1[None, :], axis=1)
-        tl.store(u + (slot * H + h) * 128 * G + v * G + 1, u1, m > 1)
-        omega2 = tl.load(frame + h.to(tl.int64) * 16384 + k * 128 + 2, m > 2, 0.0)
+        tl.store(u + (slot * H + h) * 128 * G + v + 1 * 128, u1, m > 1)
+        omega2 = tl.load(frame + h.to(tl.int64) * 16384 + k + 2 * 128, m > 2, 0.0)
         u2 = tl.sum(raw * omega2[None, :], axis=1)
-        tl.store(u + (slot * H + h) * 128 * G + v * G + 2, u2, m > 2)
-        omega3 = tl.load(frame + h.to(tl.int64) * 16384 + k * 128 + 3, m > 3, 0.0)
+        tl.store(u + (slot * H + h) * 128 * G + v + 2 * 128, u2, m > 2)
+        omega3 = tl.load(frame + h.to(tl.int64) * 16384 + k + 3 * 128, m > 3, 0.0)
         u3 = tl.sum(raw * omega3[None, :], axis=1)
-        tl.store(u + (slot * H + h) * 128 * G + v * G + 3, u3, m > 3)
+        tl.store(u + (slot * H + h) * 128 * G + v + 3 * 128, u3, m > 3)
         gram0_0 = tl.sum(u0 * u0) + ridge
         gram1_0 = tl.sum(u1 * u0)
         gram1_1 = tl.sum(u1 * u1) + ridge
@@ -113,7 +113,7 @@ def small_metadata(
         x2 = (y2 - l3_2 * x3) / l2_2
         x1 = (y1 - l2_1 * x2 - l3_1 * x3) / l1_1
         x0 = (y0 - l1_0 * x1 - l2_0 * x2 - l3_0 * x3) / l0_0
-        tl.store(phi + (slot * H + h) * 128 * G + k * G + 0, x0, m > 0)
-        tl.store(phi + (slot * H + h) * 128 * G + k * G + 1, x1, m > 1)
-        tl.store(phi + (slot * H + h) * 128 * G + k * G + 2, x2, m > 2)
-        tl.store(phi + (slot * H + h) * 128 * G + k * G + 3, x3, m > 3)
+        tl.store(phi + (slot * H + h) * 128 * G + k + 0 * 128, x0, m > 0)
+        tl.store(phi + (slot * H + h) * 128 * G + k + 1 * 128, x1, m > 1)
+        tl.store(phi + (slot * H + h) * 128 * G + k + 2 * 128, x2, m > 2)
+        tl.store(phi + (slot * H + h) * 128 * G + k + 3 * 128, x3, m > 3)

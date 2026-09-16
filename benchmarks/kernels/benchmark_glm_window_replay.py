@@ -9,7 +9,9 @@ measurements, not model throughput. No artificial cursor resets are timed.
 """
 
 import argparse
+import hashlib
 import importlib.util
+import inspect
 import json
 import statistics
 from pathlib import Path
@@ -170,12 +172,23 @@ def main():
             rows.append(row)
             print(json.dumps(row), flush=True)
             torch.accelerator.empty_cache()
+    source_dir = Path(inspect.getfile(ReplayCache)).parent
+    sources = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(source_dir.glob("*.py"))
+    }
     args.out.write_text(
         json.dumps(
             dict(
                 scope="synthetic_one_layer_including_lifecycle",
                 checkpoint=str(args.checkpoint) if args.checkpoint else None,
                 checkpoint_meta=pack["meta"] if pack else None,
+                checkpoint_sha256=(
+                    hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()
+                    if args.checkpoint
+                    else None
+                ),
+                source_sha256=sources,
                 results=rows,
             ),
             indent=2,

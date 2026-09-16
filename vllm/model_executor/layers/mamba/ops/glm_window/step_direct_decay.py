@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Candidate: mask U/Phi/f memory operations by the actual head rank."""
+"""Rank-bucketed exact-Z read with contiguous U/Phi columns and parallel WY."""
 
 from vllm.triton_utils import tl, triton
 
@@ -43,9 +43,12 @@ def _step_direct_decay(
     Ranks=None,
     ALL_SKETCH: tl.constexpr = False,
     EXACT_FLUSH_OUTPUT: tl.constexpr = False,
+    Heads=None,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
+    if Heads is not None:
+        head = tl.load(Heads + head)
     slot = tl.load(Slots + row)
     if slot >= 0:
         pos = tl.load(Pos + slot)
@@ -108,7 +111,7 @@ def _step_direct_decay(
             kk = tl.sum(ell * k[None, :], axis=1)
             kq = tl.sum(ell * q[None, :], axis=1)
             phi = tl.load(
-                Phi + (slot * H + head) * K * G + kh[:, None] * G + gg[None, :],
+                Phi + (slot * H + head) * K * G + kh[:, None] + gg[None, :] * K,
                 mask=gg[None, :] < head_rank,
                 other=0.0,
             )
@@ -135,7 +138,7 @@ def _step_direct_decay(
             )
             u = beta * (v - tl.sum(us * kk[:, None], axis=0))
             latch = tl.load(
-                U + (slot * H + head) * V * G + vv[:, None] * G + gg[None, :],
+                U + (slot * H + head) * V * G + vv[:, None] + gg[None, :] * V,
                 mask=gg[None, :] < head_rank,
                 other=0.0,
             )

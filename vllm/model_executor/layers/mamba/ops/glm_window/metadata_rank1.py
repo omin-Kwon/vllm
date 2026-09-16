@@ -72,12 +72,12 @@ def rank1_metadata(
                         Out + (row.to(tl.int64) * H + h) * 128 + v,
                         tl.sum(raw * query[None, :], axis=1),
                     )
-            omega = tl.load(frame + h.to(tl.int64) * 16384 + k * 128)
+            omega = tl.load(frame + h.to(tl.int64) * 16384 + k)
             uu = tl.sum(raw * omega[None, :], axis=1)
             energy = tl.sum(uu * uu)
             mu = tl.sum(tl.sum(raw * raw, axis=0), axis=0) / 128.0
             denominator = energy + 0.1 * mu
             numerator = tl.sum(raw * uu[:, None], axis=0)
             result = numerator / tl.where(denominator > 0, denominator, 1.0)
-            tl.store(u + (slot * H + h) * 128 * G + v * G, uu)
-            tl.store(phi + (slot * H + h) * 128 * G + k * G, result)
+            tl.store(u + (slot * H + h) * 128 * G + v, uu)
+            tl.store(phi + (slot * H + h) * 128 * G + k, result)

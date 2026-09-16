@@ -9,9 +9,8 @@ import torch
 from vllm.triton_utils import triton
 
 from .controls import (
-    _acquire,
     _acquire_work,
-    _advance,
+    _advance_work,
     _bump,
     _flush,
     _prefill_handoff,
@@ -275,20 +274,17 @@ class ReplayCache:
             self.heads,
             *state.stride(),
         )
-        if self.replay_factors:
-            _acquire_work[(self.flush_programs,)](
-                *acquire_args,
-                self.work_rows,
-                self.work_counts,
-                self.capacity,
-                DIRECT_STATE=True,
-                num_warps=4,
-            )
-        else:
-            _acquire[(batch, self.heads)](*acquire_args, num_warps=4)
+        _acquire_work[(self.flush_programs,)](
+            *acquire_args,
+            self.work_rows,
+            self.work_counts,
+            self.capacity,
+            DIRECT_STATE=self.replay_factors,
+            num_warps=4,
+        )
         out = self._decode(state, indices, slots, q, k, v, gate, beta, a_log, bias)
         if not self.replay_factors:
-            _advance[(batch, self.heads)](
+            _advance_work[(self.flush_programs,)](
                 indices,
                 slots,
                 p.pos,
@@ -297,8 +293,11 @@ class ReplayCache:
                 self.heads,
                 self.heads * 16384,
                 16,
-                16384,
+                4096,
                 *state.stride(),
+                self.work_rows,
+                self.work_counts,
+                self.capacity,
                 num_warps=4,
             )
         _bump[(1,)](slots, p.pos, batch, 16, triton.next_power_of_2(batch))

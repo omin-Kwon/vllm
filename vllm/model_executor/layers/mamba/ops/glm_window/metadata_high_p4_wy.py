@@ -67,13 +67,13 @@ def build_persistent(
                         tl.sum(raw * query[None, :], axis=1),
                     )
             omega = tl.load(
-                frame + h.to(tl.int64) * 16384 + k[:, None] * 128 + g[None, :],
+                frame + h.to(tl.int64) * 16384 + k[:, None] + g[None, :] * 128,
                 g[None, :] < m,
                 0.0,
             )
             s = tl.dot(raw, omega, input_precision="tf32x3")
             tl.store(
-                u + (slot * H + h) * 128 * G + v[:, None] * G + g[None, :],
+                u + (slot * H + h) * 128 * G + v[:, None] + g[None, :] * 128,
                 s,
                 g[None, :] < G,
             )
@@ -169,7 +169,7 @@ def build_persistent(
             result += native2[:, None] * g2[None, :]
             result += native3[:, None] * g3[None, :]
             tl.store(
-                phi + (slot * H + h) * 128 * G + k[:, None] * G + g[None, :],
+                phi + (slot * H + h) * 128 * G + k[:, None] + g[None, :] * 128,
                 result,
                 g[None, :] < G,
             )

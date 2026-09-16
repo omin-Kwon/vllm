@@ -6,8 +6,6 @@ from functools import lru_cache
 
 import torch
 
-from vllm.triton_utils import triton
-
 from .cache import ReplayCache
 from .metadata_high_p4_wy import build_persistent as build4
 from .metadata_high_p6_wy import build_persistent as build6
@@ -63,7 +61,8 @@ class SketchCache(ReplayCache):
             raise ValueError("One integer rank in [0, 128] is required per head")
         cpu = torch.where(cpu == 128, 0, cpu).long()
         super().__init__(len(frame), capacity, frame.device, replay_factors=False)
-        self.frame = frame.float().contiguous()
+        # Preserve logical [K, G] indexing with contiguous basis columns.
+        self.frame = frame.float().transpose(-1, -2).contiguous().transpose(-1, -2)
         self.ranks = cpu.to(device=frame.device, dtype=torch.int32)
         self.rank = max(8, (int(cpu.max()) + 7) // 8 * 8)
         self.pivots = pivots
@@ -71,19 +70,36 @@ class SketchCache(ReplayCache):
         p = self.pool
         p.latch_heads = self.ranks > 0
         fp = dict(device=frame.device, dtype=torch.float32)
-        p.latch = torch.zeros(capacity, self.heads, 128, self.rank, **fp)
+        # Logical [slot, head, K/V, G], stored as contiguous K/V vectors.
+        p.latch = torch.zeros(capacity, self.heads, self.rank, 128, **fp).transpose(
+            -1, -2
+        )
         p.phi = torch.zeros_like(p.latch)
         p.prefix = torch.zeros_like(p.log_a)
         p.direct_decay = torch.zeros_like(p.log_a)
         p.u = torch.zeros_like(p.log_a)
         p.f = torch.zeros(capacity, self.heads, 16, self.rank, **fp)
         sm = torch.cuda.get_device_properties(frame.device).multi_processor_count
+        self.step_groups = []
+        dense_heads = torch.where(cpu == 0)[0].to(
+            device=frame.device, dtype=torch.int32
+        )
+        if dense_heads.numel():
+            self.step_groups.append((dense_heads, 4, 4, False))
+        for lo, hi in ((0, 4), (4, 8), (8, 16), (16, 32), (32, 64), (64, 128)):
+            mask = (cpu > lo) & (cpu <= hi)
+            heads = torch.where(mask)[0].to(device=frame.device, dtype=torch.int32)
+            if heads.numel():
+                self.step_groups.append((heads, hi, 1 if hi <= 16 else 4, True))
         self.metadata_groups = []
-        for mask, builder, warps, programs in (
-            (cpu == 1, rank1_metadata, 4, 2 * sm),
-            ((cpu > 1) & (cpu <= 4), small_metadata, 4, 2 * sm),
-            (cpu > 4, build4 if pivots == 4 else build6, 8, sm),
-        ):
+        metadata_specs = [
+            (cpu == 1, rank1_metadata, 4, 2 * sm, 16),
+            ((cpu > 1) & (cpu <= 4), small_metadata, 4, 2 * sm, 16),
+        ]
+        builder = build4 if pivots == 4 else build6
+        for lo, hi in ((4, 16), (16, 32), (32, 64), (64, 128)):
+            metadata_specs.append(((cpu > lo) & (cpu <= hi), builder, 8, sm, hi))
+        for mask, builder, warps, programs, width in metadata_specs:
             heads = torch.where(mask)[0].to(device=frame.device, dtype=torch.int32)
             if heads.numel():
                 self.metadata_groups.append(
@@ -92,12 +108,13 @@ class SketchCache(ReplayCache):
                         builder,
                         warps,
                         min(programs, capacity * heads.numel()),
+                        width,
                     )
                 )
 
     def _metadata(self, slots, flush, q=None, out=None):
         p = self.pool
-        for heads, builder, warps, programs in self.metadata_groups:
+        for heads, builder, warps, programs, width in self.metadata_groups:
             builder[(programs,)](
                 p.state,
                 slots,
@@ -118,7 +135,7 @@ class SketchCache(ReplayCache):
                 self.capacity,
                 self.heads,
                 self.rank,
-                max(16, triton.next_power_of_2(self.rank)),
+                width,
                 flush,
                 Q=q,
                 Out=out,
@@ -131,45 +148,47 @@ class SketchCache(ReplayCache):
         self._metadata(slots, False)
         p = self.pool
         out = torch.zeros_like(v)
-        _step_direct_decay[(q.shape[0], self.heads)](
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            a_log,
-            bias,
-            slots,
-            p.pos,
-            p.state,
-            p.latch,
-            p.phi,
-            p.latch_heads,
-            p.k,
-            p.v,
-            p.log_a,
-            p.beta,
-            p.prefix,
-            p.f,
-            p.u,
-            p.direct_decay,
-            out,
-            self.heads,
-            128,
-            128,
-            self.rank,
-            triton.next_power_of_2(self.rank),
-            16,
-            True,
-            -5.0,
-            128**-0.5,
-            True,
-            RAW_K_RING=True,
-            Ranks=self.ranks,
-            ALL_SKETCH=self.all_sketch,
-            EXACT_FLUSH_OUTPUT=True,
-            num_warps=4,
-            num_stages=1,
-        )
+        for heads, width, warps, all_sketch in self.step_groups:
+            _step_direct_decay[(q.shape[0], heads.numel())](
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                a_log,
+                bias,
+                slots,
+                p.pos,
+                p.state,
+                p.latch,
+                p.phi,
+                p.latch_heads,
+                p.k,
+                p.v,
+                p.log_a,
+                p.beta,
+                p.prefix,
+                p.f,
+                p.u,
+                p.direct_decay,
+                out,
+                self.heads,
+                128,
+                128,
+                self.rank,
+                width,
+                16,
+                True,
+                -5.0,
+                128**-0.5,
+                True,
+                RAW_K_RING=True,
+                Ranks=self.ranks,
+                ALL_SKETCH=all_sketch,
+                EXACT_FLUSH_OUTPUT=True,
+                Heads=heads,
+                num_warps=warps,
+                num_stages=1,
+            )
         self._metadata(slots, True, q, out)
         return out
