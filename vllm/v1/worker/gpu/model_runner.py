@@ -974,6 +974,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+    def _release_finished_latch_blocks(self, req_id: str) -> None:
+        req_idx = self.req_states.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return
+        # Hybrid blocks can be reassigned to attention KV storage. A lazy
+        # recurrent cache must not later flush to a finished owner's block.
+        if not hasattr(self, "_latch_release_groups"):
+            self._latch_release_groups = []
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                releases = []
+                for layer_name in group.layer_names:
+                    layer = self.vllm_config.compilation_config.static_forward_context[
+                        layer_name
+                    ]
+                    cache = getattr(layer, "_latch_cache", None)
+                    release = getattr(cache, "release_finished", None)
+                    if release is not None:
+                        releases.append(release)
+                if releases:
+                    self._latch_release_groups.append((group_id, releases))
+        for group_id, releases in self._latch_release_groups:
+            count = int(self.block_tables.num_blocks.np[group_id, req_idx])
+            physical_ids = self.block_tables.block_tables[group_id].gpu[req_idx, :count]
+            for release in releases:
+                release(physical_ids)
+
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
@@ -1004,6 +1030,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
         for req_id in sorted(finished_req_ids):
+            self._release_finished_latch_blocks(req_id)
             self._remove_request(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:

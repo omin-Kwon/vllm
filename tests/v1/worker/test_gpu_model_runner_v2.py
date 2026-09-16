@@ -19,6 +19,42 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+def test_finished_latch_releases_only_its_blocks_before_request_removal():
+    """Freed hybrid pages may already belong to another request's attention KV."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.pooling_runner = None
+    runner.req_states = SimpleNamespace(req_id_to_index={"done": 0, "live": 1})
+    events = []
+    cache = SimpleNamespace(
+        release_finished=lambda ids: events.append(("release", ids.tolist()))
+    )
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=["attention", "kda"])]
+    )
+    runner.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "attention": SimpleNamespace(),
+                "kda": SimpleNamespace(_latch_cache=cache),
+            }
+        )
+    )
+    runner.block_tables = SimpleNamespace(
+        num_blocks=SimpleNamespace(np=torch.tensor([[2, 1]]).numpy()),
+        block_tables=[SimpleNamespace(gpu=torch.tensor([[7, 8, 999], [9, 999, 999]]))],
+    )
+    runner._remove_request = lambda req: events.append(("remove", req))
+    runner.finish_requests(
+        SimpleNamespace(finished_req_ids={"done"}, preempted_req_ids=set())
+    )
+    assert events == [("release", [7, 8]), ("remove", "done")]
+    events.clear()
+    runner.finish_requests(
+        SimpleNamespace(finished_req_ids=set(), preempted_req_ids={"live"})
+    )
+    assert events == [("release", [9]), ("remove", "live")]
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144

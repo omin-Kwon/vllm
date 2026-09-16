@@ -64,6 +64,7 @@ def _step(
     LOWER: tl.constexpr,
     SCALE: tl.constexpr,
     NORMALIZE: tl.constexpr,
+    RAW_K_RING: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -77,6 +78,11 @@ def _step(
         q = tl.load(Q + (row * H + head) * K + kh).to(tl.float32)
         k = tl.load(KIn + (row * H + head) * K + kh).to(tl.float32)
         v = tl.load(VIn + (row * H + head) * V + vv).to(tl.float32)
+        if RAW_K_RING:
+            # Match current-step arithmetic to the stored raw input precision.
+            k = k.to(KR.dtype.element_ty).to(tl.float32)
+            v = v.to(VR.dtype.element_ty).to(tl.float32)
+        raw_k = k
         if NORMALIZE:
             q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
             k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
@@ -94,7 +100,10 @@ def _step(
         base = (slot * H + head) * W
         prev = tl.load(PrefixR + (base + pos - 1) * K + kh, mask=pos > 0, other=0.0)
         prefix = prev + log_a
-        tl.store(KR + (base + pos) * K + kh, k)
+        if RAW_K_RING:
+            tl.store(KR + (base + pos) * K + kh, raw_k)
+        else:
+            tl.store(KR + (base + pos) * K + kh, k)
         tl.store(VR + (base + pos) * V + vv, v)
         tl.store(GR + (base + pos) * K + kh, log_a)
         tl.store(BR + base + pos, beta)
@@ -105,7 +114,9 @@ def _step(
                 KR + (base + tt[:, None]) * K + kh[None, :],
                 mask=tt[:, None] < pos,
                 other=0.0,
-            )
+            ).to(tl.float32)
+            if RAW_K_RING and NORMALIZE:
+                past_k *= tl.rsqrt(tl.sum(past_k * past_k, 1)[:, None] + 1e-6)
             past_prefix = tl.load(
                 PrefixR + (base + tt[:, None]) * K + kh[None, :],
                 mask=tt[:, None] < pos,
@@ -181,6 +192,7 @@ def _flush(
     W: tl.constexpr,
     BV: tl.constexpr,
     PARTIAL: tl.constexpr = False,
+    RAW_K_RING: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -197,8 +209,12 @@ def _flush(
             state = tl.load(sp, mask=vv[:, None] < V, other=0.0)
             base = (slot * H + head) * W
             for t in range(count):
-                k = tl.load(KR + (base + t) * K + kk)
-                v = tl.load(VR + (base + t) * V + vv, mask=vv < V, other=0.0)
+                k = tl.load(KR + (base + t) * K + kk).to(tl.float32)
+                if RAW_K_RING:
+                    k *= tl.rsqrt(tl.sum(k * k) + 1e-6)
+                v = tl.load(
+                    VR + (base + t) * V + vv, mask=vv < V, other=0.0
+                ).to(tl.float32)
                 log_a = tl.load(GR + (base + t) * K + kk)
                 beta = tl.load(BR + base + t)
                 state *= tl.exp(log_a[None, :])
