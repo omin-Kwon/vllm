@@ -7,16 +7,149 @@ The oracle explicitly multiplies KxK transitions and uses augmented lstsq;
 it never uses the kernel's f_s/u_s recurrences or Phi normal-equation solve.
 """
 
+import ast
 import json
 import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 from vllm.third_party.flash_linear_attention.ops.kda import fused_recurrent_kda
 from vllm.third_party.flash_linear_attention.ops.kda_latch import KDALatchState
+
+
+class TestMixedKdaRoutingCPU(unittest.TestCase):
+    """Exercise the production dispatch block with CPU kernel doubles.
+
+    Guard decode ownership/ring continuity and prefill-only state writes. This
+    tests routing, not GPU arithmetic, graph replay, or full engine lifecycle.
+    """
+
+    def test_mixed_decode_keeps_native_or_replay_path(self):
+        source = (
+            Path(__file__).resolve().parents[3] / "vllm/models/glm5next/nvidia/kda.py"
+        )
+        tree = ast.parse(source.read_text())
+        blocks = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(stmt, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "prefill_indices"
+                    for t in stmt.targets
+                )
+                for stmt in node.body
+            )
+        ]
+        self.assertEqual(len(blocks), 1)
+        code = compile(ast.Module(body=blocks[0].body, type_ignores=[]), source, "exec")
+        for mode in ("dense", "exact_replay", "sketch"):
+            for decode_count in (0, 2):
+                for pos in (0, 7, 15):
+                    with self.subTest(mode=mode, decodes=decode_count, position=pos):
+                        self._case(code, mode, decode_count, pos)
+
+    def _case(self, code, mode, nd, position):
+        ids = torch.arange(1, nd + 3)
+        cu = torch.tensor(list(range(nd + 1)) + [nd + 3, nd + 5])
+        q = torch.arange((nd + 5) * 4).reshape(nd + 5, 4).bfloat16()
+        state = torch.zeros(8, 1, 4, 4)
+        initial = torch.tensor([True] * nd + [True, False])
+        prefill_ids = ids[nd:]
+        step_positions = {int(i): position for i in ids}
+        events = []
+        owner = self
+
+        class Cache:
+            def before_prefill(self, st, indices, has_initial):
+                owner.assertEqual(indices.tolist(), prefill_ids.tolist())
+                owner.assertEqual(has_initial.tolist(), [True, False])
+                for i in indices.tolist():
+                    step_positions.pop(i)
+                events.append("handoff")
+
+            def step(self, st, indices, qd, kd, vd, gd, bd, *args):
+                owner.assertEqual(indices.tolist(), ids[:nd].tolist())
+                owner.assertEqual(bd.dtype, torch.bfloat16)
+                for i in indices.tolist():
+                    owner.assertEqual(step_positions[i], position)
+                    step_positions[i] = (position + 1) % 16
+                events.append(mode)
+                return vd + 10
+
+        def native(**kw):
+            self.assertEqual(mode, "dense")
+            self.assertEqual(kw["ssm_state_indices"].tolist(), ids[:nd].tolist())
+            self.assertEqual(kw["cu_seqlens"].tolist(), list(range(nd + 1)))
+            self.assertTrue(kw["sigmoid_beta"])
+            events.append("dense")
+            return kw["v"] + 10, None
+
+        def gather(st, indices, has_initial):
+            self.assertEqual(indices.tolist(), prefill_ids.tolist())
+            return st[indices].clone()
+
+        def chunk(**kw):
+            self.assertEqual(kw["cu_seqlens"].tolist(), [0, 3, 5])
+            self.assertTrue(torch.equal(kw["q"][0, :, 0], q[nd:]))
+            self.assertEqual(kw["beta"].dtype, torch.float32)
+            events.append("chunk")
+            # Match the real chunk kernel's input-v/output alias.
+            kw["v"].add_(20)
+            return kw["v"], kw["initial_state"] + 2
+
+        def scatter(st, final, indices):
+            self.assertEqual(indices.tolist(), prefill_ids.tolist())
+            st[indices] = final
+
+        ns = dict(
+            torch=torch,
+            self=SimpleNamespace(
+                _latch_cache=None if mode == "dense" else Cache(),
+                A_log=torch.zeros(1),
+                dt_bias=torch.zeros(1, 4),
+                _quantize_qmamba_state=lambda *args: None,
+            ),
+            attn_metadata_narrowed=SimpleNamespace(
+                num_decode_tokens=nd,
+                num_decodes=nd,
+                qmamba_quantize_d=None,
+                qmamba_quantize_p=None,
+            ),
+            use_spec=False,
+            q_ns=q.clone(),
+            k_ns=q.clone(),
+            v_ns=q.clone(),
+            g1_ns=q.reshape(1, nd + 5, 1, 4),
+            beta_ns=torch.zeros(1, nd + 5, 1, dtype=torch.bfloat16),
+            non_spec_state_indices_tensor=ids,
+            has_initial_state=initial,
+            non_spec_query_start_loc=cu,
+            recurrent_state=state,
+            lower_bound=-5.0,
+            safe_gate=True,
+            _rearr=lambda x: x.reshape(1, -1, 1, 4),
+            _cast_sigmoid=lambda x: x.float().sigmoid(),
+            fused_recurrent_kda=native,
+            chunk_kda_with_fused_gate=chunk,
+            gather_initial_states=gather,
+            scatter_states=scatter,
+        )
+        exec(code, ns)
+        expected = torch.cat((q[:nd] + 10, q[nd:] + 20)).reshape(1, -1, 1, 4)
+        self.assertTrue(torch.equal(ns["core_attn_out_non_spec"], expected))
+        self.assertTrue(torch.equal(state[ids[:nd]], torch.zeros_like(state[ids[:nd]])))
+        self.assertEqual(events.count("chunk"), 1)
+        self.assertEqual(events.count(mode), int(nd > 0))
+        if mode != "dense":
+            self.assertEqual(events[0], "handoff")
+            for i in ids[:nd].tolist():
+                self.assertEqual(step_positions[i], (position + 1) % 16)
 
 
 def inputs(batch=2, heads=2, steps=49, seed=72):

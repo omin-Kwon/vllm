@@ -667,30 +667,76 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
+            assert non_spec_query_start_loc is not None
+            # Non-spec decode rows precede prefill rows. Keep their recurrence
+            # (and replay window) intact when new prefills enter the batch.
+            num_decode_tokens = (
+                attn_metadata_narrowed.num_decode_tokens if not use_spec else 0
+            )
+            prefill_indices = non_spec_state_indices_tensor[num_decode_tokens:]
+            prefill_initial = has_initial_state[num_decode_tokens:]
+            prefill_cu = (
+                non_spec_query_start_loc[num_decode_tokens:] - num_decode_tokens
+            )
             if self._latch_cache is not None:
                 self._latch_cache.before_prefill(
-                    recurrent_state, non_spec_state_indices_tensor, has_initial_state
+                    recurrent_state, prefill_indices, prefill_initial
                 )
+            decode_out = None
+            if num_decode_tokens:
+                decode_indices = non_spec_state_indices_tensor[:num_decode_tokens]
+                if self._latch_cache is not None:
+                    decode_out = self._latch_cache.step(
+                        recurrent_state,
+                        decode_indices,
+                        _rearr(q_ns)[0, :num_decode_tokens],
+                        _rearr(k_ns)[0, :num_decode_tokens],
+                        _rearr(v_ns)[0, :num_decode_tokens],
+                        g1_ns[0, :num_decode_tokens],
+                        beta_ns[0, :num_decode_tokens],
+                        self.A_log,
+                        self.dt_bias,
+                        lower_bound,
+                    ).unsqueeze(0)
+                else:
+                    decode_out, _ = fused_recurrent_kda(
+                        q=_rearr(q_ns)[:, :num_decode_tokens],
+                        k=_rearr(k_ns)[:, :num_decode_tokens],
+                        v=_rearr(v_ns)[:, :num_decode_tokens],
+                        g=g1_ns[:, :num_decode_tokens],
+                        beta=beta_ns[:, :num_decode_tokens],
+                        initial_state=recurrent_state,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc[: num_decode_tokens + 1],
+                        ssm_state_indices=decode_indices,
+                        sigmoid_beta=True,
+                        a_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        compute_gate=True,
+                        lower_bound=lower_bound,
+                    )
             initial_state = gather_initial_states(
-                recurrent_state, non_spec_state_indices_tensor, has_initial_state
+                recurrent_state, prefill_indices, prefill_initial
             )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
             ) = chunk_kda_with_fused_gate(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
-                raw_g=g1_ns,
+                q=_rearr(q_ns)[:, num_decode_tokens:],
+                k=_rearr(k_ns)[:, num_decode_tokens:],
+                v=_rearr(v_ns)[:, num_decode_tokens:],
+                raw_g=g1_ns[:, num_decode_tokens:],
                 # Chunk path wants the pre-sigmoided fp32 beta (its kernels
                 # don't sigmoid); beta_ns is raw bf16 from forward.
-                beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+                beta=_cast_sigmoid(beta_ns[:, num_decode_tokens:].squeeze(0)).unsqueeze(
+                    0
+                ),
                 A_log=self.A_log,
                 g_bias=self.dt_bias,
                 initial_state=initial_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=prefill_cu,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
             )
@@ -698,8 +744,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             scatter_states(
                 recurrent_state,
                 last_recurrent_state,
-                non_spec_state_indices_tensor,
+                prefill_indices,
             )
+            if decode_out is not None:
+                core_attn_out_non_spec = torch.cat(
+                    (decode_out, core_attn_out_non_spec), dim=1
+                )
             if attn_metadata_narrowed.num_decodes > 0:
                 self._quantize_qmamba_state(
                     recurrent_state,
