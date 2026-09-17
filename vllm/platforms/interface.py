@@ -893,6 +893,63 @@ class Platform:
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
 
+        from vllm import envs
+        from vllm.v1.kv_cache_interface import KVCacheLayout
+
+        compact_target = envs.VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE
+        if compact_target:
+            if (
+                compact_target != 2112
+                or model_config.max_model_len != 2304
+                or cache_config.block_size != 16
+                or model_config.architecture != "NemotronHForCausalLM"
+                or model_config.hf_config.layers_block_type.count("mamba") != 40
+                or model_config.hf_config.layers_block_type.count("attention") != 8
+                or cache_config.enable_prefix_caching
+                or cache_config.mamba_cache_mode != "none"
+                or cache_config.cache_dtype != "fp8"
+                or cache_config.kv_cache_dtype_skip_layers
+                or parallel_config.tensor_parallel_size != 1
+                or parallel_config.pipeline_parallel_size != 1
+                or parallel_config.data_parallel_size != 1
+                or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+                or backend_cls.get_name() != "FLASHINFER"
+                or vllm_config.kv_transfer_config is not None
+                or vllm_config.speculative_config is not None
+            ):
+                raise ValueError(
+                    "Compact cache requires Nemotron 40 Mamba/8 attention layers, "
+                    "TP/PP/DP=1, FP8 KV, FlashInfer, target=2112, max_model_len=2304, "
+                    "prefix caching off, mamba mode none, no KV transfer/speculation"
+                )
+            from vllm.v1.worker.utils import select_common_block_size
+
+            legacy_block = kernel_block_alignment_size * cdiv(
+                mamba_page_size, kernel_block_alignment_size * attn_page_size_1_token
+            )
+            with set_current_vllm_config(vllm_config):
+                kernel_page = select_common_block_size(legacy_block, [backend_cls])
+            compact_alignment = lcm(64, kernel_page)
+            if envs.VLLM_KV_CACHE_LAYOUT not in (None, "BLHNC"):
+                raise ValueError("Compact cache requires BLHNC layout")
+            # The attention group must fill the entire shared physical block.
+            # Subdivide it as [manager block, kernel page, layer, head, token, KV].
+            cache_config.block_size = compact_alignment * cdiv(
+                max(
+                    compact_target,
+                    cdiv(2 * mamba_page_size, 8 * attn_page_size_1_token),
+                ),
+                compact_alignment,
+            )
+            cache_config.mamba_page_size_padded = None
+            cache_config.kv_cache_layout = KVCacheLayout.BLHNC.name
+            logger.info(
+                "Setting attention block size to %d tokens for compact Nemotron "
+                "cache (20 recurrent groups of 2 layers, 1 attention group of 8)",
+                cache_config.block_size,
+            )
+            return
+
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
             # TODO(tdoublep): this constraint can be relaxed fairly

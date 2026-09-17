@@ -462,6 +462,30 @@ def prepare_kernel_block_sizes(
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )
+            from vllm import envs
+
+            if envs.VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE:
+                state_page = max(
+                    g.kv_cache_spec.page_size_bytes
+                    for g in kv_cache_config.kv_cache_groups
+                    if isinstance(g.kv_cache_spec, MambaSpec)
+                )
+                kv_bytes_per_token = (
+                    kv_cache_spec.page_size_bytes // kv_cache_spec.block_size
+                )
+                legacy_block = 16 * math.ceil(state_page / (16 * kv_bytes_per_token))
+                selected_kernel_size = select_common_block_size(
+                    legacy_block, group_backends
+                )
+                if kv_manager_block_size % selected_kernel_size:
+                    raise ValueError(
+                        "Compact block must preserve the original kernel page"
+                    )
+                logger.info(
+                    "Compact attention kernel page=%d (original manager block=%d)",
+                    selected_kernel_size,
+                    legacy_block,
+                )
             kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.

@@ -329,11 +329,24 @@ def create_kv_cache_views(
     )
     ratio = shape_bytes[0] // num_blocks
     if ratio > 1:
+        from vllm import envs
+
+        # Interleave complete layer sets at kernel-page granularity. Keeping
+        # manager-page layer strides would overlap layers with virtual pages.
+        packed_split = (
+            envs.VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE > 0
+            and layout == KVCacheLayout.BLHNC
+            and isinstance(spec, FullAttentionSpec)
+            and spec.page_size_padded is None
+            and kv_cache_tensor.offset == 0
+            and layer_stride == spec.page_size_bytes
+            and block_stride == num_layers * spec.page_size_bytes
+        )
         # Kernel blocks subdivide a manager block into `ratio` equal pieces, so
         # they sit a constant stride apart only if a block is one dense page: no
         # padding at its end, and no other layer's page before the next block.
         dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
-        if block_stride != dense_page_size:
+        if block_stride != dense_page_size and not packed_split:
             raise ValueError(
                 f"The resolved KV cache layout ({layout.name}) does not store "
                 "blocks as dense, unpadded pages (block stride "
@@ -347,6 +360,9 @@ def create_kv_cache_views(
             f"Block stride {block_stride} must divide into {ratio} equal kernel blocks."
         )
         block_stride //= ratio
+        if packed_split:
+            assert layer_stride % ratio == 0
+            layer_stride //= ratio
 
     logical_shape = (num_layers, *shape_bytes)
     strides = compute_layout_strides(

@@ -2167,6 +2167,28 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+def _get_compact_nemotron_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    mamba = [n for n, s in kv_cache_spec.items() if type(s) is MambaSpec]
+    attention = [n for n, s in kv_cache_spec.items() if type(s) is FullAttentionSpec]
+    if len(mamba) != 40 or len(attention) != 8 or len(kv_cache_spec) != 48:
+        raise ValueError("Compact Nemotron cache requires 40 Mamba/8 attention layers")
+    if (
+        len({kv_cache_spec[n] for n in mamba}) != 1
+        or len({kv_cache_spec[n] for n in attention}) != 1
+    ):
+        raise ValueError("Compact Nemotron cache requires uniform specs per type")
+    if (
+        2 * kv_cache_spec[mamba[0]].page_size_bytes
+        > 8 * kv_cache_spec[attention[0]].page_size_bytes
+    ):
+        raise ValueError("Compact attention group must fill each physical pool block")
+    return create_kv_cache_group_specs(
+        kv_cache_spec, [mamba[i : i + 2] for i in range(0, 40, 2)] + [attention]
+    )
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2199,6 +2221,8 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif envs.VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE:
+        return _get_compact_nemotron_groups(kv_cache_spec)
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window

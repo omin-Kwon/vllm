@@ -300,6 +300,7 @@ if TYPE_CHECKING:
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_OFFLOAD_IPC_PATH: str | None = None
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE: int = 0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -600,6 +601,9 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE": lambda: int(
+        os.getenv("VLLM_NEMOTRON_COMPACT_KV_CACHE_BLOCK_SIZE", "0")
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -2050,9 +2054,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional node-local IPC address shared by independently launched DP ranks.
     # Without it, each process creates its own random address before the external
     # launcher has a chance to synchronize ParallelConfig.
-    "VLLM_PLE_OFFLOAD_IPC_PATH": lambda: os.getenv(
-        "VLLM_PLE_OFFLOAD_IPC_PATH", None
-    ),
+    "VLLM_PLE_OFFLOAD_IPC_PATH": lambda: os.getenv("VLLM_PLE_OFFLOAD_IPC_PATH", None),
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
