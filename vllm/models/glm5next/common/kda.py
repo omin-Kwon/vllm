@@ -342,6 +342,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 self._kda_qmamba_bits,
             )
 
+        from vllm.models.glm5next.ghost import configure_ghost
+
+        configure_ghost(self, vllm_config)
+
         additional_config = vllm_config.additional_config
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
             additional_config.get("kda_prefill_backend", "auto")
@@ -663,6 +667,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 conv_state_indices=decode_conv_indices,
             )
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+
+        if self._ghost_qk_mask is not None and q_ns is not None:
+            from vllm.models.glm5next.ghost import apply_glm5_ghost_mask
+
+            q_ns, k_ns = apply_glm5_ghost_mask(
+                q_ns,
+                k_ns,
+                self._ghost_qk_mask,
+                self.local_num_heads,
+                self.head_dim,
+            )
 
         def _rearr(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)

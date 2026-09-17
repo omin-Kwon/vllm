@@ -326,6 +326,7 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        self.build_temp = os.environ.get("VLLM_LOCAL_BUILD_DIR", self.build_temp)
         # Ensure that CMake is present and working
         try:
             subprocess.check_output(["cmake", "--version"])
