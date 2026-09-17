@@ -7,6 +7,8 @@ from functools import lru_cache
 import torch
 
 from .cache import ReplayCache
+from .flash_wy import prepare_flash_wy
+from .metadata_flash_smallrank import flash_small_metadata
 from .metadata_high_p4_wy import build_persistent as build4
 from .metadata_high_p6_wy import build_persistent as build6
 from .metadata_rank1 import rank1_metadata
@@ -47,7 +49,12 @@ def load_checkpoint(path):
 class SketchCache(ReplayCache):
     """Approximate only non-flush reads; raw-write state and flush output are exact."""
 
-    def __init__(self, frame, ranks, capacity=64, pivots=4):
+    def __init__(
+        self, frame, ranks, capacity=64, pivots=4, *, flush_backend="original"
+    ):
+        if flush_backend not in ("original", "flash_wy"):
+            raise ValueError("Unknown Sketch flush backend")
+        self.flush_backend = flush_backend
         if pivots not in (4, 6):
             raise ValueError("Supported inference pivot counts are P4 and P6")
         if frame.ndim != 3 or frame.shape[1:] != (128, 128):
@@ -79,7 +86,37 @@ class SketchCache(ReplayCache):
         p.direct_decay = torch.zeros_like(p.log_a)
         p.u = torch.zeros_like(p.log_a)
         p.f = torch.zeros(capacity, self.heads, 16, self.rank, **fp)
+        self.flash_workspace = None
+        if flush_backend == "flash_wy":
+            self.flash_workspace = (
+                torch.empty(
+                    capacity,
+                    self.heads,
+                    16,
+                    128,
+                    device=frame.device,
+                    dtype=torch.bfloat16,
+                ),
+                torch.empty(
+                    capacity,
+                    self.heads,
+                    16,
+                    128,
+                    device=frame.device,
+                    dtype=torch.bfloat16,
+                ),
+                torch.empty(
+                    capacity,
+                    self.heads,
+                    16,
+                    16,
+                    device=frame.device,
+                    dtype=torch.bfloat16,
+                ),
+                torch.empty(capacity, self.heads, 128, **fp),
+            )
         sm = torch.cuda.get_device_properties(frame.device).multi_processor_count
+        self.flash_programs = min(capacity * self.heads, 4 * sm)
         self.step_groups = []
         dense_heads = torch.where(cpu == 0)[0].to(
             device=frame.device, dtype=torch.int32
@@ -114,7 +151,30 @@ class SketchCache(ReplayCache):
 
     def _metadata(self, slots, flush, q=None, out=None):
         p = self.pool
+        prepared = self.flash_workspace or (None, None, None, None)
+        if flush and self.flash_workspace is not None:
+            prepare_flash_wy[(self.flash_programs,)](
+                p.k,
+                p.log_a,
+                p.beta,
+                slots,
+                self.work_rows,
+                self.work_counts,
+                self.ranks,
+                *prepared,
+                self.heads,
+                self.capacity,
+                num_warps=4,
+                num_stages=1,
+            )
         for heads, builder, warps, programs, width in self.metadata_groups:
+            if (
+                flush
+                and self.flash_workspace is not None
+                and (builder is rank1_metadata or builder is small_metadata)
+            ):
+                width = 1 if builder is rank1_metadata else 4
+                builder = flash_small_metadata
             builder[(programs,)](
                 p.state,
                 slots,
@@ -140,6 +200,11 @@ class SketchCache(ReplayCache):
                 Q=q,
                 Out=out,
                 EXACT_OUTPUT=q is not None,
+                FLASH_WY=self.flash_workspace is not None,
+                PreparedA=prepared[0],
+                Restored=prepared[1],
+                Inverse=prepared[2],
+                Decay=prepared[3],
                 num_warps=warps,
                 num_stages=1,
             )

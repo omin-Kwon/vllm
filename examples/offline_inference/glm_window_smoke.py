@@ -98,6 +98,7 @@ class WindowAudit:
         from vllm.v1.worker.gpu import model_runner
 
         layers, packed = [], 0
+        sources = {}
         for module in self.get_model().modules():
             packed += sum(
                 p.numel()
@@ -114,6 +115,11 @@ class WindowAudit:
                 window=None if cache is None else type(cache).__name__,
             )
             if cache is not None:
+                if not sources:
+                    for path in Path(inspect.getfile(type(cache))).parent.glob("*.py"):
+                        sources[str(path)] = hashlib.sha256(
+                            path.read_bytes()
+                        ).hexdigest()
                 row.update(
                     decoded_tokens=int(cache.counts[0]),
                     mixed_decode_tokens=cache.mixed_decode_tokens,
@@ -123,11 +129,11 @@ class WindowAudit:
                     beta_ring=str(cache.pool.beta.dtype),
                     capacity=cache.capacity,
                     pivot_count=getattr(cache, "pivots", None),
+                    flush_backend=getattr(cache, "flush_backend", None),
                 )
                 if hasattr(cache, "probe_stats"):
                     row["native_probe"] = cache.probe_stats.tolist()
             layers.append(row)
-        sources = {}
         for module in (kda, model_runner):
             path = Path(inspect.getfile(module)).resolve()
             sources[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -141,6 +147,9 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", choices=["dense", "replay", "sketch"], required=True)
     parser.add_argument("--checkpoint")
+    parser.add_argument(
+        "--flush-backend", choices=["original", "flash_wy"], default="original"
+    )
     parser.add_argument("--probe-replay", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -150,7 +159,9 @@ def main():
     if args.mode != "dense":
         extra["kda_window"] = {"mode": args.mode, "window": 16}
         if args.mode == "sketch":
-            extra["kda_window"].update(checkpoint=args.checkpoint, pivots=4)
+            extra["kda_window"].update(
+                checkpoint=args.checkpoint, pivots=4, flush_backend=args.flush_backend
+            )
     llm = LLM(
         model=args.model,
         dtype="bfloat16",
@@ -238,6 +249,8 @@ def main():
             if args.mode != "dense":
                 assert row["mixed_decode_tokens"] > 0 and row["decoded_tokens"] > 200
                 assert row["key_ring"] == row["value_ring"] == "torch.bfloat16"
+            if args.mode == "sketch":
+                assert row["flush_backend"] == args.flush_backend
             if args.probe_replay:
                 import math
 
@@ -249,6 +262,7 @@ def main():
             json.dumps(
                 dict(
                     mode=args.mode,
+                    flush_backend=args.flush_backend if args.mode == "sketch" else None,
                     status="PASS",
                     steps=step,
                     audit=audit,

@@ -140,6 +140,10 @@ def main():
     parser.add_argument("--layers", type=int, nargs="+")
     parser.add_argument("--pivots", type=int, default=4)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--flush-backend", choices=["original", "flash_wy"], default="original"
+    )
+    parser.add_argument("--metadata-warps", type=int, choices=[4, 8, 16, 32])
     args = parser.parse_args()
     torch.set_num_threads(2)
     classes = {"native": ReplayCache, "parallel_replay": ReplayCache}
@@ -157,12 +161,19 @@ def main():
         for layer in args.layers or sorted(pack["frames"]):
 
             def factory(heads, capacity, device, layer=layer):
-                return SketchCache(
+                cache = SketchCache(
                     pack["frames"][layer].to(device),
                     pack["ranks"][layer].to(device),
                     capacity=capacity,
                     pivots=args.pivots,
+                    flush_backend=args.flush_backend,
                 )
+                if args.metadata_warps:
+                    cache.metadata_groups = [
+                        (heads, builder, args.metadata_warps, programs, width)
+                        for heads, builder, _, programs, width in cache.metadata_groups
+                    ]
+                return cache
 
             classes[f"sketch_p{args.pivots}_layer{layer}"] = factory
     rows = []
@@ -181,6 +192,9 @@ def main():
         json.dumps(
             dict(
                 scope="synthetic_one_layer_including_lifecycle",
+                flush_backend=args.flush_backend,
+                pivots=args.pivots,
+                metadata_warps=args.metadata_warps,
                 checkpoint=str(args.checkpoint) if args.checkpoint else None,
                 checkpoint_meta=pack["meta"] if pack else None,
                 checkpoint_sha256=(

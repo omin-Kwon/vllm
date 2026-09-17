@@ -146,3 +146,71 @@ guards); GDN metadata and kpool-tail tests passed 32; Q-Mamba tests passed 17,
 including CUDA cases. The real G4/P4 mixed-batch model gate also passed again.
 The earlier Dense/Replay/shadow measurements above precede this remote merge;
 they are not a benchmark accuracy claim for the combined branch.
+
+## Opt-in Flash-style Sketch flush, 2026-09-17
+
+Set `additional_config.kda_window.flush_backend="flash_wy"` for the experimental
+Sketch backend. The default is `original`; Replay rejects this Sketch-only key.
+This backend follows the deployed FlashKDA pin
+`b59532f1f464fbd536272780e30df5bf6a2ccc02`, not the older FP16 inverse implementation.
+
+- Prepare decay-adjusted keys and the W16 inverse before accessing full state.
+  Two FP32 8x8 triangular solves and BF16 block products construct the inverse.
+- Use BF16 matrix operands and FP32 accumulation. Updated full state is rounded
+  to BF16 internally and widened into the existing FP32 cache. Raw k/v rings
+  remain BF16; already activated decay/beta rings remain FP32.
+- For ranks 1 through 4, process V32 tiles, accumulating small ridge-system
+  statistics in FP32. Store U and exact full-state flush output from each tile;
+  finish Phi in the same kernel without rereading the full state.
+- Larger ranks retain the existing P4/P6 pivot formulas, with the prepared WY
+  recurrence fused ahead of metadata construction. Register spilling in this
+  larger builder remains an optimization target.
+- Non-flush coefficient formulas, calibrated frames and allocations are
+  unchanged. Dense-fallback heads and partial-window handoff retain FP32
+  recurrence. The scratch workspace is per slot/head and follows device worklists.
+
+The raw-logit FlashKDA interface and this already-activated ring interface have
+different gate rounding and operation ordering; this is not a bitwise port.
+Adopting its precision requires a separately tagged accuracy run. Do not replace
+an in-flight evaluation's backend or combine its scores with this candidate.
+
+```bash
+.venv/bin/python benchmarks/kernels/benchmark_glm_window_replay.py \
+  --batches 64 --checkpoint /path/to/g4/runtime.pt --pivots 4 \
+  --flush-backend flash_wy --out flash_wy_kernels.json
+PYTHONPATH=examples/offline_inference VLLM_USE_V2_MODEL_RUNNER=1 \
+  .venv/bin/python examples/offline_inference/glm_window_smoke.py \
+  --model /path/to/GLM-5.3-Flash-NVFP4 --mode sketch \
+  --checkpoint /path/to/g4/runtime.pt --flush-backend flash_wy \
+  --out flash_wy_smoke.json
+```
+
+The tests compare flush state with an independent CPU precision oracle, metadata
+with an FP64 pivot solve, and flush output with the updated full-state read even
+when sketch metadata is poisoned. Graph/eager lifecycle tests exercise release,
+slot replacement, row reordering and partial prefill handoff.
+
+B300 G4/P4, actual allocations over all 34 layers, B64/W16 synthetic CUDA graphs
+(including lifecycle; microseconds per layer):
+
+| Backend | Non-flush | Flush | W16 mean |
+| --- | ---: | ---: | ---: |
+| Native recurrent Dense | 103.24 | 103.23 | 103.24 |
+| Original 51a268f886 | 46.12 | 1198.61 | 118.15 |
+| Flash-style candidate | 46.94 | 820.50 | 95.29 |
+
+This is a 31.55% flush reduction and 1.24x window-mean speedup versus the original
+Sketch kernel. It is not an end-to-end speedup or an accuracy result. Non-flush
+does not improve. Large-rank metadata still spills, empty metadata/flush kernels
+remain in the common graph, and Sketch still publishes pooled state to native
+pages with a copy. Optimization is incomplete.
+
+The final candidate passes 24 kernel/lifecycle tests and the packed GLM
+mixed-batch model gate (34 layers, 384 tokens, 128 engine steps). This integration
+gate does not establish benchmark accuracy for the new rounding boundaries.
+
+NSYS graph-node tracing at layer 18, non-flush position 7, B64: four read-body
+kernels total 33.825us (55.9%); nine empty initialization/flush dispatches total
+16.384us (27.1%); lifecycle and output zeroing total 10.272us (17.0%). The profiled
+60.481us total is diagnostic, not a replacement for unprofiled graph timings.
+Eliminating empty dispatches alone will not achieve a 10x non-flush speedup.

@@ -9,6 +9,8 @@ unchanged. Persistent state is never rotated. k/v rings are untouched.
 
 from vllm.triton_utils import tl, triton
 
+from .flash_wy import flash_wy_update
+
 
 @triton.jit
 def rank1_metadata(
@@ -36,6 +38,11 @@ def rank1_metadata(
     Q=None,
     Out=None,
     EXACT_OUTPUT: tl.constexpr = False,
+    FLASH_WY: tl.constexpr = False,
+    PreparedA=None,
+    Restored=None,
+    Inverse=None,
+    Decay=None,
 ):
     total = tl.load(WorkCounts + (1 if FLUSH else 0)) * NH
     for item in range(tl.program_id(0), total, tl.num_programs(0)):
@@ -50,16 +57,21 @@ def rank1_metadata(
                 state + (slot * H + h) * 16384 + v[:, None] * 128 + k[None, :]
             )
             if FLUSH:
-                ring = (slot * H + h) * 16
-                for t in range(16):
-                    key = tl.load(kr + (ring + t) * 128 + k).to(tl.float32)
-                    key *= tl.rsqrt(tl.sum(key * key) + 1e-6)
-                    value = tl.load(vr + (ring + t) * 128 + v).to(tl.float32)
-                    decay = tl.load(gr + (ring + t) * 128 + k)
-                    beta = tl.load(br + ring + t)
-                    raw *= tl.exp(decay[None, :])
-                    delta = beta * (value - tl.sum(raw * key[None, :], axis=1))
-                    raw += delta[:, None] * key[None, :]
+                if FLASH_WY:
+                    raw = flash_wy_update(
+                        raw, PreparedA, Restored, Inverse, Decay, vr, br, slot, h, H
+                    )
+                else:
+                    ring = (slot * H + h) * 16
+                    for t in range(16):
+                        key = tl.load(kr + (ring + t) * 128 + k).to(tl.float32)
+                        key *= tl.rsqrt(tl.sum(key * key) + 1e-6)
+                        value = tl.load(vr + (ring + t) * 128 + v).to(tl.float32)
+                        decay = tl.load(gr + (ring + t) * 128 + k)
+                        beta = tl.load(br + ring + t)
+                        raw *= tl.exp(decay[None, :])
+                        delta = beta * (value - tl.sum(raw * key[None, :], axis=1))
+                        raw += delta[:, None] * key[None, :]
                 tl.store(
                     state + (slot * H + h) * 16384 + v[:, None] * 128 + k[None, :], raw
                 )
@@ -75,7 +87,10 @@ def rank1_metadata(
             omega = tl.load(frame + h.to(tl.int64) * 16384 + k)
             uu = tl.sum(raw * omega[None, :], axis=1)
             energy = tl.sum(uu * uu)
-            mu = tl.sum(tl.sum(raw * raw, axis=0), axis=0) / 128.0
+            if FLASH_WY:
+                mu = tl.sum(raw * raw) / 128.0
+            else:
+                mu = tl.sum(tl.sum(raw * raw, axis=0), axis=0) / 128.0
             denominator = energy + 0.1 * mu
             numerator = tl.sum(raw * uu[:, None], axis=0)
             result = numerator / tl.where(denominator > 0, denominator, 1.0)

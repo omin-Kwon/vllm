@@ -643,3 +643,153 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
         broken["cu_seqlens"] = None if q.shape[0] > 1 else inputs["cu_seqlens"]
         with pytest.raises(AssertionError, match=r"torch.Size"):
             run_kernel(broken, state)
+
+
+def _flash_precision_reference(state, keys, values, logs, beta):
+    """CPU oracle: triangular solves, explicit BF16 round trips, FP32 products."""
+
+    def bf(x):
+        return x.bfloat16().float()
+
+    keys = bf(keys / (keys.square().sum(-1, keepdim=True) + 1e-6).sqrt())
+    prefix = (logs * 1.4426950408889634).cumsum(-2)
+    decay = prefix[..., -1, :].exp2()
+    a = bf(keys * bf(prefix.exp2()))
+    c = bf(keys * bf((-prefix).exp2()))
+    restored = bf(c * bf(decay)[..., None, :])
+    lower = torch.tril((a @ c.transpose(-1, -2)) * beta[..., :, None], -1)
+    eye = torch.eye(8).expand(*lower.shape[:-2], 8, 8)
+    inv = torch.zeros_like(lower)
+    for start in (0, 8):
+        block = lower[..., start : start + 8, start : start + 8]
+        inv[..., start : start + 8, start : start + 8] = torch.linalg.solve_triangular(
+            eye + block, eye, upper=False
+        )
+    dc = bf(bf(inv[..., 8:, 8:]) @ bf(lower[..., 8:, :8]))
+    inv[..., 8:, :8] = (-dc) @ bf(inv[..., :8, :8])
+    inv = bf(inv)
+    state = bf(state)
+    projection = bf(state @ a.transpose(-1, -2))
+    residual = bf(bf(values.transpose(-1, -2) - projection) * bf(beta)[..., None, :])
+    delta = bf(residual @ inv.transpose(-1, -2))
+    return bf(state * decay[..., None, :] + delta @ restored)
+
+
+@pytest.mark.parametrize("pivots", [4, 6])
+@torch.inference_mode()
+def test_flash_wy_full_state_flush_matches_precision_reference(pivots):
+    """Catch transpose, double activation and stale preparation/metadata errors."""
+    from vllm.model_executor.layers.mamba.ops.glm_window.sketch import SketchCache
+
+    from .window_reference import coefficient
+
+    torch.manual_seed(612)
+    h = 5
+    state = torch.randn(3, h, 128, 128, device="cuda") * 0.1
+    frame = torch.linalg.qr(torch.randn(h, 128, 128, dtype=torch.float64)).Q.float()
+    cache = SketchCache(
+        frame.cuda(),
+        torch.tensor([0, 1, 3, 7, 28]),
+        2,
+        pivots,
+        flush_backend="flash_wy",
+    )
+    ids = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    a, bias = torch.zeros(h, device="cuda"), torch.zeros(h, 128, device="cuda")
+    for t in range(32):
+        if t % 16 == 0:
+            initial = state[1:].cpu().clone()
+        data = [
+            torch.randn(2, h, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(4)
+        ]
+        data[3].sub_(3)
+        data.append(torch.randn(2, h, device="cuda", dtype=torch.bfloat16))
+        if t % 16 == 7:
+            cache.pool.phi.fill_(float("nan"))
+            cache.pool.latch.fill_(float("nan"))
+        out = cache.step(state, ids, *data, a, bias)
+        if t % 16 == 15:
+            p = cache.pool
+            expected = _flash_precision_reference(
+                initial,
+                p.k.cpu().float(),
+                p.v.cpu().float(),
+                p.log_a.cpu(),
+                p.beta.cpu(),
+            )
+            actual = state[1:].cpu()
+            relative = (actual[:, 1:] - expected[:, 1:]).norm() / expected[:, 1:].norm()
+            assert relative < 0.003, relative
+            q = data[0].float()
+            q = q / (q.square().sum(-1, keepdim=True) + 1e-6).sqrt() * 128**-0.5
+            full_read = (state[1:] * q[..., None, :]).sum(-1).bfloat16()
+            torch.testing.assert_close(out, full_read, rtol=0.008, atol=3e-5)
+            for head, rank in enumerate((0, 1, 3, 7, 28)):
+                assert torch.isfinite(p.phi[:, head, :, :rank]).all()
+                if rank:
+                    for slot in range(2):
+                        expected_phi = coefficient(
+                            actual[slot, head], frame[head], rank, pivots
+                        )
+                        phi = p.phi[slot, head, :, :rank].cpu().double()
+                        error = (phi - expected_phi).norm() / expected_phi.norm()
+                        assert error < 8e-4, (rank, error)
+
+
+@torch.inference_mode()
+def test_flash_wy_graph_eager_lifecycle_agrees():
+    """Prepared scratch must follow live worklists across release and handoff."""
+    from vllm.model_executor.layers.mamba.ops.glm_window.sketch import SketchCache
+
+    torch.manual_seed(614)
+    h, batch = 3, 32
+    initial = torch.randn(97, h, 128, 128, device="cuda") * 0.1
+    states = [initial.clone(), initial.clone()]
+    caches = [
+        SketchCache(
+            torch.eye(128, device="cuda").repeat(h, 1, 1),
+            torch.tensor([1, 3, 28]),
+            64,
+            4,
+            flush_backend="flash_wy",
+        )
+        for _ in range(2)
+    ]
+    ids = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    data = [
+        torch.randn(batch, h, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(4)
+    ]
+    data[3].sub_(4)
+    data.append(torch.randn(batch, h, device="cuda", dtype=torch.bfloat16))
+    a, bias = torch.zeros(h, device="cuda"), torch.zeros(h, 128, device="cuda")
+    caches[0].step(states[0], ids, *data, a, bias)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = caches[0].step(states[0], ids, *data, a, bias)
+    for cache, state in zip(caches, states):
+        cache.reset()
+        state.copy_(initial)
+    for t in range(512):
+        values = [(i + 7 * (t // 37)) % 96 + 1 for i in range(batch)]
+        if t % 2:
+            values.reverse()
+        values[-1] = 0
+        ids.copy_(torch.tensor(values, device="cuda", dtype=torch.int32))
+        for cache, state in zip(caches, states):
+            if t % 97 == 0:
+                cache.release_finished(ids[:1])
+                state[values[0]].zero_()
+            if t % 53 == 0:
+                cache.before_prefill(
+                    state, ids[1:2], torch.ones(1, device="cuda", dtype=torch.bool)
+                )
+        data[0].normal_()
+        graph.replay()
+        eager = caches[1].step(states[1], ids, *data, a, bias)
+        torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+    all_ids = torch.arange(1, 97, device="cuda", dtype=torch.int32)
+    for cache, state in zip(caches, states):
+        cache.before_prefill(state, all_ids, torch.ones_like(all_ids, dtype=torch.bool))
+    torch.testing.assert_close(states[0], states[1], rtol=0, atol=0)

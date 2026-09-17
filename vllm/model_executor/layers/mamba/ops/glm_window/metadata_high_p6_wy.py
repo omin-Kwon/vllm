@@ -9,6 +9,7 @@ unchanged. Persistent state is never rotated. k/v rings are untouched.
 
 from vllm.triton_utils import tl, triton
 
+from .flash_wy import flash_wy_update
 from .wy_update import wy_update
 
 
@@ -38,6 +39,11 @@ def build_persistent(
     Q=None,
     Out=None,
     EXACT_OUTPUT: tl.constexpr = False,
+    FLASH_WY: tl.constexpr = False,
+    PreparedA=None,
+    Restored=None,
+    Inverse=None,
+    Decay=None,
 ):
     total = tl.load(WorkCounts + (1 if FLUSH else 0)) * NH
     for item in range(tl.program_id(0), total, tl.num_programs(0)):
@@ -53,7 +59,12 @@ def build_persistent(
                 state + (slot * H + h) * 16384 + v[:, None] * 128 + k[None, :]
             )
             if FLUSH:
-                raw = wy_update(raw, kr, vr, gr, br, slot, h, H)
+                if FLASH_WY:
+                    raw = flash_wy_update(
+                        raw, PreparedA, Restored, Inverse, Decay, vr, br, slot, h, H
+                    ).to(tl.bfloat16)
+                else:
+                    raw = wy_update(raw, kr, vr, gr, br, slot, h, H)
                 tl.store(
                     state + (slot * H + h) * 16384 + v[:, None] * 128 + k[None, :], raw
                 )
@@ -71,14 +82,14 @@ def build_persistent(
                 g[None, :] < m,
                 0.0,
             )
-            s = tl.dot(raw, omega, input_precision="tf32x3")
+            s = tl.dot(raw.to(tl.float32), omega, input_precision="tf32x3")
             tl.store(
                 u + (slot * H + h) * 128 * G + v[:, None] + g[None, :] * 128,
                 s,
                 g[None, :] < G,
             )
             energy = tl.sum(s * s, axis=0)
-            mean = tl.sum(raw * raw) / 128.0
+            mean = tl.sum(raw.to(tl.float32) * raw.to(tl.float32)) / 128.0
             safe_mean = tl.where(mean > 0.0, mean, 1.0)
             u0 = tl.sum(tl.where(g[None, :] == 0, s, 0.0), axis=1)
             v0 = tl.full((128,), 0.0, tl.float32)
