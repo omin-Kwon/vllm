@@ -15,7 +15,7 @@ def create_cache(vllm_config, layer_idx, heads, head_dim, lower_bound):
 
     if bits_from_env():
         raise ValueError("Q-Mamba DSQ cannot be combined with GLM window replay/sketch")
-    allowed = {"mode", "window", "checkpoint", "pivots"}
+    allowed = {"mode", "window", "checkpoint", "pivots", "sketch_dtype"}
     if not isinstance(options, dict) or set(options) - allowed:
         raise ValueError("Invalid kda_window configuration keys")
     mode = options.get("mode")
@@ -50,15 +50,19 @@ def create_cache(vllm_config, layer_idx, heads, head_dim, lower_bound):
         vllm_config.compilation_config.max_cudagraph_capture_size or 0,
     )
     if mode == "replay":
-        if "checkpoint" in options or "pivots" in options:
+        if any(k in options for k in ("checkpoint", "pivots", "sketch_dtype")):
             raise ValueError("Exact Replay has no checkpoint or pivot approximation")
         return ReplayCache(heads, capacity, torch.device("cuda"))
     from .sketch import SketchCache, load_checkpoint
 
+    dtype = options.get("sketch_dtype", "bfloat16")
+    if dtype not in ("float32", "bfloat16"):
+        raise ValueError("sketch_dtype must be float32 or bfloat16")
     pack = load_checkpoint(options["checkpoint"])
     return SketchCache(
         pack["frames"][layer_idx].cuda(),
         pack["ranks"][layer_idx],
         capacity=capacity,
         pivots=options.get("pivots", 4),
+        sketch_dtype=getattr(torch, dtype),
     )

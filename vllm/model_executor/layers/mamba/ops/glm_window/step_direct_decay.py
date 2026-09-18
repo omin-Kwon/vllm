@@ -114,14 +114,14 @@ def _step_direct_decay(
                 Phi + (slot * H + head) * K * G + kh[:, None] + gg[None, :] * K,
                 mask=gg[None, :] < head_rank,
                 other=0.0,
-            )
+            ).to(tl.float32)
             dk = current_decay * k
             dq = current_decay * q
             fs = tl.load(
                 FR + (base + tt[:, None]) * G + gg[None, :],
                 mask=(tt[:, None] < pos) & (gg[None, :] < head_rank),
                 other=0.0,
-            )
+            ).to(tl.float32)
             f = beta * (
                 tl.sum(phi * dk[:, None], axis=0) - tl.sum(fs * kk[:, None], axis=0)
             )
@@ -141,7 +141,7 @@ def _step_direct_decay(
                 U + (slot * H + head) * V * G + vv[:, None] + gg[None, :] * V,
                 mask=gg[None, :] < head_rank,
                 other=0.0,
-            )
+            ).to(tl.float32)
             out = (
                 tl.sum(latch * c[None, :], axis=1)
                 + tl.sum(us * kq[:, None], axis=0)

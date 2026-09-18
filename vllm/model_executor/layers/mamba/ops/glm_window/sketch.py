@@ -47,7 +47,12 @@ def load_checkpoint(path):
 class SketchCache(ReplayCache):
     """Approximate only non-flush reads; raw-write state and flush output are exact."""
 
-    def __init__(self, frame, ranks, capacity=64, pivots=4):
+    def __init__(
+        self, frame, ranks, capacity=64, pivots=4, sketch_dtype=torch.bfloat16
+    ):
+        if sketch_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("Sketch storage must be FP32 or BF16")
+        self.sketch_dtype = sketch_dtype
         if pivots not in (4, 6):
             raise ValueError("Supported inference pivot counts are P4 and P6")
         if frame.ndim != 3 or frame.shape[1:] != (128, 128):
@@ -69,7 +74,7 @@ class SketchCache(ReplayCache):
         self.all_sketch = bool((cpu > 0).all())
         p = self.pool
         p.latch_heads = self.ranks > 0
-        fp = dict(device=frame.device, dtype=torch.float32)
+        fp = dict(device=frame.device, dtype=sketch_dtype)
         # Logical [slot, head, K/V, G], stored as contiguous K/V vectors.
         p.latch = torch.zeros(capacity, self.heads, self.rank, 128, **fp).transpose(
             -1, -2

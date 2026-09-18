@@ -362,8 +362,9 @@ def make_inputs(num_seqs: int, query_len: int, device: torch.device):
 
 
 @pytest.mark.parametrize("pivots", [4, 6])
+@pytest.mark.parametrize("sketch_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
-def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots):
+def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots, sketch_dtype):
     from vllm.model_executor.layers.mamba.ops.glm_window.sketch import SketchCache
 
     from .window_reference import Oracle, coefficient
@@ -379,7 +380,16 @@ def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots):
     dependent[:, :, 1] = dependent[:, :, 0]
     initial[:, 7] = dependent @ frame[7].T
     state = initial.cuda()
-    cache = SketchCache(frame.cuda(), ranks, capacity=3, pivots=pivots)
+    cache = SketchCache(
+        frame.cuda(), ranks, capacity=3, pivots=pivots, sketch_dtype=sketch_dtype
+    )
+    assert (
+        cache.pool.latch.dtype
+        == cache.pool.phi.dtype
+        == cache.pool.f.dtype
+        == sketch_dtype
+    )
+    assert cache.pool.state.dtype == torch.float32
     ref = Oracle(initial, frame, ranks, pivots)
     a = torch.randn(heads) * 0.1
     bias = torch.randn(heads, 128) * 0.1
@@ -414,7 +424,10 @@ def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots):
                     error = (
                         actual - expected_phi
                     ).norm() / expected_phi.norm().clamp_min(1e-12)
-                    assert error < 8e-4, (rank, error)
+                    assert error < (4e-3 if sketch_dtype == torch.bfloat16 else 8e-4), (
+                        rank,
+                        error,
+                    )
         if t in (15, 31):
             torch.testing.assert_close(
                 state[1:3].double().cpu(), ref.state[1:3], rtol=1e-3, atol=3e-6
@@ -423,6 +436,62 @@ def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots):
     torch.testing.assert_close(
         state[1:3].double().cpu(), ref.state[1:3], rtol=1e-3, atol=3e-6
     )
+
+
+@pytest.mark.parametrize("pivots", [4, 6])
+@torch.inference_mode()
+def test_window_bf16_sketch_storage_preserves_state_and_rounds_flush_maps(pivots):
+    """Only readout is approximate: storage cannot feed exact state/flush output."""
+    from vllm.model_executor.layers.mamba.ops.glm_window.sketch import SketchCache
+
+    torch.manual_seed(211)
+    torch.set_num_threads(2)
+    ranks = torch.tensor([0, 1, 3, 4, 5, 6, 7, 12, 28, 60])
+    h = len(ranks)
+    frame = torch.linalg.qr(torch.randn(h, 128, 128, device="cuda")).Q
+    states = [torch.randn(5, h, 128, 128, device="cuda") * 0.1]
+    states.append(states[0].clone())
+    caches = [
+        SketchCache(frame, ranks, 3, pivots, dtype)
+        for dtype in (torch.float32, torch.bfloat16)
+    ]
+    ids = torch.tensor([1, 2, 0], device="cuda", dtype=torch.int32)
+    a = torch.zeros(h, device="cuda")
+    bias = torch.zeros(h, 128, device="cuda")
+    for t in range(128):
+        if t == 37:
+            for cache, state in zip(caches, states):
+                cache.before_prefill(
+                    state, ids[:2], torch.ones(2, device="cuda", dtype=torch.bool)
+                )
+            ids.copy_(torch.tensor([2, 1, 0], device="cuda", dtype=torch.int32))
+        if t == 80:
+            for cache in caches:
+                cache.release_finished(
+                    torch.tensor([1], device="cuda", dtype=torch.int32)
+                )
+            for state in states:
+                state[1].zero_()
+        data = [
+            torch.randn(3, h, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(4)
+        ]
+        data[3].sub_(3)
+        data.append(torch.randn(3, h, device="cuda", dtype=torch.bfloat16))
+        outputs = [
+            cache.step(state, ids, *data, a, bias)
+            for cache, state in zip(caches, states)
+        ]
+        assert torch.equal(states[0], states[1])
+        for name in ("latch", "phi"):
+            reference = getattr(caches[0].pool, name).to(torch.bfloat16)
+            assert torch.equal(reference, getattr(caches[1].pool, name)), (t, name)
+        assert caches[1].pool.f.dtype == torch.bfloat16
+        assert torch.isfinite(outputs[1]).all()
+        relative = (outputs[1].float() - outputs[0].float()).norm() / outputs[
+            0
+        ].float().norm().clamp_min(1e-12)
+        assert relative < 0.01, (t, relative)
 
 
 @pytest.mark.parametrize("pivots", [4, 6])

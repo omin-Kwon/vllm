@@ -124,6 +124,12 @@ class WindowAudit:
                     capacity=cache.capacity,
                     pivot_count=getattr(cache, "pivots", None),
                 )
+                if hasattr(cache.pool, "latch"):
+                    row.update(
+                        sketch_dtype=str(cache.pool.latch.dtype),
+                        coefficient_dtype=str(cache.pool.phi.dtype),
+                        projected_erase_dtype=str(cache.pool.f.dtype),
+                    )
                 if hasattr(cache, "probe_stats"):
                     row["native_probe"] = cache.probe_stats.tolist()
             layers.append(row)
