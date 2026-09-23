@@ -27,3 +27,27 @@ of sketch metadata, and long graph/slot lifecycle checks.
 
 The companion GDN implementation and GPU queue are in `omin-Kwon/nested_ssm`,
 branch `port/machine-agnostic-paths`, `scale/research/qwen_bf16_storage`.
+
+## Validation update (2026-09-23, B300)
+
+Completed GLM RULER runs used BF16 U/C/projected erase, as recorded in the
+archived `SSM_results/data/ruler_recall_16k_2026-09-20/results/glm/` engine audits.
+This does not establish the storage dtype of older reasoning evaluations.
+
+The new low-rank reasoning queue initially stopped on a bit-exact comparison
+between direct BF16 coefficient storage and FP32 coefficients cast to BF16.
+Separate output-dtype specializations can straddle a rounding boundary; that
+comparison is stricter than the intended numerical contract. The test now
+bounds map error by half the BF16 relative spacing plus a per-head FP32
+arithmetic tolerance near zero. State and rounded U comparisons remain exact.
+Independent FP64 coefficient checks now also cover two flushes, not just
+initialization. No production kernel arithmetic was changed.
+
+All eight selected P4/P6 tests passed: independent FP64 oracle (both storage
+dtypes), BF16 storage/state, and flush output with corrupted sketch metadata.
+An additional 128-step diagnostic with reorder/release/reset found bit-identical
+full states and maximum output relative norms of 0.002474 (P4) and 0.002550 (P6).
+These are kernel checks with shared inputs, not model accuracy guarantees.
+
+Local evidence:
+`/disk2/omin/kda-latch-results/accuracy_lowrank_20260923/glm/debug_bf16/`.

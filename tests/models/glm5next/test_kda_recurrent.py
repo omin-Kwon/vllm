@@ -410,7 +410,7 @@ def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots, sketch_dtyp
         relative = (out.double().cpu() - expected).norm() / expected.norm()
         assert relative < 0.007, (t, relative)
         assert torch.count_nonzero(out[2]) == 0
-        if t == 0:
+        if t in (0, 15, 31):
             for slot, physical in enumerate(cache.owners.tolist()):
                 if physical <= 0:
                     continue
@@ -418,7 +418,7 @@ def test_window_sketch_matches_independent_fp64_pivot_oracle(pivots, sketch_dtyp
                     if rank in (0, 128):
                         continue
                     expected_phi = coefficient(
-                        initial[physical, h], frame[h], rank, pivots
+                        ref.start[physical, h], frame[h], rank, pivots
                     )
                     actual = cache.pool.phi[slot, h, :, :rank].double().cpu()
                     error = (
@@ -484,8 +484,21 @@ def test_window_bf16_sketch_storage_preserves_state_and_rounds_flush_maps(pivots
         ]
         assert torch.equal(states[0], states[1])
         for name in ("latch", "phi"):
-            reference = getattr(caches[0].pool, name).to(torch.bfloat16)
-            assert torch.equal(reference, getattr(caches[1].pool, name)), (t, name)
+            reference = getattr(caches[0].pool, name)
+            actual = getattr(caches[1].pool, name)
+            if name == "latch":
+                assert torch.equal(reference.to(torch.bfloat16), actual), (t, name)
+                continue
+            # Separate dtype specializations need not round identically at a
+            # BF16 midpoint. Bound storage error by half a BF16 relative ULP,
+            # plus FP32 arithmetic tolerance near zero, per slot and head.
+            scale = reference.abs().amax(dim=(-2, -1), keepdim=True)
+            bound = (
+                0.5 * torch.finfo(torch.bfloat16).eps * reference.abs()
+                + 32 * torch.finfo(torch.float32).eps * scale
+            )
+            assert torch.isfinite(actual).all(), (t, name)
+            assert ((actual.float() - reference).abs() <= bound).all(), (t, name)
         assert caches[1].pool.f.dtype == torch.bfloat16
         assert torch.isfinite(outputs[1]).all()
         relative = (outputs[1].float() - outputs[0].float()).norm() / outputs[
