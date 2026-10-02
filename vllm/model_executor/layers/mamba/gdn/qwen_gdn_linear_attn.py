@@ -30,8 +30,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.gdn_sketchssm import GDNSketchSSM
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
@@ -368,10 +370,8 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
-    def get_state_shape(
-        self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -380,6 +380,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+        if self.cache_config.sketchssm is not None:
+            shapes = MambaStateShapeCalculator.append_gdn_sketchssm_ring(
+                shapes,
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.cache_config.replayssm_buffer_len,
+            )
+        return shapes
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        dtypes = super().get_state_dtype()
+        if self.cache_config.sketchssm is not None:
+            dtypes = MambaStateDtypeCalculator.append_gdn_sketchssm_ring(
+                dtypes, self.model_config.dtype
+            )
+        return dtypes
 
     def __init__(
         self,
@@ -399,6 +418,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        self.sketchssm: GDNSketchSSM | None = None
+        if vllm_config.cache_config.sketchssm is not None:
+            if gqa_interleaved_layout:
+                raise ValueError("SketchSSM requires the non-interleaved GDN layout")
+            self.sketchssm = GDNSketchSSM.maybe_create(
+                vllm_config.cache_config,
+                config.layer_types[: self.layer_idx].count("linear_attention"),
+                self.layer_idx,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                vllm_config.scheduler_config.max_num_seqs,
+                vllm_config.model_config.dtype,
+                self.get_state_dtype()[1],
+            )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -535,7 +570,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -1105,7 +1140,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
+        state_dtype = self.get_state_dtype()[1]
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1292,12 +1327,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
-        if (
-            self.enable_packed_recurrent_decode
-            and attn_metadata.spec_sequence_masks is None
+        is_non_spec_decode = (
+            attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
-        ):
+        )
+        if self.sketchssm is not None and is_non_spec_decode:
+            return self._forward_core_decode_non_spec(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+                sketchssm=True,
+            )
+        if self.enable_packed_recurrent_decode and is_non_spec_decode:
             return self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -1401,6 +1445,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         else:
             mixed_qkv_non_spec = None
+        if mixed_qkv_non_spec is not None:
+            self._rotate_qk(mixed_qkv_non_spec)
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
@@ -1490,7 +1536,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
-        if split_non_spec:
+        if split_non_spec and self.sketchssm is not None:
+            core_attn_out_decode = core_attn_out.new_empty(
+                (num_decode_tokens, *core_attn_out.shape[1:])
+            )
+            self._sketchssm_decode(
+                mixed_qkv_non_spec[:num_decode_tokens].contiguous(),  # type: ignore[index]
+                a[:num_decode_tokens],
+                b[:num_decode_tokens],
+                core_attn_out_decode.unsqueeze(1),
+                non_spec_state_indices_tensor[:num_decode_tokens],  # type: ignore[index]
+                attn_metadata,
+            )
+            core_attn_out_decode = core_attn_out_decode.unsqueeze(0)
+        elif split_non_spec:
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
@@ -1543,6 +1602,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if self.sketchssm is not None:
+                self.sketchssm.prefilled(
+                    ssm_state, attn_metadata, prefill_state_indices
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1654,6 +1717,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out.reshape(-1),
         )
 
+    def _sketchssm_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor,
+        state_indices: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        assert attn_metadata.sketchssm_window_pos_d is not None
+        d_cache, k_cache, g_cache = self.kv_cache[2:5]
+        assert self.sketchssm is not None
+        self.sketchssm.decode(
+            mixed_qkv,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            out.view(out.shape[0], -1, out.shape[-1]),
+            self.kv_cache[1],
+            d_cache,
+            k_cache,
+            g_cache,
+            attn_metadata,
+            state_indices,
+            self.head_k_dim**-0.5,
+        )
+
+    def _rotate_qk(self, mixed_qkv: torch.Tensor) -> None:
+        """Rotate the packed q and k blocks into the sketch coordinates."""
+        if self.sketchssm is not None:
+            self.sketchssm.rotate_(mixed_qkv)
+
     def _forward_core_decode_non_spec(
         self,
         mixed_qkv: torch.Tensor,
@@ -1661,6 +1757,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
+        sketchssm: bool = False,
     ):
         """
         Core attention computation with a packed non-spec decode fast path.
@@ -1693,7 +1790,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
+        self._rotate_qk(mixed_qkv_non_spec)
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        if sketchssm:
+            self._sketchssm_decode(
+                mixed_qkv_non_spec,
+                a,
+                b,
+                out_buf,
+                non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                attn_metadata,
+            )
+            return
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
