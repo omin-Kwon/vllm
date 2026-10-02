@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config.cache import CacheConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
@@ -21,6 +22,7 @@ from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     state = object.__new__(MambaHybridModelState)
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+    state.cache_config = CacheConfig()
     state.max_model_len = 8192
     state._align_mode = False
     state.recoverssm = None
@@ -37,6 +39,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
         seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
         seq_lens=torch.tensor([1537], dtype=torch.int32),
         is_prefilling_np=torch.tensor([False]).numpy(),
+        idx_mapping_np=torch.tensor([0]).numpy(),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -56,6 +59,51 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
+
+
+def test_prepare_attn_forwards_sketchssm_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SketchSSM rows get their ring origin and persistent request index."""
+    state = object.__new__(MambaHybridModelState)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+    state.cache_config = CacheConfig(sketchssm="unused.pt")
+    state.max_model_len = 8192
+    state._align_mode = False
+    state.recoverssm = None
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=2,
+        num_reqs_after_padding=4,
+        num_tokens_after_padding=4,
+        query_start_loc_np=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32).numpy(),
+        query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+        num_scheduled_tokens=torch.tensor([1, 1], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([40, 77, 0, 0], dtype=torch.int32),
+        seq_lens=torch.tensor([40, 77, 0, 0], dtype=torch.int32),
+        is_prefilling_np=torch.tensor([False, False]).numpy(),
+        prefill_len_np=torch.tensor([30, 70], dtype=torch.int32).numpy(),
+        idx_mapping_np=torch.tensor([5, 2]).numpy(),
+        dcp_local_seq_lens=None,
+        positions=torch.tensor([39, 76, 0, 0], dtype=torch.int64),
+        prompt_lens=torch.tensor([30, 70], dtype=torch.int32),
+    )
+    build_attn_metadata = Mock(return_value={})
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_attn_metadata)
+
+    state.prepare_attn(
+        input_batch=input_batch,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        block_tables=(),
+        slot_mappings=torch.empty(0, dtype=torch.int64),
+        attn_groups=[],
+        kv_cache_config=Mock(),
+    )
+
+    kwargs = build_attn_metadata.call_args.kwargs
+    assert kwargs["req_idx"].tolist() == [5, 2]
+    common = kwargs["model_specific_attn_metadata"].get_extra_common_attn_kwargs(0, 4)
+    assert common["replayssm_decode_base_cpu"].tolist() == [30, 70, 0, 0]
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
