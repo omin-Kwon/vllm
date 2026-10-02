@@ -26,6 +26,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.mamba2_sketchssm import (
+    Mamba2SketchSSM,
+    mamba2_sketchssm_state_shapes,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -53,6 +57,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -282,6 +287,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        recurrent_layer_idx: int | None = None,
     ):
         super().__init__()
 
@@ -521,18 +527,37 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.use_replayssm = (
             cache_config.use_replayssm if cache_config is not None else False
         )
+        # The x/dt/B window rings of ReplaySSM, also used by SketchSSM.
+        self.use_window_rings = (
+            cache_config.uses_mamba_window_rings if cache_config is not None else False
+        )
         self.replayssm_buffer_len = (
             cache_config.replayssm_buffer_len
-            if cache_config is not None and cache_config.use_replayssm
+            if cache_config is not None and self.use_window_rings
             else None
         )
         self.mamba_config = vllm_config.mamba_config
-        if self.use_replayssm and self.num_heads % self.tp_size != 0:
+        if self.use_window_rings and self.num_heads % self.tp_size != 0:
             raise ValueError(
                 "--use-replayssm requires tensor-parallel heads to divide evenly"
             )
-        # ReplaySSM appends x/dt/B rings to (conv_state, ssm_state).
-        _n_state = 5 if self.use_replayssm else 2
+        self.sketchssm: Mamba2SketchSSM | None = None
+        if cache_config is not None and cache_config.sketchssm is not None:
+            assert model_config is not None
+            self.sketchssm = Mamba2SketchSSM.maybe_create(
+                cache_config,
+                recurrent_layer_idx,
+                extract_layer_index(prefix),
+                num_heads,
+                head_dim,
+                n_groups,
+                ssm_state_size,
+                vllm_config.scheduler_config.max_num_seqs,
+                model_config.dtype,
+                self.get_state_dtype()[1],
+            )
+        # ReplaySSM and SketchSSM append x/dt/B rings to (conv_state, ssm_state).
+        _n_state = 5 if self.use_window_rings else 2
         self.kv_cache = tuple(torch.tensor([]) for _ in range(_n_state))
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
@@ -741,7 +766,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 else self.kv_cache[0].transpose(-1, -2)
             )
             ssm_state = self.kv_cache[1]
-            if self.use_replayssm:
+            if self.sketchssm is not None:
+                # SketchSSM keeps the state key-major, (heads, dstate, dim).
+                ssm_state = ssm_state.transpose(-1, -2)
+            if self.use_window_rings:
                 x_cache, dt_cache, B_cache = self.kv_cache[2:5]
                 if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
                     ring_start = self._replayssm_ring_start
@@ -873,6 +901,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
             hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_p
             )
+            if self.sketchssm is not None:
+                B_p, C_p = self.sketchssm.rotate(B_p, C_p)
 
             # 3. State Space Model sequence transformation
             initial_states = None
@@ -1004,6 +1034,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 #   tensor
                 assert state_indices_tensor_p is not None
                 ssm_state[state_indices_tensor_p] = varlen_states
+                if self.sketchssm is not None:
+                    self.sketchssm.prefilled(
+                        ssm_state, attn_metadata, state_indices_tensor_p
+                    )
                 if ring_start is not None and self._updates_replayssm_trackers:
                     assert prev_num_accepted is not None
                     reset_replayssm_ring_trackers(
@@ -1062,6 +1096,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
             )
+            if self.sketchssm is not None:
+                self.sketchssm.rotate_(B_d, C_d)
 
             # 3. State Space Model sequence transformation
             n_groups = self.n_groups // self.tp_size
@@ -1087,9 +1123,26 @@ class MambaMixer2(MambaBase, PluggableLayer):
             preallocated_ssm_out_d = preallocated_ssm_out_d.view(
                 num_decode_tokens, -1, self.head_dim
             )
-            if self.use_replayssm:
+            if self.use_window_rings:
                 assert self.replayssm_buffer_len is not None
-                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                if self.sketchssm is not None:
+                    self.sketchssm.decode(
+                        ssm_state,
+                        hidden_states_d,
+                        dt_d,
+                        A_d,
+                        B_d,
+                        C_d,
+                        D_d,
+                        dt_bias,
+                        x_cache,
+                        dt_cache,
+                        B_cache,
+                        attn_metadata,
+                        state_indices_tensor_d_input,
+                        preallocated_ssm_out_d,
+                    )
+                elif self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
                     assert ring_start is not None
                     assert prev_num_accepted is not None
                     assert attn_metadata.replayssm_scratch is not None
@@ -1174,7 +1227,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
         )
-        if self.use_replayssm:
+        if self.use_window_rings:
             return MambaStateDtypeCalculator.append_replayssm_ring(
                 base_dtype, self.model_config.dtype
             )
@@ -1192,15 +1245,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
             conv_kernel=self.conv_kernel_size,
             num_spec=self.num_spec,
         )
-        if self.use_replayssm:
+        if self.use_window_rings:
             assert self.replayssm_buffer_len is not None
-            return MambaStateShapeCalculator.append_replayssm_ring(
+            shapes = MambaStateShapeCalculator.append_replayssm_ring(
                 base_shapes=base_shape,
                 n_groups=self.n_groups,
                 tp_world_size=tp_world_size,
                 logical_window=self.replayssm_buffer_len,
                 backend=self.mamba_config.backend,
             )
+            if self.sketchssm is not None:
+                shapes = mamba2_sketchssm_state_shapes(shapes)
+            return shapes
         return base_shape
 
     @property
