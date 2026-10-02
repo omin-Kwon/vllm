@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""KDA SketchSSM decode (Triton kernels) against an FP64 oracle."""
+"""KDA SketchSSM decode (CUDA and Triton kernels) against an FP64 oracle."""
 
 import math
 from collections.abc import Callable
@@ -10,14 +10,18 @@ import torch
 
 from vllm.model_executor.layers.mamba.ops import kda_sketchssm_common as common
 from vllm.model_executor.layers.mamba.ops import kda_sketchssm_triton as kdt
+from vllm.model_executor.layers.mamba.ops import sketchssm_kernels as skk
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="GPU")
 D = 128
 RANKS = [0, 3, 17, 40, 70, 128]  # dense heads and one per flush rank bucket
 H = len(RANKS)
-BACKENDS = ["triton"]
+CUDA = skk.kda_cuda_supported(H, D, D, 16, torch.bfloat16, torch.float32)
+NO_CUDA = pytest.mark.skipif(not CUDA, reason="Requires the sketchssm package")
+BACKENDS = [pytest.param("cuda", marks=NO_CUDA), "triton"]
 KERNELS: dict[str, tuple[Callable[..., None], Callable[..., None]]] = {
+    "cuda": (skk.kda_cuda_cold_build, skk.kda_cuda_decode),
     "triton": (kdt.kda_sketch_triton_cold_build, kdt.kda_sketch_triton_decode),
 }
 i32 = lambda x: torch.tensor(x, device="cuda", dtype=torch.int32)

@@ -19,6 +19,10 @@ from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import (
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_triton import (
     gdn_sketch_triton_decode,
 )
+from vllm.model_executor.layers.mamba.ops.sketchssm_kernels import (
+    gdn_cuda_decode,
+    gdn_cuda_supported,
+)
 from vllm.model_executor.layers.mamba.sketchssm import (
     SketchSSMCalibration,
     load_sketchssm_calibration,
@@ -69,6 +73,11 @@ class GDNSketchSSM(torch.nn.Module):
                 f"{GDN_SKETCH_WINDOW_ALIGN}, a whole number of value heads per key "
                 "head and an FP32 state"
             )
+        use_cuda = gdn_cuda_supported(
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, window,
+            activation_dtype, state_dtype,
+        )  # fmt: skip
+        self._decode = gdn_cuda_decode if use_cuda else gdn_sketch_triton_decode
         device = torch.get_default_device()
         self.register_buffer(
             "rotation_t", gdn_rotation_from_frames(frames).to(device), persistent=False
@@ -106,7 +115,7 @@ class GDNSketchSSM(torch.nn.Module):
         scale: float,
     ) -> None:
         """One decode step; rows at the end of their window are flushed."""
-        gdn_sketch_triton_decode(
+        self._decode(
             mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache,
             g_cache, state_indices, attn_metadata.sketchssm_window_pos_d,
             attn_metadata.sketch_meta_d, attn_metadata.sketch_flush_rows_d,

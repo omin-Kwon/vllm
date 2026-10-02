@@ -21,3 +21,7 @@ vllm serve <model> --sketchssm /path/to/calibration.pt
 ## Constraints
 
 SketchSSM is available for models that implement `SupportsSketchSSM`. It requires Model Runner V2, `--mamba-backend triton` and `--mamba-ssm-cache-dtype float32`. It does not support tensor parallelism, Mamba prefix caching, speculative decoding, stochastic rounding of the SSM state, or KV connectors.
+
+## Kernels
+
+Mamba-2, Gated DeltaNet and KDA layers have Triton kernels. On supported NVIDIA GPUs, faster CUDA kernels are used where the layer shape allows; they are vendored at build time or come from the optional `sketchssm` package, and are compiled just-in-time (with `nvcc` and `ninja`) when not prebuilt. Set `VLLM_SKETCHSSM_USE_CUDA=0` to always use the Triton kernels.

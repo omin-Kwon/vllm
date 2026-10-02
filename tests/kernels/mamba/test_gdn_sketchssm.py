@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GDN SketchSSM decode (Triton) against an FP64 oracle."""
+"""GDN SketchSSM decode (CUDA and Triton) against an FP64 oracle."""
 
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -10,14 +10,20 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.mamba.ops import gdn_sketchssm_common as common
+from vllm.model_executor.layers.mamba.ops import sketchssm_kernels as skk
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_triton import (
     gdn_sketch_triton_decode,
 )
 from vllm.platforms import current_platform
 
+CUDA_OK = skk.gdn_cuda_supported(2, 6, 128, 128, 16, torch.bfloat16, torch.float32)
 pytestmark = pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="GPU")
-BACKENDS = ["triton"]
-DECODE: dict[str, Callable[..., None]] = {"triton": gdn_sketch_triton_decode}
+NO_CUDA = pytest.mark.skipif(not CUDA_OK, reason="Requires the sketchssm package")
+BACKENDS = [pytest.param("cuda", marks=NO_CUDA), "triton"]
+DECODE: dict[str, Callable[..., None]] = {
+    "cuda": skk.gdn_cuda_decode,
+    "triton": gdn_sketch_triton_decode,
+}
 K = V = 128
 NX, NR = 8, 5  # state slots (0 is the null block), sketch rows
 # Ranks of 3 value heads per key head: dense, merged and four-pivot maps, full.

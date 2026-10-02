@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.sketchssm_kernels import (
+    mamba2_cuda_decode,
+    mamba2_cuda_supported,
+)
 from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     SKETCH_DTYPES,
     SketchArgs,
@@ -77,6 +81,11 @@ class Mamba2SketchSSM(torch.nn.Module):
             self.register_buffer(
                 name, torch.zeros(max_num_reqs, *shape, dtype=dtype), persistent=False
             )
+        use_cuda = mamba2_cuda_supported(
+            num_heads, head_dim, state_size, n_groups, window, activation_dtype,
+            state_dtype,
+        )  # fmt: skip
+        self._decode = mamba2_cuda_decode if use_cuda else sketch_triton_decode
 
     def rotate_(self, B: torch.Tensor, C: torch.Tensor) -> None:
         """Rotate B and C ``(tokens, groups * state_size)`` in place."""
@@ -109,7 +118,7 @@ class Mamba2SketchSSM(torch.nn.Module):
         sketch = SketchArgs(self.u, self.w, self.ag, self.tables)
         if state_indices.dim() == 2:
             state_indices = state_indices[:, 0]
-        sketch_triton_decode(
+        self._decode(
             state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache,
             attn_metadata.bc_pre_scratch, attn_metadata.write_pos_d,
             attn_metadata.is_flush_d, attn_metadata.sketch_flush_rows_d,

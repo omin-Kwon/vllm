@@ -449,6 +449,19 @@ class cmake_build_ext(build_ext):
                     dirs_exist_ok=True,
                 )
 
+            sketchssm_build = os.path.join(
+                self.build_lib, "vllm", "third_party", "sketchssm_kernels"
+            )
+            if os.path.exists(sketchssm_build):
+                print(
+                    f"Copying {sketchssm_build} to vllm/third_party/sketchssm_kernels"
+                )
+                shutil.copytree(
+                    sketchssm_build,
+                    "vllm/third_party/sketchssm_kernels",
+                    dirs_exist_ok=True,
+                )
+
             tml_fa4_build = os.path.join(
                 self.build_lib, "vllm", "third_party", "tml_fa4"
             )
@@ -1047,6 +1060,7 @@ class precompiled_wheel_utils:
                 deep_gemm_regex = re.compile(r"vllm/third_party/deep_gemm/.*")
                 fmha_sm100_regex = re.compile(r"vllm/third_party/fmha_sm100/.*")
                 tml_fa4_regex = re.compile(r"vllm/third_party/tml_fa4/.*")
+                sketchssm_regex = re.compile(r"vllm/third_party/sketchssm_kernels/.*")
                 file_members = []
                 for member in wheel.filelist:
                     if member.filename in exact_members:
@@ -1074,6 +1088,7 @@ class precompiled_wheel_utils:
                         or deep_gemm_regex.match(member.filename)
                         or tml_fa4_regex.match(member.filename)
                         or fmha_sm100_regex.match(member.filename)
+                        or sketchssm_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
@@ -1389,6 +1404,7 @@ if _is_cuda():
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.0")
     ):
         ext_modules.append(CMakeExtension(name="vllm._flashkda_C", optional=True))
+        ext_modules.append(CMakeExtension(name="vllm.sketchssm_kernels", optional=True))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
@@ -1444,6 +1460,10 @@ package_data = {
         "third_party/fmha_sm100/cutlass/include/**/*.hpp",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.h",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.hpp",
+        # SketchSSM kernel sources, configs and AOT cubins (vendored via cmake)
+        "third_party/sketchssm_kernels/csrc/**/*",
+        "third_party/sketchssm_kernels/configs/**/*.json",
+        "third_party/sketchssm_kernels/aot/**/*",
     ]
 }
 
