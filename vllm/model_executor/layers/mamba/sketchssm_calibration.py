@@ -147,7 +147,7 @@ def crossover(g: dict[str, Any], window: int | None = None) -> int:
     """Dense crossover rank (the default rank cap) of a geometry at a window."""
     K, V = g["key_dim"], g["value_dim"]
     W = g["window"] if window is None else window
-    # "erase" marks the delta-rule families (GDN/KDA, follow-up PRs).
+    # "erase" marks the delta-rule families (GDN; KDA in a follow-up PR).
     return min(K, K * V // (K + V + (W if g["erase"] else 0)))
 
 

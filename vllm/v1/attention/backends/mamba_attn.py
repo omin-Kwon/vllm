@@ -847,7 +847,6 @@ def sketch_prefill_rows(
     )
 
 
-# Used by the GDN/KDA SketchSSM layers (follow-up PRs).
 def sketch_prefill_build_rows(
     common_attn_metadata: CommonAttentionMetadata,
     num_decodes: int,
