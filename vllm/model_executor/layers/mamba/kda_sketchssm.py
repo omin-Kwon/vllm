@@ -20,6 +20,11 @@ from vllm.model_executor.layers.mamba.ops.kda_sketchssm_triton import (
     kda_sketch_triton_cold_build,
     kda_sketch_triton_decode,
 )
+from vllm.model_executor.layers.mamba.ops.sketchssm_kernels import (
+    kda_cuda_cold_build,
+    kda_cuda_decode,
+    kda_cuda_supported,
+)
 from vllm.model_executor.layers.mamba.sketchssm import (
     SketchSSMCalibration,
     load_sketchssm_calibration,
@@ -85,6 +90,14 @@ class KDASketchSSM(torch.nn.Module):
                 f"that is a multiple of 16 (got {window}), gate lower bound "
                 f"{KDA_SKETCH_LOWER_BOUND}, BF16 activations and an FP32 state"
             )
+        use_cuda = kda_cuda_supported(
+            local, head_dim, head_dim, window, activation_dtype, state_dtype,
+            lower_bound,
+        )  # fmt: skip
+        self._decode = kda_cuda_decode if use_cuda else kda_sketch_triton_decode
+        self._cold_build = (
+            kda_cuda_cold_build if use_cuda else kda_sketch_triton_cold_build
+        )
         device = torch.get_default_device()
         self.tables = KDASketchTables(frames[heads].to(device), ranks[heads], window)
         self.sketch = KDASketchArgs.allocate(self.tables, max_num_reqs, device)
@@ -110,7 +123,7 @@ class KDASketchSSM(torch.nn.Module):
         n = rows.numel()
         if n == 0:
             return
-        kda_sketch_triton_cold_build(
+        self._cold_build(
             state, KDASketchRings(*rings), state_indices[:n].contiguous(),
             attn_metadata.sketch_meta_p, rows, self.sketch, self._scratch(),
         )  # fmt: skip
@@ -134,7 +147,7 @@ class KDASketchSSM(torch.nn.Module):
         n, h = q.shape[0], self.tables.num_heads
         if state_indices.dim() == 2:
             state_indices = state_indices[:, 0]
-        kda_sketch_triton_decode(
+        self._decode(
             q.view(n, h, -1), k.view(n, h, -1), v.view(n, h, -1),
             g.view(n, h, -1), beta, A_log, dt_bias, out, state,
             KDASketchRings(*rings), state_indices.contiguous(),

@@ -13,8 +13,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.layers.mamba import kda_sketchssm as kds
 from vllm.model_executor.layers.mamba.kda_sketchssm import KDASketchSSM
 from vllm.model_executor.layers.mamba.ops import kda_sketchssm_common as common
+from vllm.model_executor.layers.mamba.ops import kda_sketchssm_triton as kdt
+from vllm.model_executor.layers.mamba.ops import sketchssm_kernels as skk
 from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 from vllm.platforms import current_platform
 
@@ -26,6 +29,11 @@ H = len(RANKS)
 DENSE = [0, 2, 4]
 STATE_TOL = dict(rtol=3e-5, atol=2e-6)
 SKETCH_STATE_TOL = dict(rtol=3e-5, atol=2e-5)  # the sketch heads' WY fold
+CUDA = skk.kda_cuda_supported(H, D, D, W, torch.bfloat16, torch.float32)
+BACKENDS = [
+    pytest.param("cuda", marks=pytest.mark.skipif(not CUDA, reason="sketchssm")),
+    "triton",
+]
 i32 = lambda x: torch.tensor(x, device="cuda", dtype=torch.int32)
 
 
@@ -48,14 +56,18 @@ def _inputs(n):
     return data + [torch.randn(n, H, device="cuda").bfloat16()]
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @torch.inference_mode()
-def test_dense_heads_prefill_then_decode():
+def test_dense_heads_prefill_then_decode(backend, monkeypatch):
     torch.manual_seed(5)
+    if backend == "triton":
+        monkeypatch.setattr(kds, "kda_cuda_supported", lambda *a, **k: False)
     frames = torch.linalg.qr(torch.randn(H, D, D, dtype=torch.float64)).Q.float()
     cal = SimpleNamespace(frames=[frames.mT.contiguous()], ranks=[torch.tensor(RANKS)])
     with torch.device("cuda"):
         layer = KDASketchSSM(cal, 0, H, D, 0, 1, W, 4, torch.bfloat16,
                              torch.float32, -5.0)  # fmt: skip
+    assert (layer._decode is kdt.kda_sketch_triton_decode) == (backend == "triton")
     specs = [((H, D, D), torch.float32), *common.kda_sketch_ring_specs(H, W).values()]
     page = (sum(math.prod(s) * t.itemsize for s, t in specs) + 511) // 512 * 512
     views = common.kda_sketch_paged_views(specs, 5, page, "cuda")

@@ -15,6 +15,11 @@ import torch
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import GDNSketchArgs
+from vllm.model_executor.layers.mamba.ops.kda_sketchssm_common import (
+    KDA_SKETCH_LOWER_BOUND,
+    KDASketchArgs,
+    KDASketchRings,
+)
 from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     SketchArgs,
     row_list_programs,
@@ -191,4 +196,72 @@ def gdn_cuda_decode(
         mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache, g_cache,
         slots, write_pos, meta, flush_rows, sketch, scale, null_block_id,
         has_flush_rows,
+    )  # fmt: skip
+
+
+def kda_cuda_supported(
+    num_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    window: int,
+    activation_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    lower_bound: float = KDA_SKETCH_LOWER_BOUND,
+) -> bool:
+    sk = _package()
+    return sk is not None and _supported(
+        "KDA",
+        sk.kda_supported(
+            num_heads,
+            head_k_dim,
+            head_v_dim,
+            window,
+            activation_dtype,
+            state_dtype,
+            lower_bound,
+        ),  # fmt: skip
+    )
+
+
+def kda_cuda_cold_build(
+    state: torch.Tensor,
+    rings: KDASketchRings,
+    slots: torch.Tensor,
+    meta: torch.Tensor,
+    rows: torch.Tensor,
+    sketch: KDASketchArgs,
+    scratch: torch.Tensor,
+    null_block_id: int = NULL_BLOCK_ID,
+) -> None:
+    """Same arguments and results as ``kda_sketch_triton_cold_build``."""
+    _kernels().kda_cold_build(
+        state, rings, slots, meta, rows, sketch, scratch, null_block_id
+    )
+
+
+def kda_cuda_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    out: torch.Tensor,
+    state: torch.Tensor,
+    rings: KDASketchRings,
+    slots: torch.Tensor,
+    meta: torch.Tensor,
+    pos: torch.Tensor,
+    flush_rows: torch.Tensor,
+    sketch: KDASketchArgs,
+    scratch: torch.Tensor,
+    scale: float = 128**-0.5,
+    null_block_id: int = NULL_BLOCK_ID,
+    has_flush_rows: bool = True,
+) -> None:
+    """Same arguments and results as ``kda_sketch_triton_decode``."""
+    _kernels().kda_decode(
+        q, k, v, g, beta, A_log, dt_bias, out, state, rings, slots, meta, pos,
+        flush_rows, sketch, scratch, scale, null_block_id, has_flush_rows,
     )  # fmt: skip
