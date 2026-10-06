@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SketchSSM Mamba-2 decode (Triton kernel) against FP64 references.
+"""SketchSSM Mamba-2 decode (CUDA and Triton kernels) against FP64 references.
 
 The state lives in random per-group frames; B and C arrive unrotated and the
 references rotate them in FP64.
@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.mamba.ops import sketchssm_kernels as skk
 from vllm.model_executor.layers.mamba.ops import sketchssm_mamba2 as sk
 from vllm.model_executor.layers.mamba.ops import sketchssm_mamba2_triton as skt
 from vllm.platforms import current_platform
@@ -18,8 +19,7 @@ pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires
 
 H, P, G, N, NULL = 32, 32, 8, 128, 0
 RANKS = ([0, 1, 2, 3, 4, 5, 9, 20, 38, 64] * H)[:H]  # dense, maps, pivots
-# The CUDA backend (follow-up PR) adds a "cuda" entry.
-DECODE = {"triton": skt.sketch_triton_decode}
+DECODE = {"cuda": skk.mamba2_cuda_decode, "triton": skt.sketch_triton_decode}
 
 
 def flush_row_list(is_flush: torch.Tensor) -> torch.Tensor:
@@ -69,6 +69,9 @@ class Layer:
 
     def __init__(self, backend: str, W: int, batch: int = 5):
         bf16, S = torch.bfloat16, batch + 1
+        cuda_ok = skk.mamba2_cuda_supported(H, P, N, G, W, bf16, torch.float32)
+        if backend == "cuda" and not cuda_ok:
+            pytest.skip("Requires the sketchssm package")
         self.decode, self.W, self.batch = DECODE[backend], W, batch
         g = self.g = torch.Generator().manual_seed(0)
         rand = lambda *s: torch.rand(*s, generator=g).cuda()  # noqa: E731
@@ -155,7 +158,7 @@ class Layer:
             assert (err.cpu() < torch.tensor(tol)).all(), (row, p, err)
 
 
-@pytest.mark.parametrize("backend", ["triton"])
+@pytest.mark.parametrize("backend", ["triton", "cuda"])
 def test_sketchssm_mamba2_decode(backend):
     """Rows at mixed window positions decode a full window, each flushing."""
     W = 16
@@ -165,7 +168,7 @@ def test_sketchssm_mamba2_decode(backend):
         layer.checked_step((t + torch.tensor([0, W // 2 + 1, W - 1, 3, 0])) % W)
 
 
-@pytest.mark.parametrize("backend", ["triton"])
+@pytest.mark.parametrize("backend", ["triton", "cuda"])
 def test_sketchssm_mamba2_decode_after_prefill_build(backend):
     """The sketch built from a prefilled state serves the next decode."""
     layer = Layer(backend, 16)

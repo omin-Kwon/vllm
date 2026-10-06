@@ -149,7 +149,8 @@ def test_mamba2_sketchssm_dims(head_dim, state_size, match):
     calibration = SketchSSMCalibration(
         frames, torch.tensor([[0, 1, 4, 5]], dtype=torch.int32), None
     )
-    args = (calibration, 0, 4, head_dim, 2, state_size, 3)
+    args = (calibration, 0, 4, head_dim, 2, state_size, 16, 3, torch.bfloat16,
+            torch.float32)  # fmt: skip
     if match is None:
         layer = Mamba2SketchSSM(*args)
         assert layer.u.shape == (3, state_size + 1 + 4 + 5, head_dim)

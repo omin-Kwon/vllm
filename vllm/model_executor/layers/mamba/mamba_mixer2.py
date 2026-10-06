@@ -551,6 +551,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             )
         self.sketchssm: Mamba2SketchSSM | None = None
         if cache_config is not None and cache_config.sketchssm is not None:
+            assert model_config is not None
             self.sketchssm = Mamba2SketchSSM.maybe_create(
                 cache_config,
                 recurrent_layer_idx,
@@ -560,6 +561,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 n_groups,
                 ssm_state_size,
                 vllm_config.scheduler_config.max_num_seqs,
+                model_config.dtype,
+                self.get_state_dtype()[1],
             )
         # ReplaySSM and SketchSSM append x/dt/B rings to (conv_state, ssm_state).
         _n_state = 5 if self.use_window_rings else 2

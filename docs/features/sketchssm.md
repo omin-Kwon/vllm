@@ -24,3 +24,6 @@ SketchSSM is available for models that implement `SupportsSketchSSM`. It require
 
 Mamba-2 layers need a power-of-two state size of at least 16 and a head dim of at least 16.
 
+## Kernels
+
+SketchSSM layers have Triton kernels. On supported NVIDIA GPUs, faster CUDA kernels are used where the layer shape allows; they are vendored at build time or come from the optional `sketchssm` package, and are compiled just-in-time (with `nvcc` and `ninja`) when not prebuilt. Set `VLLM_SKETCHSSM_USE_CUDA=0` to always use the Triton kernels.

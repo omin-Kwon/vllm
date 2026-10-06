@@ -431,7 +431,7 @@ def sketch_triton_decode(
     out: torch.Tensor,
     sketch: SketchArgs,
     null_block_id: int = NULL_BLOCK_ID,
-    # False skips the flush launch; shared with the CUDA backend (follow-up PR).
+    # False skips the flush launch; shared with the CUDA backend.
     has_flush_rows: bool = True,
 ) -> None:
     """One SketchSSM decode step of a Mamba-2 layer.

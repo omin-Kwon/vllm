@@ -675,7 +675,7 @@ class SketchArgs:
 
 
 # Rows per program when a launch walks a row list. The Triton flush uses
-# TRITON_ROWS_PER_PROGRAM; the CUDA backend (follow-up PR) uses this default.
+# TRITON_ROWS_PER_PROGRAM; the CUDA backend uses this default.
 _ROWS_PER_PROGRAM = 4
 
 

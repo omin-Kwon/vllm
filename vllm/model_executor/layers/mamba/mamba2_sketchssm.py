@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.sketchssm_kernels import (
+    mamba2_cuda_decode,
+    mamba2_cuda_supported,
+)
 from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     SKETCH_DTYPES,
     SketchArgs,
@@ -49,7 +53,10 @@ class Mamba2SketchSSM(torch.nn.Module):
         head_dim: int,
         n_groups: int,
         state_size: int,
+        window: int,
         max_num_reqs: int,
+        activation_dtype: torch.dtype,
+        state_dtype: torch.dtype,
     ):
         super().__init__()
         # The kernels take state_size as a power-of-two block and use it and
@@ -88,6 +95,11 @@ class Mamba2SketchSSM(torch.nn.Module):
             self.register_buffer(
                 name, torch.zeros(max_num_reqs, *shape, dtype=dtype), persistent=False
             )
+        use_cuda = mamba2_cuda_supported(
+            num_heads, head_dim, state_size, n_groups, window, activation_dtype,
+            state_dtype,
+        )  # fmt: skip
+        self._decode = mamba2_cuda_decode if use_cuda else sketch_triton_decode
 
     def rotate(
         self, B: torch.Tensor, C: torch.Tensor
@@ -117,7 +129,7 @@ class Mamba2SketchSSM(torch.nn.Module):
         sketch = SketchArgs(self.u, self.w, self.ag, self.tables, self.frames_t)
         if state_indices.dim() == 2:
             state_indices = state_indices[:, 0]
-        sketch_triton_decode(
+        self._decode(
             state, x, dt, A, B, C, D, dt_bias, x_cache, dt_cache, B_cache,
             attn_metadata.bc_pre_scratch, attn_metadata.write_pos_d,
             attn_metadata.is_flush_d, attn_metadata.sketch_flush_rows_d,
@@ -145,6 +157,8 @@ class Mamba2SketchSSM(torch.nn.Module):
         n_groups: int,
         state_size: int,
         max_num_reqs: int,
+        activation_dtype: torch.dtype,
+        state_dtype: torch.dtype,
     ) -> "Mamba2SketchSSM | None":
         """The layer's SketchSSM when ``--sketchssm`` is set."""
         if cache_config is None or cache_config.sketchssm is None:
@@ -179,5 +193,8 @@ class Mamba2SketchSSM(torch.nn.Module):
             head_dim,
             n_groups,
             state_size,
+            cache_config.replayssm_buffer_len,
             max_num_reqs,
+            activation_dtype,
+            state_dtype,
         )

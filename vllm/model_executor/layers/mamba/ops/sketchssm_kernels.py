@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""SketchSSM CUDA kernels, vendored or from the ``sketchssm`` package.
+
+Used when ``VLLM_SKETCHSSM_USE_CUDA`` is set and the layer shape is supported;
+otherwise layers use the Triton kernels.
+"""
+
+import functools
+import os
+from types import ModuleType
+
+import torch
+
+from vllm import envs
+from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
+    SketchArgs,
+    row_list_programs,
+    run_with_flush,
+    sketch_bc_pre,
+    sketch_query,
+)
+from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+logger = init_logger(__name__)
+
+SKETCHSSM_KERNELS_API = 5
+
+
+@functools.cache
+def _package() -> ModuleType | None:
+    if not envs.VLLM_SKETCHSSM_USE_CUDA or not current_platform.is_cuda():
+        return None
+    try:
+        import vllm.third_party.sketchssm_kernels as kernels
+    except ImportError:
+        try:
+            from sketchssm import kernels
+        except ImportError:
+            logger.info_once(
+                "The SketchSSM CUDA kernels are not available; SketchSSM uses its "
+                "Triton kernels"
+            )
+            return None
+    api = getattr(kernels, "API_VERSION", None)
+    if api != SKETCHSSM_KERNELS_API:
+        logger.warning_once(
+            "SketchSSM kernels API %s does not match vLLM's %d; SketchSSM uses "
+            "its Triton kernels",
+            api,
+            SKETCHSSM_KERNELS_API,
+        )
+        return None
+    kernels.set_config_dirs([envs.VLLM_TUNED_CONFIG_FOLDER])
+    kernels.set_cache_dir(os.path.join(envs.VLLM_CACHE_ROOT, "sketchssm_cuda"))
+    return kernels
+
+
+def _kernels() -> ModuleType:
+    sk = _package()
+    assert sk is not None
+    return sk
+
+
+def _supported(family: str, support) -> bool:
+    if not support:
+        logger.info_once(
+            "SketchSSM %s CUDA kernels unavailable (%s); using the Triton kernels",
+            family,
+            support.reason,
+        )
+    return bool(support)
+
+
+def mamba2_cuda_supported(
+    num_heads: int,
+    head_dim: int,
+    state_size: int,
+    n_groups: int,
+    window: int,
+    activation_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+) -> bool:
+    sk = _package()
+    return sk is not None and _supported(
+        "Mamba-2",
+        sk.mamba2_supported(
+            num_heads,
+            head_dim,
+            state_size,
+            n_groups,
+            window,
+            activation_dtype,
+            state_dtype,
+        ),  # fmt: skip
+    )
+
+
+def mamba2_cuda_decode(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    x_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    bc_pre: torch.Tensor,
+    write_pos: torch.Tensor,
+    is_flush: torch.Tensor,
+    flush_rows: torch.Tensor,
+    slots: torch.Tensor,
+    meta: torch.Tensor,
+    out: torch.Tensor,
+    sketch: SketchArgs,
+    null_block_id: int = NULL_BLOCK_ID,
+    has_flush_rows: bool = True,
+) -> None:
+    """Same arguments and results as ``sketch_triton_decode``."""
+    batch = x.shape[0]
+    if batch == 0:
+        return
+    if slots.dim() == 2:
+        slots = slots[:, 0]
+    sketch_bc_pre(B, C, B_cache, write_pos, is_flush, bc_pre, slots, null_block_id)
+    query = sketch_query(C, sketch.frames_t)
+    _kernels().mamba2_decode(
+        state, x, dt, A, B, query, D, dt_bias, x_cache, dt_cache, B_cache,
+        bc_pre, write_pos, is_flush, flush_rows, slots, meta, out, sketch,
+        null_block_id, has_flush_rows, frames_t=sketch.frames_t,
+        flush_programs=row_list_programs(batch), run_with_flush=run_with_flush,
+    )  # fmt: skip
