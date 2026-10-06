@@ -14,6 +14,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.gdn_sketchssm_common import GDNSketchArgs
 from vllm.model_executor.layers.mamba.ops.sketchssm_mamba2 import (
     SketchArgs,
     row_list_programs,
@@ -134,4 +135,60 @@ def mamba2_cuda_decode(
         bc_pre, write_pos, is_flush, flush_rows, slots, meta, out, sketch,
         null_block_id, has_flush_rows, frames_t=sketch.frames_t,
         flush_programs=row_list_programs(batch), run_with_flush=run_with_flush,
+    )  # fmt: skip
+
+
+def gdn_cuda_supported(
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    window: int,
+    activation_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+) -> bool:
+    sk = _package()
+    if sk is None or not _supported(
+        "GDN",
+        sk.gdn_supported(
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            window,
+            activation_dtype,
+            state_dtype,
+        ),  # fmt: skip
+    ):
+        return False
+    # Raises if no build knobs fit this shape and window on this GPU.
+    sk.gdn.check_resources(num_k_heads, num_v_heads, window)
+    return True
+
+
+def gdn_cuda_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    out: torch.Tensor,
+    state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    slots: torch.Tensor,
+    write_pos: torch.Tensor,
+    meta: torch.Tensor,
+    flush_rows: torch.Tensor,
+    sketch: GDNSketchArgs,
+    scale: float,
+    null_block_id: int = NULL_BLOCK_ID,
+    has_flush_rows: bool = True,
+) -> None:
+    """Same arguments and results as ``gdn_sketch_triton_decode``."""
+    _kernels().gdn_decode(
+        mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache, g_cache,
+        slots, write_pos, meta, flush_rows, sketch, scale, null_block_id,
+        has_flush_rows,
     )  # fmt: skip
