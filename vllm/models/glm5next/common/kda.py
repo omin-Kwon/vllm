@@ -25,6 +25,7 @@ from vllm.model_executor.layers.mamba.kda_checkpoint import (
     FlashKDAPrefillCheckpointExporter,
     kda_prefill_checkpoint_alignment,
 )
+from vllm.model_executor.layers.mamba.kda_sketchssm import KDASketchSSM
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -175,29 +176,38 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             prefill_checkpoint_alignment=alignment,
         )
 
-    def get_state_dtype(
-        self,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
-        return MambaStateDtypeCalculator.kda_state_dtype(
+        dtypes: tuple[torch.dtype, ...] = MambaStateDtypeCalculator.kda_state_dtype(
             self.model_config.dtype, self.cache_config.mamba_cache_dtype
         )
+        if self.cache_config.sketchssm is not None:
+            dtypes = MambaStateDtypeCalculator.append_kda_sketchssm_ring(dtypes)
+        return dtypes
 
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    ) -> tuple[tuple[int, ...], ...]:
         # conv_state width must include num_spec so the spec-decode conv update
         # (causal_conv1d_update with num_accepted_tokens + max_query_len) can
         # slide the window across the draft-verify tokens without reading past
         # the allocated width. Matches qwen_gdn_linear_attn.get_state_shape.
-        return MambaStateShapeCalculator.kda_state_shape(
+        shapes: tuple[tuple[int, ...], ...] = MambaStateShapeCalculator.kda_state_shape(
             self.tp_size,
             self.num_heads,
             self.head_dim,
             conv_kernel_size=self.conv_size,
             num_spec=self.num_spec,
         )
+        if self.cache_config.sketchssm is not None:
+            shapes = MambaStateShapeCalculator.append_kda_sketchssm_ring(
+                shapes,
+                self.tp_size,
+                self.num_heads,
+                self.cache_config.replayssm_buffer_len,
+            )
+        return shapes
 
     def __init__(
         self,
@@ -222,8 +232,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
 
-        _, recurrent_state_shape = self.get_state_shape()
-        _, recurrent_state_dtype = self.get_state_dtype()
+        recurrent_state_shape = self.get_state_shape()[1]
+        recurrent_state_dtype = self.get_state_dtype()[1]
         scatter_states.register_warmup(
             state_shape=recurrent_state_shape,
             state_dtype=recurrent_state_dtype,
@@ -334,6 +344,21 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # unbounded softplus gate.
         self.kda_safe_gate = True
         self.kda_lower_bound = config.linear_lower_bound
+        if self.cache_config.sketchssm is not None and current_platform.is_rocm():
+            raise NotImplementedError("KDA SketchSSM is not supported on ROCm")
+        self.sketchssm = KDASketchSSM.maybe_create(
+            self.cache_config,
+            config.layer_types[: self.layer_idx].count("linear_attention"),
+            self.layer_idx,
+            self.num_heads,
+            self.head_dim,
+            self.tp_rank,
+            self.tp_size,
+            vllm_config.scheduler_config.max_num_seqs,
+            vllm_config.model_config.dtype,
+            self.get_state_dtype()[1],
+            self.kda_lower_bound,
+        )
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
@@ -379,6 +404,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter(
                 state_len=self.conv_size - 1
             )
+
+    def _sketchssm_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g1: torch.Tensor,
+        beta: torch.Tensor,
+        out: torch.Tensor,
+        state_indices: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        """SketchSSM decode of one token per row."""
+        assert self.sketchssm is not None
+        num_tokens = q.shape[0]
+        g = g1.reshape(num_tokens, -1)
+        beta = beta.reshape(num_tokens, -1)
+        out = out.reshape(num_tokens, self.local_num_heads, self.head_dim)
+        common = (q, k, v, g, beta, self.A_log.view(-1), self.dt_bias)
+        self.sketchssm.decode(
+            *common, out, self.kv_cache[1], self.kv_cache[2:], attn_metadata,
+            state_indices,
+        )  # fmt: skip
 
     def _flashkda_prefill(
         self,
@@ -540,7 +588,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        (conv_state, recurrent_state) = constant_caches
+        conv_state, recurrent_state = constant_caches[:2]
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         # Layout is process-global and resolved once at init (see __init__).
@@ -693,6 +741,34 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # layer output buffer; the chunked prefill kernel cannot, so this
         # stays None there and the merge copy below runs as before.
         ns_out = None
+        num_decode_tokens = 0
+        if (
+            self.sketchssm is not None
+            and attn_metadata_narrowed.num_prefills > 0
+            and attn_metadata_narrowed.num_decodes > 0
+        ):
+            # Decode rows must not see a prefill update, so they run first.
+            # SketchSSM excludes prefix caching, so there are no prefill
+            # checkpoints over the whole non-spec batch to keep in sync.
+            assert attn_metadata_narrowed.checkpoint is None
+            assert q_ns is not None and k_ns is not None and v_ns is not None
+            assert non_spec_state_indices_tensor is not None
+            num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+            self._sketchssm_decode(
+                q_ns[:num_decode_tokens], k_ns[:num_decode_tokens],
+                v_ns[:num_decode_tokens], g1_ns[:, :num_decode_tokens],
+                beta_ns[:, :num_decode_tokens], core_attn_out[:, :num_decode_tokens],
+                non_spec_state_indices_tensor[:num_decode_tokens],
+                attn_metadata_narrowed,
+            )  # fmt: skip
+            q_ns = q_ns[num_decode_tokens:]
+            k_ns = k_ns[num_decode_tokens:]
+            v_ns = v_ns[num_decode_tokens:]
+            g1_ns = g1_ns[:, num_decode_tokens:]
+            beta_ns = beta_ns[:, num_decode_tokens:]
+            non_spec_state_indices_tensor = attn_metadata_narrowed.prefill_state_indices
+            has_initial_state = attn_metadata_narrowed.prefill_has_initial_state
+            non_spec_query_start_loc = attn_metadata_narrowed.prefill_query_start_loc
         if attn_metadata_narrowed.num_prefills > 0:
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
@@ -704,7 +780,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
                 # tokens: write to the workspace buffer and scatter below.
-                ns_out = None if use_spec else core_attn_out[:, :num_actual_tokens]
+                ns_out = (
+                    None
+                    if use_spec
+                    else core_attn_out[:, num_decode_tokens:num_actual_tokens]
+                )
                 core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
@@ -746,6 +826,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 last_recurrent_state,
                 non_spec_state_indices_tensor,
             )
+            if self.sketchssm is not None:
+                self.sketchssm.prefilled(
+                    recurrent_state,
+                    self.kv_cache[2:],
+                    attn_metadata_narrowed,
+                    non_spec_state_indices_tensor,
+                )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
@@ -755,6 +842,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Gate computed in-kernel (COMPUTE_GATE), beta sigmoided in-kernel.
             if not use_spec:
                 ns_out = spec_out
+            if self.sketchssm is not None:
+                assert q_ns is not None and ns_out is not None
+                self._sketchssm_decode(
+                    q_ns, k_ns, v_ns, g1_ns, beta_ns, ns_out,
+                    non_spec_state_indices_tensor, attn_metadata_narrowed,
+                )  # fmt: skip
+                return
             core_attn_out_non_spec, _ = fused_recurrent_kda(
                 q=_rearr(q_ns),
                 k=_rearr(k_ns),
@@ -787,6 +881,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         else:
             assert core_attn_out_non_spec is not None
             if ns_out is None:
-                core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-                    0, :num_actual_tokens
-                ]
+                core_attn_out[0, num_decode_tokens:num_actual_tokens] = (
+                    core_attn_out_non_spec[0, : num_actual_tokens - num_decode_tokens]
+                )
